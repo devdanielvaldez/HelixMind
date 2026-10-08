@@ -1,0 +1,32 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.trial-watch-events
+  version: 0.1.0
+  intent: Read up to the latest 100 retained snapshot hashes and source-field comparison diffs for one watched NCT ID.
+contract:
+  inputs:
+    type: object
+    required: [session_id, nct_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      nct_id: { type: string, pattern: '^NCT[0-9]{8}$' }
+  outputs:
+    type: object
+    required: [session_id, nct_id, items]
+    properties:
+      session_id: { type: string }
+      nct_id: { type: string }
+      items: { type: array, items: { type: object } }
+  successEvidence:
+    - id: retained-watch-events
+      assertion: returned_snapshot_diffs_belong_to_requested_session_and_nct
+      acceptedTypes: [state_assertion]
+effects: [state_read]
+idempotency: idempotent
+recovery: retry
+authority:
+  permissions: [biomedical.trials.watch.read]
+implementations:
+  - id: medai-trial-watch-events
+    kind: mcp
+    reference: mcp://medai/medai_trials_watch_events

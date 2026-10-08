@@ -1,0 +1,36 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-session-create
+  version: 0.1.0
+  intent: Create a persistent computational biomedical research session.
+contract:
+  inputs:
+    type: object
+    required: [objective]
+    properties:
+      objective: { type: string }
+      depth: { type: string, enum: [standard, deep] }
+      budget: { type: integer, minimum: 1, maximum: 100000 }
+  outputs:
+    type: object
+    required: [id, objective, status, created_at]
+    properties:
+      id: { type: string }
+      objective: { type: string }
+      status: { type: string }
+      created_at: { type: integer }
+      depth: { type: string }
+      budget: { type: integer }
+  successEvidence:
+    - id: research_session_created
+      assertion: research_session.id_exists_with_requested_objective
+      acceptedTypes: [state_assertion, provider_receipt]
+  effects: [data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.research.create]
+implementations:
+  - id: medai-research-api
+    kind: mcp
+    reference: mcp://medai/medai_research_create_session

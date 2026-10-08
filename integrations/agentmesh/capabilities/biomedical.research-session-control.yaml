@@ -1,0 +1,31 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-session-control
+  version: 0.1.0
+  intent: Read durable cancellation state so workers can stop before claiming tasks and while long operations run.
+contract:
+  inputs:
+    type: object
+    required: [session_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+  outputs:
+    type: object
+    required: [session_id, status, cancellation_requested]
+    properties:
+      session_id: { type: string }
+      status: { type: string }
+      cancellation_requested: { type: boolean }
+  successEvidence:
+    - id: session-control-read
+      assertion: cancellation_state_is_read_from_the_durable_session_record
+      acceptedTypes: [state_assertion]
+  effects: [read_only]
+  idempotency: guaranteed
+  recovery: retry
+authority:
+  permissions: [biomedical.research.sessions.read]
+implementations:
+  - id: medai-research-session-control
+    kind: mcp
+    reference: mcp://medai/medai_research_get_control

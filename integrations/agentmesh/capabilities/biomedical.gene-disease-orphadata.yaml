@@ -1,0 +1,40 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.gene-disease-orphadata
+  version: 0.1.0
+  intent: Retrieve Orphadata gene-disease association types and source-native status for one exact numeric ORPHAcode.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, orphacode]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      orphacode: { type: string, pattern: '^[0-9]{1,6}$' }
+  outputs:
+    type: object
+    required: [source, source_response_sha256, attribution, disease, records, record_count, found, research_only]
+    properties:
+      source: { type: string, const: Orphadata / Orphanet }
+      source_response_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+      attribution: { type: string, const: 'Orphadata, CC BY 4.0' }
+      disease: { type: object }
+      records: { type: array, maxItems: 500, items: { type: object } }
+      record_count: { type: integer, minimum: 0, maximum: 500 }
+      found: { type: boolean, const: true }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+      interpretation_limit: { type: string }
+  successEvidence:
+    - id: orphadata-source-receipt-retained
+      assertion: exact_orphacode_associations_retain_native_type_status_gene_references_and_response_digest
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.genetics.gene_disease.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-orphadata-gene-disease
+    kind: mcp
+    reference: mcp://medai/medai_gene_disease_orphadata

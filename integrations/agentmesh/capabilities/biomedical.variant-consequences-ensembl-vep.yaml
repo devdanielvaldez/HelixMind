@@ -1,0 +1,37 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.variant-consequences-ensembl-vep
+  version: 0.1.0
+  intent: Cross-check reference-validated local VCF alleles against Ensembl VEP transcript consequence annotations.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, genomic_report]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      genome_build: { type: string, enum: [GRCh37, GRCh38] }
+      genomic_report: { type: object, maxProperties: 64 }
+  outputs:
+    type: object
+    required: [assembly, queried_variant_alleles, results, research_only, interpretation_limit]
+    properties:
+      assembly: { type: string, enum: [GRCh37, GRCh38] }
+      queried_variant_alleles: { type: integer, minimum: 0, maximum: 1000 }
+      results: { type: array, maxItems: 1000, items: { type: object } }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+      interpretation_limit: { type: string }
+  successEvidence:
+    - id: exact-assembly-vep-results-retained
+      assertion: reference_validated_input_alleles_are_bound_to_matching_assembly_and_retained_with_source_hashes
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.genetics.variant_consequences, biomedical.artifacts.write]
+implementations:
+  - id: medai-ensembl-vep-consequence-check
+    kind: mcp
+    reference: mcp://medai/medai_variants_annotate_ensembl_vep

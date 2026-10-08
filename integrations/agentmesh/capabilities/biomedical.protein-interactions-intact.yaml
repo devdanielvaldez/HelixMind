@@ -1,0 +1,38 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.protein-interactions-intact
+  version: 0.2.0
+  intent: Retrieve and reconcile IntAct/PSICQUIC interaction records for a UniProt accession with MITAB provenance and biological participant roles.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, uniprot_accession]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      uniprot_accession: { type: string, pattern: '^[A-Za-z0-9]{6,10}(-[1-9][0-9]*)?$' }
+      limit: { type: integer, minimum: 1, maximum: 500 }
+      organism_id: { type: [integer, 'null'], minimum: 1, maximum: 9999999 }
+  outputs:
+    type: object
+    required: [accession, records, reconciliation, response_sha256, artifact_id, research_only]
+    properties:
+      accession: { type: string }
+      records: { type: array, items: { type: object } }
+      reconciliation: { type: object }
+      response_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      artifact_id: { type: string, minLength: 1 }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: intact-mitab-retained
+      assertion: artifact.source_is_intact_records_retain_publication_assay_raw_mitab_and_reconciliation_does_not_aggregate_confidence
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.proteins.interactions.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-intact-interaction-lookup
+    kind: mcp
+    reference: mcp://medai/medai_proteins_search_intact_interactions

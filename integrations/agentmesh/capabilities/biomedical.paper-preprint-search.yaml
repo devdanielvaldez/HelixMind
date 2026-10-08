@@ -1,0 +1,43 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.paper-preprint-search
+  version: 0.1.0
+  intent: Screen a bounded bioRxiv or medRxiv date/category slice using exact lexical query tokens over provider titles and transient abstracts, retaining metadata without abstracts.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, server, query, start_date, end_date]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      server: { type: string, enum: [biorxiv, medrxiv] }
+      query: { type: string, minLength: 1, maxLength: 256 }
+      start_date: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+      end_date: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+      limit: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      category: { type: string, maxLength: 100 }
+      max_pages: { type: integer, minimum: 1, maximum: 3, default: 2 }
+  outputs:
+    type: object
+    required: [query, date_range, records, scanned_count, scan_exhausted, artifact_id, research_only]
+    properties:
+      query: { type: string }
+      date_range: { type: object }
+      records: { type: array, items: { type: object } }
+      scanned_count: { type: integer }
+      scan_exhausted: { type: boolean }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: bounded-preprint-screen-retained
+      assertion: matched_metadata_and_provider_hashes_are_retained_without_abstract_text
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.literature.preprint_search]
+implementations:
+  - id: medai-preprint-bounded-search
+    kind: mcp
+    reference: mcp://medai/medai_papers_search_preprints

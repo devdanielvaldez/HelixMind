@@ -1,0 +1,37 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.protein-residue-mapping-sifts
+  version: 0.1.0
+  intent: Map residues in experimental PDB structures to UniProt protein positions using PDBe SIFTS records.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, uniprot_accession]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      uniprot_accession: { type: string, pattern: '^[A-Za-z0-9]{6,10}(-[1-9][0-9]*)?$' }
+      max_structures: { type: integer, minimum: 1, maximum: 20 }
+  outputs:
+    type: object
+    required: [accession, coverage, entries, residue_mappings, artifact_id, research_only]
+    properties:
+      accession: { type: string }
+      coverage: { type: object }
+      entries: { type: array, items: { type: object } }
+      residue_mappings: { type: array, items: { type: object } }
+      artifact_id: { type: string, minLength: 1 }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: sifts-residue-mappings-retained
+      assertion: artifact.source_is_sifts_and_each_mapping_retains_pdb_chain_uniprot_numbering_and_explicit_mmCIF_coordinate_observation_or_unknown
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.proteins.structure.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-sifts-residue-mapping
+    kind: mcp
+    reference: mcp://medai/medai_proteins_map_experimental_residues

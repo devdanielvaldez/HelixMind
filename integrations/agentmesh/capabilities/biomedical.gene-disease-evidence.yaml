@@ -1,0 +1,36 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.gene-disease-evidence
+  version: 0.1.0
+  intent: Retrieve source-linked Open Targets and GWAS Catalog evidence for EFO identifiers and direct human gene-disease assertions from Monarch for supported ontology IDs; preserve aggregator provenance and reconcile only exact stable gene identifiers without treating providers as independent studies.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, disease_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      disease_id: { type: string, pattern: '^(EFO|MONDO|Orphanet|DOID|HP|OTAR)_?[A-Za-z0-9_.-]{2,40}$' }
+      limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
+  outputs:
+    type: object
+    required: [disease_id, sources, reconciliation, artifact_ids]
+    properties:
+      disease_id: { type: string }
+      sources: { type: array, items: { type: object } }
+      source_errors: { type: array, items: { type: object } }
+      reconciliation: { type: object }
+      artifact_ids: { type: array, items: { type: string } }
+  successEvidence:
+    - id: source-and-reconciliation-artifacts-retained
+      assertion: source_linked_gene_disease_records_and_exact_id_reconciliation_are_retained_with_native_provider_provenance
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.genetics.gene_disease_evidence]
+implementations:
+  - id: medai-gene-disease-evidence
+    kind: mcp
+    reference: mcp://medai/medai_gene_disease_evidence

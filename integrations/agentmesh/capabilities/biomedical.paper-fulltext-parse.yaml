@@ -1,0 +1,46 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.paper-fulltext-parse
+  version: 0.1.0
+  intent: Retrieve one PMC BioC full-text record, extract article sections and source-normalized entity mentions, optionally classify result candidates with loopback inference when the operator allowlists the exact source license, and retain hash-based receipts without persisting full text.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, identifier]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      identifier: { type: string, pattern: '^(PMC[1-9][0-9]*|PMID:[1-9][0-9]{0,8})$' }
+  outputs:
+    type: object
+    required: [paper, artifact_id, retention]
+    properties:
+      paper: { type: object }
+      artifact_id: { type: string }
+      retention: { type: string }
+      model_extraction:
+        type: object
+        properties:
+          available: { type: boolean }
+          reason: { type: string }
+          artifact_id: { type: string }
+          annotations: { type: array, items: { type: object } }
+          batches: { type: integer, minimum: 1, maximum: 10 }
+          provider: { type: string }
+          model: { type: string }
+          prompt_sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+          response_sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+          usage: { type: object }
+  successEvidence:
+    - id: pmc-extraction-receipt-retained
+      assertion: extraction_metadata_retains_source_hash_sections_and_source_annotations_without_full_text
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.literature.fulltext.read]
+implementations:
+  - id: medai-pmc-bioc-paper-understanding
+    kind: mcp
+    reference: mcp://medai/medai_papers_understand_pmc

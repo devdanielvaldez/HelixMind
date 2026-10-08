@@ -1,0 +1,39 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.gene-disease-panelapp
+  version: 0.1.0
+  intent: Retrieve an exact Genomics England PanelApp gene panel version with source-native confidence and inheritance metadata.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, panel_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      panel_id: { type: integer, minimum: 1, maximum: 10000000 }
+      version: { type: string, pattern: '^[0-9]{1,4}(\.[0-9]{1,4}){0,3}$' }
+  outputs:
+    type: object
+    required: [source, panel_id, version, genes, source_record_sha256, research_only]
+    properties:
+      source: { type: string, const: Genomics England PanelApp }
+      panel_id: { type: integer, minimum: 1 }
+      version: { type: string }
+      genes: { type: array, maxItems: 10000, items: { type: object } }
+      source_record_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+      interpretation_limit: { type: string }
+  successEvidence:
+    - id: versioned-curated-panel-retained
+      assertion: panel_id_version_source_digest_and_source_native_gene_evidence_values_are_retained
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.genetics.gene_disease.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-panelapp-versioned-gene-panel
+    kind: mcp
+    reference: mcp://medai/medai_gene_disease_panelapp

@@ -1,0 +1,36 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-task-scope
+  version: 0.1.0
+  intent: Apply a verified objective-specific task selection before unselected research tasks consume execution credits.
+contract:
+  inputs:
+    type: object
+    required: [session_id, worker_id, plan_artifact_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      worker_id: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]{1,128}$" }
+      plan_artifact_id: { type: string, minLength: 1, maxLength: 128 }
+  outputs:
+    type: object
+    required: [session_id, plan_artifact_id, skipped_task_ids]
+    properties:
+      session_id: { type: string }
+      plan_artifact_id: { type: string }
+      skipped_task_ids:
+        type: array
+        uniqueItems: true
+        items: { type: string, minLength: 1 }
+  successEvidence:
+    - id: objective_task_scope_applied
+      assertion: hash_verified_objective_plan_skipped_unselected_queued_tasks
+      acceptedTypes: [state_assertion]
+  effects: [data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.research.tasks.scope]
+implementations:
+  - id: medai-research-task-scope
+    kind: mcp
+    reference: mcp://medai/medai_research_apply_task_scope

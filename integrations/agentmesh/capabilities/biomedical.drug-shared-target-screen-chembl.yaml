@@ -1,0 +1,39 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.drug-shared-target-screen-chembl
+  version: 0.1.0
+  intent: Compare exact-identity ChEMBL mechanism target identifiers across two distinct compounds as a descriptive candidate screen.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, inchikey_a, inchikey_b]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      inchikey_a: { type: string, pattern: '^[A-Z]{14}-[A-Z]{10}-[A-Z]$' }
+      inchikey_b: { type: string, pattern: '^[A-Z]{14}-[A-Z]{10}-[A-Z]$' }
+  outputs:
+    type: object
+    required: [source, compound_a, compound_b, shared_targets, target_overlap, limitations, research_only, artifact_id]
+    properties:
+      source: { type: string, const: ChEMBL web services }
+      compound_a: { type: object }
+      compound_b: { type: object }
+      shared_targets: { type: array, items: { type: object } }
+      target_overlap: { type: object }
+      limitations: { type: array, items: { type: string } }
+      research_only: { type: boolean, const: true }
+      artifact_id: { type: string, minLength: 1 }
+  successEvidence:
+    - id: exact-identity-target-receipts
+      assertion: shared_targets_are_an_intersection_of_hashed_mechanism_records_joined_only_to_exact_chEMBL_molecule_identities
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.drugs.lookup, biomedical.artifacts.write]
+implementations:
+  - id: medai-chembl-shared-target-screen
+    kind: mcp
+    reference: mcp://medai/medai_drug_shared_targets_chembl

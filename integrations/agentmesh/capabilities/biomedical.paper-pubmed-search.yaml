@@ -1,0 +1,62 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.paper-pubmed-search
+  version: 0.2.0
+  intent: Search PubMed with bounded E-utilities calls and optionally reorder the returned source records by title-only model relevance while preserving PMID identity.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, query]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, const: literature.discover }
+      query: { type: string, minLength: 1, maxLength: 256 }
+      limit: { type: integer, minimum: 1, maximum: 20, default: 10 }
+  outputs:
+    type: object
+    required: [results, coverage, coverage_artifact_id, ranking, ranking_artifact_id]
+    properties:
+      results: { type: array, items: { type: object } }
+      coverage:
+        type: object
+        required: [total_hits, requested_limit, returned_pmids, search_truncated, fetched_records, missing_record_pmids, fetch_incomplete, retrieval_incomplete]
+        properties:
+          total_hits: { type: integer, minimum: 0 }
+          requested_limit: { type: integer, minimum: 1, maximum: 200 }
+          returned_pmids: { type: integer, minimum: 0 }
+          search_truncated: { type: boolean }
+          fetched_records: { type: integer, minimum: 0 }
+          missing_record_pmids: { type: array, items: { type: string } }
+          fetch_incomplete: { type: boolean }
+          retrieval_incomplete: { type: boolean }
+          coverage_semantics: { type: string }
+      coverage_artifact_id: { type: string, minLength: 1 }
+      ranking:
+        type: object
+        required: [available]
+        properties:
+          available: { type: boolean }
+          reason: { type: string }
+          error: { type: string }
+          ranked_pmids: { type: array, items: { type: string } }
+          relevance: { type: array, items: { type: object } }
+          interpretation_limit: { type: string }
+          provider: { type: string }
+          model: { type: string }
+          prompt_sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+          response_sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+          usage: { type: object }
+      ranking_artifact_id: { type: string }
+  successEvidence:
+    - id: source-identity-preserved-in-ranking
+      assertion: result_records_retain_provider_pmid_and_model_order_covers_exactly_returned_pmids
+      acceptedTypes: [provider_receipt]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.literature.search]
+implementations:
+  - id: medai-pubmed-search
+    kind: mcp
+    reference: mcp://medai/medai_papers_search_pubmed

@@ -1,0 +1,34 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.hypotheses-propose
+  version: 0.1.0
+  intent: Generate candidate biomedical research hypotheses from evidence-linked paths in one research session graph.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, const: hypotheses.propose }
+      limit: { type: integer, minimum: 1, maximum: 200, default: 50 }
+  outputs:
+    type: object
+    required: [method, candidate_count, candidates, artifact_id]
+    properties:
+      method: { type: string }
+      candidate_count: { type: integer }
+      candidates: { type: array, items: { type: object } }
+      artifact_id: { type: string }
+  successEvidence:
+    - id: candidates-retained
+      assertion: research_artifact_contains_session_evidence_linked_hypothesis_paths
+      acceptedTypes: [state_assertion]
+  effects: [read_only, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.hypotheses.propose]
+implementations:
+  - id: medai-hypothesis-proposer
+    kind: mcp
+    reference: mcp://medai/medai_hypotheses_propose

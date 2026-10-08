@@ -1,0 +1,34 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.trial-watch-refresh
+  version: 0.1.0
+  intent: Charge a claimed research watch, retrieve a current NCT record, retain its source hash, compare it with the prior session observation, and reschedule it.
+contract:
+  inputs:
+    type: object
+    required: [session_id, nct_id, worker_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      nct_id: { type: string, pattern: '^NCT[0-9]{8}$' }
+      worker_id: { type: string, minLength: 1, maxLength: 128 }
+      last_snapshot: { type: [string, 'null'] }
+  outputs:
+    type: object
+    required: [event, comparison, research_only]
+    properties:
+      event: { type: object }
+      comparison: { type: [object, 'null'] }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: scheduled-snapshot-event
+      assertion: provider_snapshot_hash_and_source_field_diff_are_persisted_under_the_active_watch_lease
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, state_read, state_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.trials.read, biomedical.trials.watch.execute, biomedical.budget.consume]
+implementations:
+  - id: medai-trial-watch-refresh
+    kind: mcp
+    reference: mcp://medai/medai_trials_watch_refresh

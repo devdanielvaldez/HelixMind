@@ -1,0 +1,31 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.literature-watch-claim
+  version: 0.1.0
+  intent: Lease due PubMed discovery watches to an AgentMesh worker.
+contract:
+  inputs:
+    type: object
+    required: [worker_id, limit, lease_seconds]
+    properties:
+      worker_id: {"type":"string","minLength":1,"maxLength":128}
+      limit: {"type":"integer","minimum":1,"maximum":100}
+      lease_seconds: {"type":"integer","minimum":30,"maximum":3600}
+  outputs:
+    type: object
+    required: [items]
+    properties:
+      items: { type: array }
+  successEvidence:
+    - id: literature-watch-state
+      assertion: session_scoped_pubmed_discovery_is_auditable_and_does_not_become_validated_evidence
+      acceptedTypes: [state_assertion, provider_receipt]
+  effects: [data_write]
+  idempotency: not_guaranteed
+  recovery: retry
+authority:
+  permissions: [biomedical.literature.watch.execute]
+implementations:
+  - id: medai-literature-watch-claim
+    kind: mcp
+    reference: mcp://medai/medai_literature_watch_claim_due

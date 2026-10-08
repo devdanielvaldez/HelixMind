@@ -1,0 +1,41 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.graph-link
+  version: 0.1.0
+  intent: Create a research-session-scoped biomedical graph edge backed by existing same-session evidence annotations and/or source artifact receipts.
+contract:
+  inputs:
+    type: object
+    required: [session_id, source, relation, target, evidence_ids, confidence, task_id]
+    properties:
+      session_id: { type: string, minLength: 1, maxLength: 128 }
+      source: { type: string, minLength: 1, maxLength: 512 }
+      relation: { type: string, minLength: 1, maxLength: 128 }
+      target: { type: string, minLength: 1, maxLength: 512 }
+      evidence_ids: { type: array, maxItems: 100, items: { type: string, minLength: 1, maxLength: 128 } }
+      artifact_ids: { type: array, maxItems: 100, items: { type: string, minLength: 1, maxLength: 128 } }
+      confidence: { type: number, minimum: 0, maximum: 1 }
+      task_id: { type: string, minLength: 1, maxLength: 128 }
+  outputs:
+    type: object
+    required: [source, relation, target, evidence_ids, artifact_ids, saved]
+    properties:
+      source: { type: string }
+      relation: { type: string }
+      target: { type: string }
+      evidence_ids: { type: array, items: { type: string } }
+      artifact_ids: { type: array, items: { type: string } }
+      saved: { type: boolean, const: true }
+  successEvidence:
+    - id: graph-edge-provenance-is-session-scoped
+      assertion: every_linked_evidence_record_and_source_artifact_exists_in_the_same_research_session
+      acceptedTypes: [state_assertion, provider_receipt]
+  effects: [data_write]
+  idempotency: guaranteed
+  recovery: retry
+authority:
+  permissions: [biomedical.graph.write]
+implementations:
+  - id: medai-evidence-backed-graph-link
+    kind: mcp
+    reference: mcp://medai/medai_graph_link_evidence

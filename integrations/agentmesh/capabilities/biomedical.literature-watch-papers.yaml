@@ -1,0 +1,47 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.literature-watch-papers
+  version: 0.1.0
+  intent: Read bounded bibliographic metadata for new PubMed records discovered by scheduled watches.
+contract:
+  inputs:
+    type: object
+    required: [session_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      watch_id: { type: [string, "null"], pattern: "^[a-f0-9]{64}$" }
+      limit: { type: integer, minimum: 1, maximum: 500, default: 100 }
+  outputs:
+    type: object
+    required: [session_id, items]
+    properties:
+      session_id: { type: string }
+      items:
+        type: array
+        items:
+          type: object
+          required: [watch_id, event_id, pmid, title, captured_at, metadata_sha256]
+          properties:
+            watch_id: { type: string }
+            event_id: { type: string }
+            pmid: { type: string, pattern: "^[0-9]+$" }
+            title: { type: string }
+            publication_date: { type: [string, "null"] }
+            journal: { type: [string, "null"] }
+            doi: { type: [string, "null"] }
+            pmcid: { type: [string, "null"] }
+            captured_at: { type: integer }
+            metadata_sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+  successEvidence:
+    - id: pubmed-watch-records
+      assertion: bibliographic_discovery_metadata_is_hash_backed_and_not_validated_evidence
+      acceptedTypes: [state_assertion]
+  effects: [read_only]
+  idempotency: guaranteed
+  recovery: retry
+authority:
+  permissions: [biomedical.literature.watch.read]
+implementations:
+  - id: medai-literature-watch-papers
+    kind: mcp
+    reference: mcp://medai/medai_literature_watch_papers

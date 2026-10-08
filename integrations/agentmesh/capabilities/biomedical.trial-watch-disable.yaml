@@ -1,0 +1,32 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.trial-watch-disable
+  version: 0.1.0
+  intent: Disable a persistent session-specific NCT watch while retaining its history.
+contract:
+  inputs:
+    type: object
+    required: [session_id, nct_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      nct_id: { type: string, pattern: '^NCT[0-9]{8}$' }
+  outputs:
+    type: object
+    required: [session_id, nct_id, disabled]
+    properties:
+      session_id: { type: string }
+      nct_id: { type: string }
+      disabled: { type: boolean, const: true }
+  successEvidence:
+    - id: watch-disabled
+      assertion: watch_is_disabled_and_previous_events_remain_readable
+      acceptedTypes: [state_assertion]
+effects: [state_write]
+idempotency: idempotent
+recovery: retry
+authority:
+  permissions: [biomedical.trials.watch.write]
+implementations:
+  - id: medai-trial-watch-disable
+    kind: mcp
+    reference: mcp://medai/medai_trials_watch_disable

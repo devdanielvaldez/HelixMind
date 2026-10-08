@@ -1,0 +1,11 @@
+gateway:
+  host: 127.0.0.1
+  port: 8080
+  environment: development
+  upstream:
+    url: http://127.0.0.1:8091/mcp
+    allow_insecure_http: true
+    request_timeout_ms: 30000
+telemetry:
+  json: false
+  filter: agentmesh=info,tower_http=info

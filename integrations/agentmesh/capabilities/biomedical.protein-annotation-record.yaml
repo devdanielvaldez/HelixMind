@@ -1,0 +1,36 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.protein-annotation-record
+  version: 0.1.0
+  intent: Retrieve a UniProtKB protein entry with annotated sequence regions and PDB cross-reference metadata.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, uniprot_accession]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      uniprot_accession: { type: string, pattern: '^[A-Za-z0-9]{6,10}(-[1-9][0-9]*)?$' }
+  outputs:
+    type: object
+    required: [accession, domains_and_regions, experimental_structure_cross_references, record_sha256, artifact_id, research_only]
+    properties:
+      accession: { type: string }
+      domains_and_regions: { type: array, items: { type: object } }
+      experimental_structure_cross_references: { type: array, items: { type: object } }
+      record_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      artifact_id: { type: string, minLength: 1 }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: uniprot-entry-retained
+      assertion: artifact.source_is_uniprotkb_and_payload_contains_record_hash
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.proteins.annotation.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-uniprot-protein-entry
+    kind: mcp
+    reference: mcp://medai/medai_proteins_get_uniprot_record

@@ -1,0 +1,39 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.paper-claim-semantic-screen
+  version: 0.1.0
+  intent: Compare two source-anchored PMC result sentence candidates using only loopback model inference after same-session artifact, source-hash, candidate-hash, and operator-reviewed license checks; retain categorical review labels and hashes/lengths binding model-visible population and methods context without full text.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, annotation_artifact_a, candidate_id_a, annotation_artifact_b, candidate_id_b]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      annotation_artifact_a: { type: string, minLength: 1 }
+      candidate_id_a: { type: string, minLength: 1, maxLength: 64 }
+      annotation_artifact_b: { type: string, minLength: 1 }
+      candidate_id_b: { type: string, minLength: 1, maxLength: 64 }
+  outputs:
+    type: object
+    required: [available, review_required]
+    properties:
+      available: { type: boolean }
+      reason: { type: string }
+      artifact_id: { type: string }
+      review_required: { type: boolean }
+      assessment: { type: object }
+      usage: { type: object }
+  successEvidence:
+    - id: semantic-claim-screening-receipt
+      assertion: result_links_two_same_session_source_hashed_candidates_and_binds_model_visible_population_and_methods_context_by_hash_and_length_while_requiring_human_review
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.literature.fulltext.read, biomedical.model.local.inference]
+implementations:
+  - id: medai-pmc-semantic-claim-screening
+    kind: mcp
+    reference: mcp://medai/medai_papers_align_pmc_claims

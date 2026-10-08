@@ -1,0 +1,44 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.capability-generate-r-proposal
+  version: 0.1.0
+  intent: Generate, statically inspect, and installation-sign a disabled R capability proposal with source and model provenance; create a deterministic review-only AMCP package without executing, registering, or promoting it.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, capability_id, description, contract, implementation_requirements]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      capability_id: { type: string, pattern: '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$' }
+      description: { type: string, minLength: 1, maxLength: 2000 }
+      contract: { type: object }
+      implementation_requirements: { type: array, minItems: 1, maxItems: 50, items: { type: string, minLength: 1, maxLength: 2000 } }
+  outputs:
+    type: object
+    required: [available, executed, registered, promoted]
+    properties:
+      available: { type: boolean }
+      proposal: { type: object }
+      artifact_id: { type: string, minLength: 1 }
+      amcp_package: { type: object }
+      amcp_artifact_id: { type: string, minLength: 1 }
+      source_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      charged_credits: { type: integer, minimum: 0 }
+      executed: { type: boolean, const: false }
+      registered: { type: boolean, const: false }
+      promoted: { type: boolean, const: false }
+      reason: { type: string }
+  successEvidence:
+    - id: signed-disabled-r-proposal
+      assertion: signed_r_source_artifact_retains_contract_static_policy_and_model_provenance_without_execution_or_registration
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [model_inference, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.capabilities.propose, biomedical.artifacts.write]
+implementations:
+  - id: medai-r-capability-code-generator
+    kind: mcp
+    reference: mcp://medai/medai_capabilities_generate_r_proposal

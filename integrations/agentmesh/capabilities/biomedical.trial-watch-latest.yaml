@@ -1,0 +1,33 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.trial-watch-latest
+  version: 0.1.0
+  intent: Retrieve the latest complete ClinicalTrials.gov record snapshot retained by a session-specific watch.
+contract:
+  inputs:
+    type: object
+    required: [session_id, nct_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      nct_id: { type: string, pattern: '^NCT[0-9]{8}$' }
+  outputs:
+    type: object
+    required: [session_id, nct_id, study, history_scope]
+    properties:
+      session_id: { type: string }
+      nct_id: { type: string }
+      study: { type: object }
+      history_scope: { type: string }
+  successEvidence:
+    - id: latest-session-observation
+      assertion: returned_study_is_the_latest_hash_verified_record_saved_by_this_session_watch
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [state_read]
+idempotency: idempotent
+recovery: retry
+authority:
+  permissions: [biomedical.trials.watch.read]
+implementations:
+  - id: medai-trial-watch-latest
+    kind: mcp
+    reference: mcp://medai/medai_trials_watch_latest

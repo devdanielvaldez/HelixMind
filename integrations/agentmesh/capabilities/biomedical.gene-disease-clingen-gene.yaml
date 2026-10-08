@@ -1,0 +1,41 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.gene-disease-clingen-gene
+  version: 0.1.0
+  intent: Retrieve ClinGen expert-panel gene-disease validity classifications by exact HGNC identifier or gene symbol from a conditionally cached export.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, gene]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      gene: { type: string, minLength: 1, maxLength: 100 }
+      limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
+  outputs:
+    type: object
+    required: [source, attribution, dataset_sha256, query, curations, total_matching_curations, truncated, research_only]
+    properties:
+      source: { type: string, const: ClinGen Gene-Disease Validity }
+      attribution: { type: string, const: Clinical Genome Resource (ClinGen) }
+      dataset_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+      query: { type: object }
+      curations: { type: array, maxItems: 100, items: { type: object } }
+      total_matching_curations: { type: integer, minimum: 0 }
+      truncated: { type: boolean }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+      interpretation_limit: { type: string }
+  successEvidence:
+    - id: clingen-gene-curations-retained
+      assertion: exact_gene_lookup_preserves_each_clingen_classification_panel_date_sop_and_record_hash
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.genetics.gene_disease.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-clingen-gene-validity-gene-query
+    kind: mcp
+    reference: mcp://medai/medai_gene_disease_clingen_gene

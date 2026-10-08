@@ -1,0 +1,32 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-session-cancel
+  version: 0.1.0
+  intent: Request cooperative session cancellation, skip queued tasks, and allow active workers to finish their current bounded operation before stopping.
+contract:
+  inputs:
+    type: object
+    required: [session_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+  outputs:
+    type: object
+    required: [session_id, status, cancellation_requested, running_tasks]
+    properties:
+      session_id: { type: string }
+      status: { type: string, enum: [cancelling, cancelled] }
+      cancellation_requested: { type: boolean, enum: [true] }
+      running_tasks: { type: integer, minimum: 0 }
+  successEvidence:
+    - id: cancellation-request-durable
+      assertion: session_cancellation_flag_and_queued_task_terminal_states_are_committed
+      acceptedTypes: [state_assertion]
+  effects: [data_write]
+  idempotency: guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.research.sessions.cancel]
+implementations:
+  - id: medai-research-session-cancel
+    kind: mcp
+    reference: mcp://medai/medai_research_cancel_session

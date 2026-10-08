@@ -1,0 +1,35 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.literature-watch-register
+  version: 0.1.0
+  intent: Persist a session scoped recurring PubMed discovery query.
+contract:
+  inputs:
+    type: object
+    required: [session_id, query, interval_seconds]
+    properties:
+      session_id: {"type":"string","minLength":1}
+      query: {"type":"string","minLength":1,"maxLength":1000}
+      interval_seconds: {"type":"integer","minimum":86400,"maximum":31536000}
+  outputs:
+    type: object
+    required: [watch_id, session_id, query, interval_seconds, enabled]
+    properties:
+      watch_id: { type: string }
+      session_id: { type: string }
+      query: { type: string }
+      interval_seconds: { type: string }
+      enabled: { type: boolean }
+  successEvidence:
+    - id: literature-watch-state
+      assertion: session_scoped_pubmed_discovery_is_auditable_and_does_not_become_validated_evidence
+      acceptedTypes: [state_assertion, provider_receipt]
+  effects: [data_write]
+  idempotency: guaranteed
+  recovery: retry
+authority:
+  permissions: [biomedical.literature.watch.write]
+implementations:
+  - id: medai-literature-watch-register
+    kind: mcp
+    reference: mcp://medai/medai_literature_watch_register

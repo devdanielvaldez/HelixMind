@@ -1,0 +1,36 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.paper-preprint-lookup
+  version: 0.1.0
+  intent: Retrieve bounded bioRxiv or medRxiv preprint metadata by exact DOI, preserving license, version, published-version linkage, and provider provenance.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, server, doi]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      server: { type: string, enum: [biorxiv, medrxiv] }
+      doi: { type: string, pattern: '^10\.1101/[A-Za-z0-9._;()/:-]{1,200}$' }
+  outputs:
+    type: object
+    required: [query_doi, server, records, artifact_id, research_only]
+    properties:
+      query_doi: { type: string }
+      server: { type: string }
+      records: { type: array, items: { type: object } }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: preprint-provider-metadata-retained
+      assertion: exact_doi_preprint_metadata_is_retained_with_license_and_source_hash
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.literature.preprint_lookup]
+implementations:
+  - id: medai-preprint-doi-lookup
+    kind: mcp
+    reference: mcp://medai/medai_papers_lookup_preprint

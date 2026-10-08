@@ -1,0 +1,32 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.paper-citation-network
+  version: 0.1.0
+  intent: Read retained Crossref citation links and calculate descriptive centrality within one research session.
+contract:
+  inputs:
+    type: object
+    required: [session_id]
+    properties:
+      session_id: { type: string, minLength: 1, maxLength: 128 }
+  outputs:
+    type: object
+    required: [session_id, items, metrics, semantics]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      items: { type: array, items: { type: object } }
+      metrics: { type: array, items: { type: object } }
+      semantics: { type: string }
+  successEvidence:
+    - id: session-scoped-citation-graph-read
+      assertion: citations_derived_from_session_owned_crossref_artifacts
+      acceptedTypes: [state_assertion]
+effects: [data_read]
+idempotency: idempotent
+recovery: retry
+authority:
+  permissions: [biomedical.literature.read]
+implementations:
+  - id: medai-crossref-citation-network
+    kind: mcp
+    reference: mcp://medai/medai_papers_citation_network

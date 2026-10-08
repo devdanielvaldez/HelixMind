@@ -1,0 +1,30 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.literature-watch-list
+  version: 0.1.0
+  intent: List session scoped PubMed discovery schedules.
+contract:
+  inputs:
+    type: object
+    required: [session_id]
+    properties:
+      session_id: {"type":"string","minLength":1}
+  outputs:
+    type: object
+    required: [session_id, items]
+    properties:
+      session_id: { type: string }
+      items: { type: array }
+  successEvidence:
+    - id: literature-watch-state
+      assertion: session_scoped_pubmed_discovery_is_auditable_and_does_not_become_validated_evidence
+      acceptedTypes: [state_assertion, provider_receipt]
+  effects: [read_only]
+  idempotency: guaranteed
+  recovery: retry
+authority:
+  permissions: [biomedical.literature.watch.read]
+implementations:
+  - id: medai-literature-watch-list
+    kind: mcp
+    reference: mcp://medai/medai_literature_watch_list

@@ -1,0 +1,49 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-task-claim
+  version: 0.2.0
+  intent: Atomically lease runnable biomedical research tasks to a named worker.
+contract:
+  inputs:
+    type: object
+    required: [session_id, worker_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      worker_id: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]{1,128}$" }
+      limit: { type: integer, minimum: 1, maximum: 16, default: 1 }
+      lease_seconds: { type: integer, minimum: 5, maximum: 3600, default: 300 }
+      task_ids:
+        type: array
+        minItems: 1
+        maxItems: 100
+        uniqueItems: true
+        items: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]+$" }
+  outputs:
+    type: object
+    required: [session_id, tasks]
+    properties:
+      session_id: { type: string }
+      tasks:
+        type: array
+        items:
+          type: object
+          required: [id, status, lease_owner, lease_until]
+          properties:
+            id: { type: string }
+            status: { type: string, enum: [running] }
+            lease_owner: { type: string }
+            lease_until: { type: integer }
+            checkpoint: { type: string, maxLength: 262144 }
+  successEvidence:
+    - id: research_task_leased
+      assertion: research_task.lease_owner_equals_worker_and_status_is_running
+      acceptedTypes: [state_assertion]
+  effects: [data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.research.tasks.claim]
+implementations:
+  - id: medai-research-task-claim
+    kind: mcp
+    reference: mcp://medai/medai_research_claim_tasks

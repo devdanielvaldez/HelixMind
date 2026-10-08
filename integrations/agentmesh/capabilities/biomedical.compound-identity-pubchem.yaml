@@ -1,0 +1,36 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.compound-identity-pubchem
+  version: 0.1.0
+  intent: Retrieve compound identifiers and chemical identity properties from PubChem, with optional local RDKit descriptors.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, identifier]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      identifier: { type: string, minLength: 1, maxLength: 256, description: PubChem CID or public research compound name; no patient identifiers }
+  outputs:
+    type: object
+    required: [query, source, matches, research_only, artifact_id]
+    properties:
+      query: { type: string }
+      source: { type: string, const: PubChem PUG REST }
+      matches: { type: array, items: { type: object } }
+      ambiguous: { type: boolean }
+      artifact_id: { type: string, minLength: 1 }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: compound-record-retained
+      assertion: artifact.source_is_pubchem_and_records_include_cid_and_sha256
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.compounds.lookup, biomedical.artifacts.write]
+implementations:
+  - id: medai-pubchem-compound-lookup
+    kind: mcp
+    reference: mcp://medai/medai_compounds_lookup_pubchem

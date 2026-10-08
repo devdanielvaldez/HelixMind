@@ -1,0 +1,39 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.drug-profile-chembl
+  version: 0.1.0
+  intent: Retrieve ChEMBL provider records for mechanisms of action, indications, and warnings only after exact standard InChIKey identity resolution.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, inchikey]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      inchikey: { type: string, pattern: '^[A-Z]{14}-[A-Z]{10}-[A-Z]$' }
+  outputs:
+    type: object
+    required: [inchikey, source, molecule_matches, mechanisms, indications, warnings, research_only, artifact_id]
+    properties:
+      inchikey: { type: string }
+      source: { type: string, const: ChEMBL web services }
+      molecule_matches: { type: array, items: { type: object } }
+      mechanisms: { type: array, items: { type: object } }
+      indications: { type: array, items: { type: object } }
+      warnings: { type: array, items: { type: object } }
+      parent_chembl_ids: { type: array, items: { type: string } }
+      artifact_id: { type: string, minLength: 1 }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: exact-identity-pharmacology-receipts
+      assertion: all_returned_pharmacology_rows_match_chosen_chembl_parent_ids_and_include_source_hashes
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.drugs.lookup, biomedical.artifacts.write]
+implementations:
+  - id: medai-chembl-drug-profile
+    kind: mcp
+    reference: mcp://medai/medai_drug_profile_chembl

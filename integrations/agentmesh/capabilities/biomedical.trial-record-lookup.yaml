@@ -1,0 +1,33 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.trial-record-lookup
+  version: 0.1.0
+  intent: Retrieve and retain a ClinicalTrials.gov study record snapshot with lifecycle, eligibility, design, and provenance metadata for computational research.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, nct_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      nct_id: { type: string, pattern: '^NCT[0-9]{8}$' }
+  outputs:
+    type: object
+    required: [study, artifact_id, research_only]
+    properties:
+      study: { type: object }
+      artifact_id: { type: string, minLength: 1 }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: registry-snapshot-retained
+      assertion: artifact.source_is_clinicaltrials_gov_and_payload_contains_nct_snapshot_hash
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.trials.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-clinicaltrials-study-record
+    kind: mcp
+    reference: mcp://medai/medai_trials_get_clinicaltrials_gov

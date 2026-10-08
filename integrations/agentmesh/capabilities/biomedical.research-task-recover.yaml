@@ -1,0 +1,33 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-task-recover
+  version: 0.1.0
+  intent: Recover expired research-task leases with a bounded retry policy.
+contract:
+  inputs:
+    type: object
+    required: [session_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      limit: { type: integer, minimum: 1, maximum: 100, default: 25 }
+  outputs:
+    type: object
+    required: [session_id, recovered_task_ids]
+    properties:
+      session_id: { type: string }
+      recovered_task_ids:
+        type: array
+        items: { type: string }
+  successEvidence:
+    - id: expired_tasks_recovered
+      assertion: every_returned_task_was_expired_and_requeued_or_failed
+      acceptedTypes: [state_assertion]
+  effects: [data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.research.tasks.recover]
+implementations:
+  - id: medai-research-task-recover
+    kind: mcp
+    reference: mcp://medai/medai_research_recover_expired_tasks

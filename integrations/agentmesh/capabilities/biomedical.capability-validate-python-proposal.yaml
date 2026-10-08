@@ -1,0 +1,53 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.capability-validate-python-proposal
+  version: 0.1.0
+  intent: Retrieve a same-session disabled Python capability proposal, verify its installation-local HMAC signature and content/source hashes, execute it with caller-supplied expected-output cases in a cached digest-pinned no-network Docker sandbox, and persist a minimized receipt bound to the exact proposal artifact and canonical validation-request digest without registering or promoting the proposal.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, proposal_artifact_id, input_data, test_cases]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      proposal_artifact_id: { type: string, minLength: 1 }
+      input_data: { type: object }
+      test_cases:
+        type: array
+        minItems: 1
+        maxItems: 100
+        items:
+          type: object
+          required: [input, expected]
+          properties:
+            input: { type: object }
+            expected: {}
+  outputs:
+    type: object
+    required: [available]
+    properties:
+      available: { type: boolean }
+      artifact_id: { type: string, minLength: 1 }
+      proposal_artifact_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      source_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      validation_request_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      provenance_signature: { type: object, required: [verified, algorithm, key_id, payload_sha256] }
+      test_case_count: { type: integer, minimum: 0, maximum: 100 }
+      validation: { type: object }
+      case_tests_passed: { type: boolean }
+      registered: { type: boolean, const: false }
+      promoted: { type: boolean, const: false }
+      reason: { type: string }
+  successEvidence:
+    - id: sandbox-validation-receipt
+      assertion: same_session_proposal_artifact_digest_installation_signature_source_digest_and_canonical_validation_request_digest_are_bound_before_bounded_execution_receipt
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.capabilities.validate, biomedical.artifacts.write]
+implementations:
+  - id: medai-pinned-python-sandbox-validation
+    kind: mcp
+    reference: mcp://medai/medai_capabilities_validate_python_proposal

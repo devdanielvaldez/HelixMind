@@ -1,0 +1,47 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.capability-validate-r-proposal
+  version: 0.1.0
+  intent: Verify a same-session signed disabled R proposal and execute caller-supplied cases in the cached digest-pinned no-network Docker R sandbox; persist a minimized hash-bound receipt without registering or promoting it.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, proposal_artifact_id, input_data, test_cases]
+    properties:
+      session_id: { type: string, minLength: 1, maxLength: 128 }
+      task_id: { type: string, minLength: 1, maxLength: 128 }
+      proposal_artifact_id: { type: string, minLength: 1, maxLength: 128 }
+      input_data: { type: object }
+      test_cases: { type: array, minItems: 1, maxItems: 100, items: { type: object } }
+  outputs:
+    type: object
+    required: [available, registered, promoted]
+    properties:
+      available: { type: boolean }
+      proposal_artifact_id: { type: string }
+      proposal_artifact_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      source_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      validation_request_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      runner: { type: string, const: docker-no-network-r }
+      image: { type: string }
+      limits: { type: object }
+      validation: { type: object }
+      cpu_usage: { type: object }
+      artifact_id: { type: string }
+      charged_credits: { type: integer, minimum: 0 }
+      case_tests_passed: { type: boolean }
+      registered: { type: boolean, const: false }
+      promoted: { type: boolean, const: false }
+  successEvidence:
+    - id: signed-r-proposal-sandbox-receipt
+      assertion: exact_same_session_signed_r_source_and_request_hashes_bind_bounded_no_network_runner_case_results_and_cpu_metering
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.capabilities.propose, biomedical.artifacts.write]
+implementations:
+  - id: medai-r-proposal-sandbox-validation
+    kind: mcp
+    reference: mcp://medai/medai_capabilities_validate_r_proposal

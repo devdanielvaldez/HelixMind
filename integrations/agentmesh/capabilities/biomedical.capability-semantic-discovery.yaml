@@ -1,0 +1,39 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.capability-semantic-discovery
+  version: 0.1.0
+  intent: Rank local AgentMesh capability contracts using schema, authority, lifecycle, and authenticated active runtime route state without executing them.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, need, requirement]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      need: { type: string, minLength: 1, maxLength: 4096 }
+      requirement: { type: object }
+      limit: { type: integer, minimum: 1, maximum: 100, default: 10 }
+  outputs:
+    type: object
+    required: [indexed_or_updated, matches, recommendation, runtime_snapshot, decision_policy, artifact_id, executed]
+    properties:
+      indexed_or_updated: { type: integer, minimum: 0 }
+      matches: { type: array, items: { type: object } }
+      recommendation: { type: string, enum: [reuse, extend, build] }
+      runtime_snapshot: { type: object }
+      decision_policy: { type: string }
+      artifact_id: { type: string }
+      executed: { type: boolean, enum: [false] }
+  successEvidence:
+    - id: semantic-discovery-artifact-retained
+      assertion: semantic_candidate_contract_lifecycle_and_authenticated_runtime_route_status_are_retained
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [read_only, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.capabilities.discover, biomedical.artifacts.write]
+implementations:
+  - id: medai-semantic-capability-discovery
+    kind: mcp
+    reference: mcp://medai/medai_capabilities_search_semantic

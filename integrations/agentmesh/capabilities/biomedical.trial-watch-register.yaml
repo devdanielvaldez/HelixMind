@@ -1,0 +1,35 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.trial-watch-register
+  version: 0.1.0
+  intent: Persist an NCT-specific ClinicalTrials.gov snapshot schedule under a research session.
+contract:
+  inputs:
+    type: object
+    required: [session_id, nct_id, interval_seconds]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      nct_id: { type: string, pattern: '^NCT[0-9]{8}$' }
+      interval_seconds: { type: integer, minimum: 3600, maximum: 31536000 }
+  outputs:
+    type: object
+    required: [session_id, nct_id, interval_seconds, next_due, enabled]
+    properties:
+      session_id: { type: string }
+      nct_id: { type: string }
+      interval_seconds: { type: integer }
+      next_due: { type: integer }
+      enabled: { type: boolean, const: true }
+  successEvidence:
+    - id: durable-watch-schedule
+      assertion: session_scoped_nct_and_interval_are_persisted_for_due_worker_discovery
+      acceptedTypes: [state_assertion]
+effects: [data_write]
+idempotency: idempotent
+recovery: retry
+authority:
+  permissions: [biomedical.trials.watch.write]
+implementations:
+  - id: medai-trial-watch-register
+    kind: mcp
+    reference: mcp://medai/medai_trials_watch_register

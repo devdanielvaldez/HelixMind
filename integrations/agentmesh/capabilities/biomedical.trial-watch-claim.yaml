@@ -1,0 +1,31 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.trial-watch-claim
+  version: 0.1.0
+  intent: Atomically lease due trial watches to one MedAI AgentMesh worker.
+contract:
+  inputs:
+    type: object
+    required: [worker_id, limit, lease_seconds]
+    properties:
+      worker_id: { type: string, minLength: 1, maxLength: 128 }
+      limit: { type: integer, minimum: 1, maximum: 100 }
+      lease_seconds: { type: integer, minimum: 30, maximum: 3600 }
+  outputs:
+    type: object
+    required: [items]
+    properties:
+      items: { type: array, items: { type: object } }
+  successEvidence:
+    - id: leased-due-watch
+      assertion: returned_watch_has_an_unexpired_lease_owned_by_the_requested_worker
+      acceptedTypes: [state_assertion]
+effects: [state_read, state_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.trials.watch.claim]
+implementations:
+  - id: medai-trial-watch-claim
+    kind: mcp
+    reference: mcp://medai/medai_trials_watch_claim_due

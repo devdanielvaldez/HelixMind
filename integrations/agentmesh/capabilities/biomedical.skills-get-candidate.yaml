@@ -1,0 +1,35 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.skills-get-candidate
+  version: 0.1.0
+  intent: Retrieve one installation-signed, immutable disabled Skill candidate for human review.
+contract:
+  inputs:
+    type: object
+    required: [skill_id, version]
+    properties:
+      skill_id: {"type":"string","minLength":3,"maxLength":160}
+      version: {"type":"string","pattern":"^[0-9]+\\.[0-9]+\\.[0-9]+\\+[a-f0-9]{16}$"}
+  outputs:
+    type: object
+    required: [skill, skill_markdown, skill_sha256, signature_verified, execution_enabled, review_required]
+    properties:
+      skill: { type: object }
+      skill_markdown: { type: string }
+      skill_sha256: { type: string }
+      signature_verified: { type: boolean , const: true }
+      execution_enabled: { type: boolean , const: false }
+      review_required: { type: boolean , const: true }
+  successEvidence:
+    - id: signed-skill-review-package
+      assertion: installation_local_skill_signature_is_verified_and_execution_remains_disabled_pending_human_approval
+      acceptedTypes: [state_assertion]
+effects: [read_only]
+idempotency: idempotent
+recovery: retry
+authority:
+  permissions: [biomedical.skills.read]
+implementations:
+  - id: medai-skills-get-candidate
+    kind: mcp
+    reference: mcp://medai/medai_skills_get_candidate

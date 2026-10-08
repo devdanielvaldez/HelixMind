@@ -1,0 +1,31 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.graph-snapshot
+  version: 0.1.0
+  intent: Read a complete research-session-scoped biomedical graph snapshot for validation, hypothesis generation, and reproducibility reporting.
+contract:
+  inputs:
+    type: object
+    required: [session_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+  outputs:
+    type: object
+    required: [session_id, nodes, edges]
+    properties:
+      session_id: { type: string }
+      nodes: { type: array, items: { type: object } }
+      edges: { type: array, items: { type: object } }
+  successEvidence:
+    - id: graph-snapshot-session-scope
+      assertion: every_node_and_edge_belongs_to_requested_research_session
+      acceptedTypes: [state_assertion]
+  effects: [read_only]
+  idempotency: guaranteed
+  recovery: retry
+authority:
+  permissions: [biomedical.graph.read]
+implementations:
+  - id: medai-session-graph-snapshot
+    kind: mcp
+    reference: mcp://medai/medai_graph_snapshot

@@ -1,0 +1,35 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.paper-crossref-resolve
+  version: 0.1.0
+  intent: Resolve a DOI or search Crossref bibliographic metadata and retain publisher-deposited citation links with provenance.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, query]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      query: { type: string, minLength: 1, maxLength: 500, description: DOI or de-identified bibliographic query }
+      limit: { type: integer, minimum: 1, maximum: 5, default: 5 }
+  outputs:
+    type: object
+    required: [records, artifact_id, citation_links_indexed, retention]
+    properties:
+      records: { type: array, items: { type: object } }
+      artifact_id: { type: string, minLength: 1 }
+      citation_links_indexed: { type: integer, minimum: 0 }
+      retention: { type: string }
+  successEvidence:
+    - id: crossref-record-retained
+      assertion: artifact.source_is_crossref_and_records_have_doi_metadata_hash
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.literature.resolve, biomedical.artifacts.write]
+implementations:
+  - id: medai-crossref-doi-bibliography
+    kind: mcp
+    reference: mcp://medai/medai_papers_resolve_crossref

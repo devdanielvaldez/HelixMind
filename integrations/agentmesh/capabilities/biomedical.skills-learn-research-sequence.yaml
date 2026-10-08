@@ -1,0 +1,41 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.skills-learn-research-sequence
+  version: 0.1.0
+  intent: Evaluate completed, hash-verified MedAI research bundles in small disjoint batches and create a signed disabled Skill candidate only when a common successful research-task sequence is supported.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+  outputs:
+    type: object
+    required: [status, evaluated_sessions, charged_credits, execution_enabled]
+    properties:
+      status: { type: string, enum: [candidate_created, insufficient_history, no_common_core_procedure, needs_review] }
+      skill_id: { type: string }
+      version: { type: string }
+      procedure_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      skill_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      artifact_id: { type: string }
+      registry_path: { type: string }
+      evaluated_sessions: { type: integer, minimum: 0, maximum: 20 }
+      charged_credits: { type: integer, const: 1 }
+      reason_code: { type: string, enum: [skill_history_or_registry_integrity_failed] }
+      review_required: { type: boolean }
+      execution_enabled: { type: boolean, const: false }
+  successEvidence:
+    - id: learned-skill-candidate-or-audited-no-op
+      assertion: candidate_is_disabled_signed_versioned_and_derived_from_verified_bundles_or_insufficient_or_nonmatching_or_integrity_failure_is_reported_for_review_without_blocking_the_research_report
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.skills.learn, biomedical.artifacts.write]
+implementations:
+  - id: medai-learn-research-skill
+    kind: mcp
+    reference: mcp://medai/medai_skills_learn_research_sequence

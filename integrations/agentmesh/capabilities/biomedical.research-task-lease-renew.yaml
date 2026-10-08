@@ -1,0 +1,34 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-task-lease-renew
+  version: 0.1.0
+  intent: Renew a live research-task lease held by the calling worker.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, worker_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      worker_id: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:-]{1,128}$" }
+      lease_seconds: { type: integer, minimum: 5, maximum: 3600, default: 300 }
+  outputs:
+    type: object
+    required: [session_id, task_id, lease_until]
+    properties:
+      session_id: { type: string }
+      task_id: { type: string }
+      lease_until: { type: integer }
+  successEvidence:
+    - id: lease_renewed
+      assertion: research_task.lease_owner_equals_worker_and_lease_extended
+      acceptedTypes: [state_assertion]
+  effects: [data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.research.tasks.renew]
+implementations:
+  - id: medai-research-task-lease-renew
+    kind: mcp
+    reference: mcp://medai/medai_research_renew_task_lease

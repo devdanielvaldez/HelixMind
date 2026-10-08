@@ -1,0 +1,37 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-task-finish
+  version: 0.1.0
+  intent: Record a worker's completed, failed, or review-required research task result.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, status]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      worker_id: { type: string, maxLength: 128, pattern: "^[A-Za-z0-9._:-]{1,128}$" }
+      status: { type: string, enum: [succeeded, failed, needs_review, skipped] }
+      output: { type: string, maxLength: 16384 }
+      error: { type: string, maxLength: 4096 }
+  outputs:
+    type: object
+    required: [session_id, task_id, status, recorded]
+    properties:
+      session_id: { type: string }
+      task_id: { type: string }
+      status: { type: string, enum: [succeeded, failed, needs_review, skipped] }
+      recorded: { type: boolean, enum: [true] }
+  successEvidence:
+    - id: task_transition_recorded
+      assertion: research_task_state_matches_requested_status
+      acceptedTypes: [state_assertion]
+  effects: [data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.research.tasks.finish]
+implementations:
+  - id: medai-research-task-finish
+    kind: mcp
+    reference: mcp://medai/medai_research_update_task

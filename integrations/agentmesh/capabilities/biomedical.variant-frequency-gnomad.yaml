@@ -1,0 +1,52 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.variant-frequency-gnomad
+  version: 0.1.0
+  intent: Retrieve one exact normalized GRCh38 variant's separate genome and exome callset allele counts and frequencies from gnomAD v4 with source provenance.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, variant_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      variant_id: { type: string, minLength: 5, maxLength: 96, pattern: '^(chr)?([1-9]|1[0-9]|2[0-2]|X|Y)-[1-9][0-9]*-[ACGTNacgtn]+-[ACGTNacgtn]+$' }
+      assembly: { type: string, enum: [GRCh38], default: GRCh38 }
+  outputs:
+    type: object
+    required: [variant_id, assembly, dataset, found, source_record_sha256, artifact_id, research_only]
+    properties:
+      variant_id: { type: string }
+      assembly: { type: string, const: GRCh38 }
+      dataset: { type: string, const: 'gnomAD v4 (gnomad_r4)' }
+      found: { type: boolean }
+      genome_frequency:
+        type: [object, 'null']
+        required: [ac, an, af]
+        properties:
+          ac: { type: integer, minimum: 0 }
+          an: { type: integer, minimum: 0 }
+          af: { type: [number, 'null'], minimum: 0, maximum: 1, description: null only when ac and an are both zero; frequency is then undefined }
+      exome_frequency:
+        type: [object, 'null']
+        required: [ac, an, af]
+        properties:
+          ac: { type: integer, minimum: 0 }
+          an: { type: integer, minimum: 0 }
+          af: { type: [number, 'null'], minimum: 0, maximum: 1, description: null only when ac and an are both zero; frequency is then undefined }
+      source_record_sha256: { type: string }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: gnomad-frequency-receipt
+      assertion: exact_variant_population_frequency_and_source_digest_are_retained
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.genetics.variant_frequency]
+implementations:
+  - id: medai-gnomad-variant-frequency
+    kind: mcp
+    reference: mcp://medai/medai_variants_lookup_gnomad_frequency

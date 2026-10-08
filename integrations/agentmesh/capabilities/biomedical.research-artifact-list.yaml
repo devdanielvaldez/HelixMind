@@ -1,0 +1,39 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-artifact-list
+  version: 0.1.0
+  intent: Read a database-bounded cursor page of immutable artifacts belonging to one biomedical research session.
+contract:
+  inputs:
+    type: object
+    required: [session_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      kind: { type: [string, 'null'], maxLength: 128 }
+      limit: { type: integer, minimum: 1, maximum: 200, default: 200 }
+      after_recorded_at: { type: [integer, 'null'], minimum: 0 }
+      after_id: { type: [string, 'null'], minLength: 1 }
+  outputs:
+    type: object
+    required: [items, next_cursor, page_size]
+    properties:
+      items: { type: array, maxItems: 200, items: { type: object } }
+      next_cursor:
+        type: [object, 'null']
+        properties:
+          recorded_at: { type: integer, minimum: 0 }
+          id: { type: string, minLength: 1 }
+      page_size: { type: integer, minimum: 1, maximum: 200 }
+  successEvidence:
+    - id: page-is-session-scoped-and-database-bounded
+      assertion: every_returned_artifact_belongs_to_requested_session_and_page_uses_stable_recorded_at_id_cursor
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [read_only]
+  idempotency: guaranteed
+  recovery: retry
+authority:
+  permissions: [biomedical.artifacts.read]
+implementations:
+  - id: medai-research-artifact-list
+    kind: mcp
+    reference: mcp://medai/medai_research_list_artifacts

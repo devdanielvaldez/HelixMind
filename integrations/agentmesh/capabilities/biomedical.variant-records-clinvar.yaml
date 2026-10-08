@@ -1,0 +1,35 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.variant-records-clinvar
+  version: 0.1.0
+  intent: Search ClinVar by a variant, gene, accession, or other public research term and retain bounded source-linked variation summaries.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, query]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      query: { type: string, minLength: 1, maxLength: 256 }
+      limit: { type: integer, minimum: 1, maximum: 20, default: 10 }
+  outputs:
+    type: object
+    required: [query, records, artifact_id, research_only]
+    properties:
+      query: { type: string }
+      records: { type: array, items: { type: object } }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: clinvar-source-records-retained
+      assertion: bounded_clinvar_variation_summaries_and_hashes_are_persisted
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.genetics.variant_records]
+implementations:
+  - id: medai-clinvar-variant-records
+    kind: mcp
+    reference: mcp://medai/medai_variants_search_clinvar

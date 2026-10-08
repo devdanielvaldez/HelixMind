@@ -1,0 +1,52 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.capability-benchmark-proposal-versions
+  version: 0.1.0
+  intent: Compare two same-capability, same-language signed execution-disabled Python or R proposals with identical contracts over caller-supplied benchmark cases in an alternating repeated pinned no-network Docker sandbox; retain a digest-bound descriptive review artifact without registering or promoting either proposal.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, baseline_proposal_artifact_id, candidate_proposal_artifact_id, benchmark_id, cases]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      baseline_proposal_artifact_id: { type: string, minLength: 1 }
+      candidate_proposal_artifact_id: { type: string, minLength: 1 }
+      benchmark_id: { type: string, minLength: 1, maxLength: 128 }
+      cases:
+        type: array
+        minItems: 10
+        maxItems: 100
+        items:
+          type: object
+          required: [case_id, input, expected]
+          properties:
+            case_id: { type: string, minLength: 1, maxLength: 128 }
+            input: { type: object }
+            expected: { type: object }
+      repeats: { type: integer, minimum: 3, maximum: 15, default: 5 }
+  outputs:
+    type: object
+    required: [comparison_sha256, execution_receipt_sha256, benchmark_sha256, recommendation, lifecycle_mutation, registered, promoted]
+    properties:
+      comparison_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      execution_receipt_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      benchmark_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      recommendation: { type: string }
+      lifecycle_mutation: { type: boolean, const: false }
+      registered: { type: boolean, const: false }
+      promoted: { type: boolean, const: false }
+      artifact_id: { type: string, minLength: 1 }
+  successEvidence:
+    - id: paired-proposal-benchmark-receipt
+      assertion: same_session_signed_source_hashes_shared_benchmark_digest_identical_cases_and_pinned_image_are_bound_to_a_non_promoting_review_receipt
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.capabilities.validate, biomedical.artifacts.write]
+implementations:
+  - id: medai-paired-pinned-generated-capability-sandbox-benchmark
+    kind: mcp
+    reference: mcp://medai/medai_capabilities_benchmark_proposal_versions

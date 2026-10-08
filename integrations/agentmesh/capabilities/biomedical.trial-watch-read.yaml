@@ -1,0 +1,29 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.trial-watch-read
+  version: 0.1.0
+  intent: Read persistent trial-watch schedules for one research session.
+contract:
+  inputs:
+    type: object
+    required: [session_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+  outputs:
+    type: object
+    required: [items]
+    properties:
+      items: { type: array, items: { type: object } }
+  successEvidence:
+    - id: retained-watch-state
+      assertion: returned_schedule_or_event_belongs_to_requested_research_session
+      acceptedTypes: [state_assertion]
+effects: [state_read]
+idempotency: idempotent
+recovery: retry
+authority:
+  permissions: [biomedical.trials.watch.read]
+implementations:
+  - id: medai-trial-watch-list
+    kind: mcp
+    reference: mcp://medai/medai_trials_watch_list

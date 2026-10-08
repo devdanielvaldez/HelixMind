@@ -1,0 +1,40 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.drug-interaction-label-screen-openfda
+  version: 0.1.0
+  intent: Retrieve bounded FDA drug-interaction label sections for two generic drug names and screen exact lexical mentions without inferring a clinical interaction.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, drug_a, drug_b]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      drug_a: { type: string, minLength: 1, maxLength: 128, description: Public generic drug name, no patient identifiers }
+      drug_b: { type: string, minLength: 1, maxLength: 128, description: Distinct public generic drug name, no patient identifiers }
+  outputs:
+    type: object
+    required: [drug_queries, source, ingredient_resolutions, labels, search_limits, label_mention_screen, research_only, clinical_advice, artifact_id]
+    properties:
+      drug_queries: { type: array, items: { type: string }, minItems: 2, maxItems: 2 }
+      source: { type: string, const: RxNorm API and openFDA drug labeling }
+      ingredient_resolutions: { type: array, items: { type: object }, minItems: 2, maxItems: 2 }
+      labels: { type: object }
+      search_limits: { type: object }
+      label_mention_screen: { type: object }
+      artifact_id: { type: string, minLength: 1 }
+      research_only: { type: boolean, const: true }
+      clinical_advice: { type: boolean, const: false }
+  successEvidence:
+    - id: label-section-records-retained
+      assertion: returned_sections_include_label_identifiers_effective_time_source_hash_and_explicit_screen_limitations
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.drugs.interactions.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-openfda-label-interaction-screen
+    kind: mcp
+    reference: mcp://medai/medai_drug_interaction_labels_openfda

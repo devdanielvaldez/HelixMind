@@ -1,0 +1,41 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.research-objective-plan
+  version: 0.1.0
+  intent: Generate bounded public-source search queries and a validated objective-specific AgentMesh task scope for a computational biomedical research objective using an explicitly configured model provider.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, objective]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, enum: [objective.normalize] }
+      objective: { type: string, minLength: 1, maxLength: 2000 }
+      depth: { type: string, enum: [standard, deep], default: standard }
+  outputs:
+    type: object
+    required: [available]
+    properties:
+      available: { type: boolean }
+      reason: { type: string }
+      planning: { type: object }
+      model: { type: string }
+      provider: { type: string }
+      prompt_sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+      response_sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+      usage: { type: object }
+      artifact_id: { type: string }
+      charged_credits: { type: integer, minimum: 1 }
+  successEvidence:
+    - id: bounded_objective_research_plan
+      assertion: planning_queries_and_registered_task_scope_conform_to_medai_biomedical_research_plan_schema
+      acceptedTypes: [provider_receipt]
+  effects: [external_communication, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.research.plan_objective]
+implementations:
+  - id: medai-research-objective-plan
+    kind: mcp
+    reference: mcp://medai/medai_research_plan_objective

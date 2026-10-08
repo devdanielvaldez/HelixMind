@@ -1,0 +1,38 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.ontology-ols4
+  version: 0.1.0
+  intent: Search EMBL-EBI OLS4 biomedical ontology terms and resolve identifiers only by exact returned identifier equality.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, query]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      query: { type: string, minLength: 1, maxLength: 256 }
+      ontology: { type: string, maxLength: 64 }
+      limit: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      identifier_resolution: { type: boolean, default: false }
+  outputs:
+    type: object
+    required: [records, returned_count, source, artifact_id, research_only]
+    properties:
+      records: { type: array, items: { type: object } }
+      returned_count: { type: integer }
+      source: { type: string, const: EMBL-EBI Ontology Lookup Service (OLS4) }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: ontology-provider-results-retained
+      assertion: bounded_ols4_records_are_source_linked_and_identifier_resolution_uses_exact_field_matches
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.ontology.search]
+implementations:
+  - id: medai-ontology-ols4-search
+    kind: mcp
+    reference: mcp://medai/medai_ontology_search

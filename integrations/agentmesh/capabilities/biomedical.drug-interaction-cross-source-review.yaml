@@ -1,0 +1,41 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.drug-interaction-cross-source-review
+  version: 0.3.0
+  intent: Compare bounded current and documented historical openFDA/DailyMed label versions and retrieve PubMed candidate articles for two uniquely resolved RxNorm ingredients using bounded RxNorm synonyms plus drug-interaction, pharmacokinetic, pharmacodynamic, and selected outcome terms; preserve source hashes and provider-reported PubMed retrieval coverage without treating retrieval signals as an interaction verdict.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, drug_a, drug_b]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      drug_a: { type: string, minLength: 1, maxLength: 128, description: Public generic drug name; do not provide patient identifiers }
+      drug_b: { type: string, minLength: 1, maxLength: 128, description: Distinct public generic drug name; do not provide patient identifiers }
+  outputs:
+    type: object
+    required: [drug_queries, openfda, dailymed, distribution_comparison, literature_screen, literature_coverage, literature_coverage_artifact_id, artifact_ids, research_only, clinical_advice]
+    properties:
+      drug_queries: { type: array, items: { type: string }, minItems: 2, maxItems: 2 }
+      openfda: { type: object }
+      dailymed: { type: object, description: Up to three current SPL records per ingredient with at most two documented prior versions per SET ID, all source-hash linked and labeled as repeated versions of the same provider record. }
+      distribution_comparison: { type: object }
+      literature_screen: { type: object }
+      literature_coverage: { type: object }
+      literature_coverage_artifact_id: { type: string, minLength: 1 }
+      artifact_ids: { type: array, items: { type: string }, minItems: 5, maxItems: 10 }
+      research_only: { type: boolean, const: true }
+      clinical_advice: { type: boolean, const: false }
+  successEvidence:
+    - id: separate-versioned-label-receipts
+      assertion: labels_and_pubmed_title_abstract_candidates_are_retained_as_distinct_source_artifacts_and_co_mentions_are_not_treated_as_interactions
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.drugs.interactions.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-cross-source-label-review
+    kind: mcp
+    reference: mcp://medai/medai_drug_interaction_cross_source_review

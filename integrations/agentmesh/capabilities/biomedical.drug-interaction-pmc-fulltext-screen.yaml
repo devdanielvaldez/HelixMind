@@ -1,0 +1,51 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.drug-interaction-pmc-fulltext-screen
+  version: 0.1.0
+  intent: Retrieve one linked PMC BioC full-text candidate for an exact RxNorm-resolved drug pair and retain only hash/offset-anchored lexical leads for human assessment of study design and pharmacology; never infer an interaction verdict.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, literature_artifact_id, candidate_artifact_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      literature_artifact_id: { type: string, minLength: 1 }
+      candidate_artifact_id: { type: string, minLength: 1 }
+      limit: { type: integer, minimum: 1, maximum: 20, default: 20 }
+  outputs:
+    type: object
+    required: [schema_version, status, source, pmcid, pmid, candidate_artifact_id, candidate_artifact_sha256, source_sha256, source_license, section_count, candidate_count, omitted_candidate_count, unanchored_lexical_match_count, candidates, interaction_verdict, review_required, interpretation_limit, retention, artifact_id]
+    properties:
+      schema_version: { type: string, const: "1" }
+      status: { type: string, enum: [review_leads_available, no_anchored_lexical_leads] }
+      source: { type: string, const: "PMC BioC" }
+      pmcid: { type: string }
+      pmid: { type: string }
+      candidate_artifact_id: { type: string }
+      candidate_artifact_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+      source_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+      source_license: { type: [string, "null"] }
+      section_count: { type: integer, minimum: 0 }
+      candidate_count: { type: integer, minimum: 0, maximum: 20 }
+      omitted_candidate_count: { type: integer, minimum: 0 }
+      unanchored_lexical_match_count: { type: integer, minimum: 0 }
+      candidates: { type: array, maxItems: 20, items: { type: object } }
+      interaction_verdict: { type: [string, "null"], const: null }
+      review_required: { type: boolean, const: true }
+      interpretation_limit: { type: string }
+      retention: { type: string }
+      artifact_id: { type: string, minLength: 1 }
+  successEvidence:
+    - id: source-anchored-fulltext-review-leads
+      assertion: linked_pmc_document_yields_bounded_hash_offset_candidates_without_persisting_article_text_or_asserting_interaction
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.drugs.interactions.read, biomedical.papers.fulltext.read, biomedical.artifacts.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-interaction-pmc-fulltext-screen
+    kind: mcp
+    reference: mcp://medai/medai_drug_interaction_pmc_fulltext_screen

@@ -1,0 +1,35 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.hypotheses-criticize
+  version: 0.1.0
+  intent: Search session evidence and alternative graph routes for review leads and optionally generate model-assisted adversarial questions against retained candidate hypotheses.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, proposal_artifact_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, const: hypotheses.criticize }
+      proposal_artifact_id: { type: string, minLength: 1 }
+      contradiction_artifact_ids: { type: array, maxItems: 50, items: { type: string, minLength: 1, maxLength: 128 } }
+  outputs:
+    type: object
+    required: [proposal_artifact_id, reviews, artifact_id, interpretation]
+    properties:
+      proposal_artifact_id: { type: string }
+      reviews: { type: array, items: { type: object } }
+      artifact_id: { type: string }
+      interpretation: { type: string }
+  successEvidence:
+    - id: criticism-retained
+      assertion: research_artifact_contains_criticism_for_session_candidate_artifact
+      acceptedTypes: [state_assertion]
+  effects: [read_only, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.hypotheses.criticize]
+implementations:
+  - id: medai-hypothesis-critic
+    kind: mcp
+    reference: mcp://medai/medai_hypotheses_criticize

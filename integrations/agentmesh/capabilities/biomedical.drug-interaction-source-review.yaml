@@ -1,0 +1,39 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.drug-interaction-source-review
+  version: 0.1.0
+  intent: Compare exact source-anchored sentences from one selected PubMed candidate or linked, license-allowlisted PMC full-text screen and one selected versioned FDA/DailyMed interaction label for categorical human-review screening.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, label_artifact_id, literature_artifact_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      label_artifact_id: { type: string, minLength: 1 }
+      literature_artifact_id: { type: string, minLength: 1 }
+      max_pairs: { type: integer, minimum: 1, maximum: 10, default: 10 }
+  outputs:
+    type: object
+    required: [label_artifact_id, literature_artifact_id, reviews, candidate_pair_count, review_required, interaction_verdict, artifact_id]
+    properties:
+      label_artifact_id: { type: string }
+      literature_artifact_id: { type: string }
+      reviews: { type: array, items: { type: object }, maxItems: 10 }
+      candidate_pair_count: { type: integer, maximum: 10 }
+      review_required: { type: boolean, const: true }
+      interaction_verdict: { type: [string, "null"], const: null }
+      artifact_id: { type: string }
+  successEvidence:
+    - id: pair-review-has-exact-source-anchors
+      assertion: every_categorical_pair_label_is_linked_to_same_session_source_artifact_hash_text_hash_field_offset_and_when_pmc_bioc_digest_and_pubmed_parent
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.drugs.interactions.read, biomedical.model.screen, biomedical.artifacts.write]
+implementations:
+  - id: medai-drug-interaction-source-review
+    kind: mcp
+    reference: mcp://medai/medai_drug_interaction_review_sources
