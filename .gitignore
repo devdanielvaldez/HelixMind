@@ -1,0 +1,13 @@
+/target/
+/.venv/
+/.medai/
+__pycache__/
+.env
+.next/
+node_modules/
+/web/playwright-report/
+/web/test-results/
+*.db
+*.db-shm
+*.db-wal
+/artifacts/

@@ -1,0 +1,185 @@
+services:
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      MEDAI_BIND: 0.0.0.0:8090
+      MEDAI_DB: /data/medai.sqlite
+      MEDAI_API_BEARER_TOKEN: "${MEDAI_API_BEARER_TOKEN:?Set MEDAI_API_BEARER_TOKEN to a secret of at least 32 bytes}"
+      MEDAI_API_TOKENS: ${MEDAI_API_TOKENS:-}
+      MEDAI_AUDIT_RETENTION_DAYS: ${MEDAI_AUDIT_RETENTION_DAYS:-}
+      MEDAI_AUDIT_ARCHIVE_DIR: ${MEDAI_AUDIT_ARCHIVE_DIR:-/data/audit-archive}
+      MEDAI_AUDIT_ARCHIVE_INTERVAL_SECONDS: ${MEDAI_AUDIT_ARCHIVE_INTERVAL_SECONDS:-86400}
+      MEDAI_AGENT_CREDIT_LIMITS: ${MEDAI_AGENT_CREDIT_LIMITS:-}
+      MEDAI_SERVICE_TENANT_ID: ${MEDAI_SERVICE_TENANT_ID:-local}
+      MEDAI_CORS_ORIGINS: ${MEDAI_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    ports:
+      - "127.0.0.1:8090:8090"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    pids_limit: ${MEDAI_API_PIDS:-256}
+    cpus: ${MEDAI_API_CPUS:-2.0}
+    mem_limit: ${MEDAI_API_MEMORY:-2g}
+    healthcheck:
+      test: ["CMD", "medai", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    volumes:
+      - medai-data:/data
+    restart: unless-stopped
+  science-mcp:
+    build:
+      context: .
+      dockerfile: science/Dockerfile
+    environment:
+      MEDAI_API_URL: http://api:8090
+      MEDAI_API_BEARER_TOKEN: "${MEDAI_API_BEARER_TOKEN:?Set MEDAI_API_BEARER_TOKEN to a secret of at least 32 bytes}"
+      MEDAI_GENCC_CACHE_DIR: /data/gencc
+      MEDAI_CLINGEN_CACHE_DIR: /data/clingen
+      MEDAI_PUBMED_SEARCH_CACHE: /data/pubmed-search-cache.sqlite
+      MEDAI_PROVENANCE_KEY_FILE: /data/keys/provenance-hmac.key
+      MEDAI_SKILLS_DIR: /data/skills
+      MEDAI_EMBEDDING_MODEL: ${MEDAI_EMBEDDING_MODEL:-/data/embedding-model}
+      MEDAI_CAPABILITY_INDEX: ${MEDAI_CAPABILITY_INDEX:-/data/capability-vectors.sqlite}
+      MEDAI_CAPABILITY_CALIBRATION_FILE: ${MEDAI_CAPABILITY_CALIBRATION_FILE:-}
+      MEDAI_CAPABILITY_CALIBRATION_SHA256: ${MEDAI_CAPABILITY_CALIBRATION_SHA256:-}
+      MEDAI_AGENTMESH_CAPABILITY_DIR: ${MEDAI_AGENTMESH_CAPABILITY_DIR:-integrations/agentmesh/capabilities}
+      AGENTMESH_CONTROL_URL: ${AGENTMESH_CONTROL_URL:-}
+      AGENTMESH_ADMIN_TOKEN: ${AGENTMESH_ADMIN_TOKEN:-}
+      AGENTMESH_TENANT: ${AGENTMESH_TENANT:-medai}
+      AGENTMESH_NAMESPACE: ${AGENTMESH_NAMESPACE:-biomedical}
+      MEDAI_AGENTMESH_SERVICE: ${MEDAI_AGENTMESH_SERVICE:-medai-mcp}
+      MEDAI_MCP_HOST: 0.0.0.0
+      MEDAI_MCP_PORT: 8091
+      NCBI_EMAIL: ${NCBI_EMAIL:-}
+      NCBI_API_KEY: ${NCBI_API_KEY:-}
+      MEDAI_MODEL_BASE_URL: ${MEDAI_MODEL_BASE_URL:-}
+      MEDAI_MODEL_NAME: ${MEDAI_MODEL_NAME:-}
+      MEDAI_MODEL_API_KEY: ${MEDAI_MODEL_API_KEY:-}
+      MEDAI_MODEL_PROVIDER_TYPE: ${MEDAI_MODEL_PROVIDER_TYPE:-openai-compatible}
+      MEDAI_MODEL_PROVIDER_NAME: ${MEDAI_MODEL_PROVIDER_NAME:-openai-compatible}
+      MEDAI_MODEL_TIMEOUT_SECONDS: ${MEDAI_MODEL_TIMEOUT_SECONDS:-60}
+      MEDAI_MODEL_MAX_OUTPUT_TOKENS: ${MEDAI_MODEL_MAX_OUTPUT_TOKENS:-4096}
+      MEDAI_AGENT_MODEL_POLICIES: ${MEDAI_AGENT_MODEL_POLICIES:-}
+      MEDAI_MODEL_RESEARCH_DIRECTOR_API_KEY: ${MEDAI_MODEL_RESEARCH_DIRECTOR_API_KEY:-}
+      MEDAI_MODEL_LITERATURE_LIBRARIAN_API_KEY: ${MEDAI_MODEL_LITERATURE_LIBRARIAN_API_KEY:-}
+      MEDAI_MODEL_PAPER_CURATOR_API_KEY: ${MEDAI_MODEL_PAPER_CURATOR_API_KEY:-}
+      MEDAI_MODEL_ENTITY_CURATOR_API_KEY: ${MEDAI_MODEL_ENTITY_CURATOR_API_KEY:-}
+      MEDAI_MODEL_GENE_DISEASE_CURATOR_API_KEY: ${MEDAI_MODEL_GENE_DISEASE_CURATOR_API_KEY:-}
+      MEDAI_MODEL_EVIDENCE_SYNTHESIZER_API_KEY: ${MEDAI_MODEL_EVIDENCE_SYNTHESIZER_API_KEY:-}
+      MEDAI_MODEL_GENOMICS_ANALYST_API_KEY: ${MEDAI_MODEL_GENOMICS_ANALYST_API_KEY:-}
+      MEDAI_MODEL_PROTEIN_ANALYST_API_KEY: ${MEDAI_MODEL_PROTEIN_ANALYST_API_KEY:-}
+      MEDAI_MODEL_PATHWAY_ANALYST_API_KEY: ${MEDAI_MODEL_PATHWAY_ANALYST_API_KEY:-}
+      MEDAI_MODEL_TRIAL_LIBRARIAN_API_KEY: ${MEDAI_MODEL_TRIAL_LIBRARIAN_API_KEY:-}
+      MEDAI_MODEL_KNOWLEDGE_GRAPH_CURATOR_API_KEY: ${MEDAI_MODEL_KNOWLEDGE_GRAPH_CURATOR_API_KEY:-}
+      MEDAI_MODEL_HYPOTHESIS_GENERATOR_API_KEY: ${MEDAI_MODEL_HYPOTHESIS_GENERATOR_API_KEY:-}
+      MEDAI_MODEL_CAPABILITY_LEARNER_API_KEY: ${MEDAI_MODEL_CAPABILITY_LEARNER_API_KEY:-}
+      MEDAI_MODEL_REPRODUCIBILITY_AGENT_API_KEY: ${MEDAI_MODEL_REPRODUCIBILITY_AGENT_API_KEY:-}
+      MEDAI_MODEL_SCIENTIFIC_CRITIC_API_KEY: ${MEDAI_MODEL_SCIENTIFIC_CRITIC_API_KEY:-}
+      MEDAI_MODEL_PHARMACOLOGY_ANALYST_API_KEY: ${MEDAI_MODEL_PHARMACOLOGY_ANALYST_API_KEY:-}
+    ports:
+      - "127.0.0.1:8091:8091"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    pids_limit: ${MEDAI_MCP_PIDS:-512}
+    cpus: ${MEDAI_MCP_CPUS:-4.0}
+    mem_limit: ${MEDAI_MCP_MEMORY:-8g}
+    volumes:
+      - medai-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+  science-worker:
+    build:
+      context: .
+      dockerfile: science/Dockerfile
+    entrypoint: ["medai-science"]
+    command: ["work", "--watch", "--poll-seconds", "300"]
+    environment:
+      MEDAI_API_URL: http://api:8090
+      MEDAI_API_BEARER_TOKEN: "${MEDAI_API_BEARER_TOKEN:?Set MEDAI_API_BEARER_TOKEN to a secret of at least 32 bytes}"
+      MEDAI_AGENTMESH_URL: ${MEDAI_AGENTMESH_URL:-http://host.docker.internal:8080/mcp}
+      MEDAI_TRIAL_WATCH_WORKER_ID: medai-compose-worker
+      NCBI_EMAIL: ${NCBI_EMAIL:-}
+      NCBI_API_KEY: ${NCBI_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1g
+    pids_limit: ${MEDAI_WORKER_PIDS:-1024}
+    cpus: ${MEDAI_WORKER_CPUS:-4.0}
+    mem_limit: ${MEDAI_WORKER_MEMORY:-8g}
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles: ["agentmesh-worker"]
+    restart: unless-stopped
+  science-specialist-worker:
+    build:
+      context: .
+      dockerfile: science/Dockerfile
+    entrypoint: ["medai-science"]
+    command: ["work", "--watch", "--poll-seconds", "300"]
+    environment:
+      MEDAI_API_URL: http://api:8090
+      MEDAI_AGENTMESH_URL: ${MEDAI_AGENTMESH_URL:-http://host.docker.internal:8080/mcp}
+      MEDAI_SCIENTIFIC_AGENT_ID: ${MEDAI_SCIENTIFIC_AGENT_ID:-literature_librarian}
+      MEDAI_SPECIALIST_API_TOKEN: ${MEDAI_SPECIALIST_API_TOKEN:-}
+      NCBI_EMAIL: ${NCBI_EMAIL:-}
+      NCBI_API_KEY: ${NCBI_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1g
+    pids_limit: ${MEDAI_WORKER_PIDS:-1024}
+    cpus: ${MEDAI_WORKER_CPUS:-4.0}
+    mem_limit: ${MEDAI_WORKER_MEMORY:-8g}
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles: ["agentmesh-specialist"]
+    restart: unless-stopped
+  web:
+    build: ./web
+    environment:
+      MEDAI_INTERNAL_API_URL: http://api:8090
+      MEDAI_WEB_SESSION_SECRET: "${MEDAI_WEB_SESSION_SECRET:?Set MEDAI_WEB_SESSION_SECRET to a unique random value of at least 32 bytes}"
+    ports:
+      - "127.0.0.1:3000:3000"
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+      - /app/.next/cache:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=0750
+    pids_limit: ${MEDAI_WEB_PIDS:-256}
+    cpus: ${MEDAI_WEB_CPUS:-2.0}
+    mem_limit: ${MEDAI_WEB_MEMORY:-2g}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  medai-data:
