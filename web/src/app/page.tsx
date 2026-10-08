@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import {
-  Activity, BookOpenText, ClipboardCheck, Dna, FlaskConical, GitBranch, Microscope,
+  Activity, BookOpenText, ClipboardCheck, Dna, FlaskConical, GitBranch, KeyRound, Microscope,
   Network, Plus, Search, ShieldCheck,
 } from "lucide-react";
 import KnowledgeGraph from "./KnowledgeGraph";
@@ -24,7 +24,8 @@ type LiteratureRecord = { key: string; title: string; abstract: string; authors:
 type WatchedPaper = { session_id: string; watch_id: string; event_id: string; pmid: string; title: string; publication_date: string | null; journal: string | null; doi: string | null; pmcid: string | null; captured_at: number; metadata_sha256: string };
 type Capability = { id: string; version: string; kind: string; status: string; description: string; manifest: string; manifest_sha256: string };
 type CapabilityEvent = { from: string | null; to: string; actor: string; reason: string; validation_sha256: string | null; occurred_at: number };
-type WorkspaceView = "overview" | "literature" | "biology" | "graph" | "hypotheses" | "experiments" | "capabilities" | "review";
+type ManagedCredential = { id: string; subject: string; tenant_id: string; role: string; created_at: number; revoked_at: number | null; active: boolean };
+type WorkspaceView = "overview" | "literature" | "biology" | "graph" | "hypotheses" | "experiments" | "capabilities" | "review" | "credentials";
 const api = "/api/medai";
 
 function artifactData(artifact: ResearchArtifact): Record<string, unknown> {
@@ -139,6 +140,12 @@ export default function Home() {
   const [literatureSearch, setLiteratureSearch] = useState("");
   const [citationFocus, setCitationFocus] = useState("");
   const [view, setView] = useState<WorkspaceView>("overview");
+  const [managedCredentials, setManagedCredentials] = useState<ManagedCredential[]>([]);
+  const [credentialSubject, setCredentialSubject] = useState("");
+  const [credentialTenant, setCredentialTenant] = useState("");
+  const [credentialRole, setCredentialRole] = useState("researcher");
+  const [issuedCredential, setIssuedCredential] = useState<{ token: string; subject: string; tenant_id: string; role: string } | null>(null);
+  const [credentialBusy, setCredentialBusy] = useState("");
 
   const refresh = async () => {
     const [sessionResponse, summaryResponse, capabilityResponse] = await Promise.all([
@@ -152,6 +159,40 @@ export default function Home() {
     setSummary(summaryData);
     setCapabilities(capabilityData.items ?? []);
   };
+
+  async function loadCredentials() {
+    const response = await fetch(api + "/v1/admin/credentials");
+    if (!response.ok) throw new Error(await response.text());
+    const result = await response.json();
+    setManagedCredentials(Array.isArray(result.items) ? result.items : []);
+  }
+
+  async function createManagedCredential(event: FormEvent) {
+    event.preventDefault();
+    setCredentialBusy("create"); setError(""); setIssuedCredential(null);
+    try {
+      const payload: Record<string, string> = { subject: credentialSubject.trim(), role: credentialRole };
+      if (browserIdentity?.role === "platform_admin") payload.tenant_id = credentialTenant.trim() || browserIdentity.tenant_id;
+      const response = await fetch(api + "/v1/admin/credentials", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? "Credential creation failed.");
+      setIssuedCredential({ token: result.token, subject: result.subject, tenant_id: result.tenant_id, role: result.role });
+      setCredentialSubject("");
+      await loadCredentials();
+    } catch (cause) { setError(String(cause)); }
+    finally { setCredentialBusy(""); }
+  }
+
+  async function revokeManagedCredential(credential: ManagedCredential) {
+    if (!window.confirm(`Revoke ${credential.role} credential for ${credential.subject}? Existing sessions using it will no longer authenticate.`)) return;
+    setCredentialBusy(credential.id); setError("");
+    try {
+      const response = await fetch(`${api}/v1/admin/credentials/${encodeURIComponent(credential.id)}`, { method: "DELETE" });
+      if (!response.ok) throw new Error(await response.text());
+      await loadCredentials();
+    } catch (cause) { setError(String(cause)); }
+    finally { setCredentialBusy(""); }
+  }
 
   async function login(event: FormEvent) {
     event.preventDefault();
@@ -179,6 +220,8 @@ export default function Home() {
   async function logout() {
     await fetch("/api/auth/session", { method: "DELETE" });
     setBrowserIdentity(null);
+    setIssuedCredential(null);
+    setManagedCredentials([]);
     setSessions([]);
     setSelected(null);
     setPlan(null);
@@ -272,6 +315,10 @@ export default function Home() {
       .finally(() => { if (active) setAuthReady(true); });
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    if (view === "credentials" && ["tenant_admin", "platform_admin"].includes(browserIdentity?.role ?? "")) void loadCredentials().catch(cause => setError(String(cause)));
+  }, [view, browserIdentity]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setLiteratureSearch(literatureFilter.trim()), 250);
@@ -627,11 +674,12 @@ export default function Home() {
           <button aria-current={view === "experiments" ? "page" : undefined} className={view === "experiments" ? "active" : ""} onClick={() => setView("experiments")}><ShieldCheck size={17} /> Reproducibility</button>
           <button aria-current={view === "capabilities" ? "page" : undefined} className={view === "capabilities" ? "active" : ""} onClick={() => setView("capabilities")}><GitBranch size={17} /> Capabilities</button>
           <button aria-current={view === "review" ? "page" : undefined} className={view === "review" ? "active" : ""} onClick={() => setView("review")}><ClipboardCheck size={17} /> Review</button>
+          {["tenant_admin", "platform_admin"].includes(browserIdentity.role) && <button aria-current={view === "credentials" ? "page" : undefined} className={view === "credentials" ? "active" : ""} onClick={() => setView("credentials")}><KeyRound size={17} /> Credentials</button>}
         </nav>
         <div className="sidebar-foot"><ShieldCheck size={16} /><span>Signed in as {browserIdentity.subject}<br /><small>{browserIdentity.tenant_id} · {browserIdentity.role}</small></span></div>
       </aside>
       <section className="main">
-        <header><div><span className="eyebrow">BIOMEDICAL AUTONOMOUS RESEARCH</span><h1>{view === "literature" ? "Literature explorer" : view === "biology" ? "Biomedical entities" : view === "graph" ? "Knowledge graph" : view === "hypotheses" ? "Hypothesis review" : view === "experiments" ? "Reproducibility record" : view === "capabilities" ? "Capability registry" : view === "review" ? "Human review" : "Research workspace"}</h1></div><div className="status"><i /> Local system</div><div className="account-controls"><span>{browserIdentity.subject} · {browserIdentity.role}</span><button type="button" onClick={() => void logout()}>Sign out</button></div></header>
+        <header><div><span className="eyebrow">BIOMEDICAL AUTONOMOUS RESEARCH</span><h1>{view === "literature" ? "Literature explorer" : view === "biology" ? "Biomedical entities" : view === "graph" ? "Knowledge graph" : view === "hypotheses" ? "Hypothesis review" : view === "experiments" ? "Reproducibility record" : view === "capabilities" ? "Capability registry" : view === "review" ? "Human review" : view === "credentials" ? "Credential administration" : "Research workspace"}</h1></div><div className="status"><i /> Local system</div><div className="account-controls"><span>{browserIdentity.subject} · {browserIdentity.role}</span><button type="button" onClick={() => void logout()}>Sign out</button></div></header>
         <section className="hero">
           <div className="hero-copy">
             <span className="pill">RESEARCH DIRECTOR</span>
@@ -653,6 +701,17 @@ export default function Home() {
             </button>
           ))}
         </div>
+        {view === "credentials" && <section className="plan-panel">
+          <div className="section-heading"><div><h3>API credentials</h3><p>Issue and revoke tenant-scoped credentials. Tokens are displayed only at creation.</p></div><button type="button" className="review-secondary" onClick={() => void loadCredentials().catch(cause => setError(String(cause)))}>Refresh</button></div>
+          <form className="credential-create" onSubmit={event => void createManagedCredential(event)}>
+            <label className="review-credential">Subject<input required minLength={1} maxLength={128} value={credentialSubject} onChange={event => setCredentialSubject(event.target.value)} placeholder="researcher-name" /></label>
+            {browserIdentity.role === "platform_admin" && <label className="review-credential">Tenant ID<input required minLength={1} maxLength={128} value={credentialTenant} onChange={event => setCredentialTenant(event.target.value)} placeholder={browserIdentity.tenant_id} /></label>}
+            <label className="review-credential">Role<select value={credentialRole} onChange={event => setCredentialRole(event.target.value)}>{(browserIdentity.role === "platform_admin" ? ["reader", "researcher", "tenant_admin", "platform_admin", "service"] : ["reader", "researcher"]).map(role => <option key={role} value={role}>{role}</option>)}</select></label>
+            <button type="submit" disabled={credentialBusy === "create" || !credentialSubject.trim()}>{credentialBusy === "create" ? "Creating…" : "Create credential"}</button>
+          </form>
+          {issuedCredential && <section className="issued-credential" aria-live="polite"><b>Credential created · copy it now</b><p>{issuedCredential.subject} · {issuedCredential.tenant_id} · {issuedCredential.role}</p><code>{issuedCredential.token}</code><button type="button" onClick={() => void navigator.clipboard?.writeText(issuedCredential.token)}>Copy token</button><button type="button" className="review-secondary" onClick={() => setIssuedCredential(null)}>Dismiss</button></section>}
+          {managedCredentials.length === 0 ? <div className="empty compact">No credentials are registered for this administration scope.</div> : <div className="capability-list">{managedCredentials.map(credential => <article key={credential.id}><div><b>{credential.subject}</b><span>{credential.tenant_id} · {credential.role}</span></div><code>{credential.id}</code><span className={`task-status ${credential.active ? "status-succeeded" : "status-deprecated"}`}>{credential.active ? "active" : "revoked"}</span><small>Created {new Date(credential.created_at * 1000).toLocaleString()}</small>{credential.active && <button type="button" className="review-reject" disabled={Boolean(credentialBusy)} onClick={() => void revokeManagedCredential(credential)}>{credentialBusy === credential.id ? "Revoking…" : "Revoke"}</button>}</article>)}</div>}
+        </section>}
         {view === "literature" && <section className="plan-panel literature-panel">
           <div className="section-heading"><div><h3>PubMed records</h3><p>{selected ? `${selected.id} · search all retained paper metadata and abstracts in this session` : "Select a research session to inspect its papers."}</p></div><span className="count">{literatureRecords.length} results loaded</span></div>
           {selected && <section aria-label="Clinical trial record snapshots" className="coverage-list"><div className="section-heading"><div><h3>ClinicalTrials.gov records</h3><p>Captured registry records and observed field changes. Provider record history opens on ClinicalTrials.gov.</p></div><span className="count">{trialSnapshots.length} snapshots</span></div>{trialSnapshots.length === 0 ? <p className="empty compact">No ClinicalTrials.gov record snapshots are retained for this session.</p> : trialSnapshots.map(({ artifact, data }) => { const nctId = String(data.nct_id ?? artifact.source_id ?? ""); const lifecycle = data.lifecycle && typeof data.lifecycle === "object" ? data.lifecycle as Record<string, unknown> : {}; const historyUrl = officialTrialHistoryUrl(nctId); return <article key={artifact.id}><div className="literature-record-meta"><span className="graph-kind">CLINICALTRIALS.GOV</span><code>{nctId}</code><span>{String(lifecycle.overall_status ?? "status unavailable")}</span><span>Captured {new Date(artifact.recorded_at * 1000).toLocaleString()}</span></div><h4>{String((data.identification as Record<string, unknown> | undefined)?.brief_title ?? nctId)}</h4><p>Automated history includes snapshots retained by MedAI; it does not backfill earlier provider versions.</p>{historyUrl ? <a href={historyUrl} target="_blank" rel="noreferrer">Open official record history for {nctId}</a> : <p>Provider history link unavailable because the stored study identifier is invalid.</p>}</article>; })}{trialComparisons.length > 0 && <div><h4>Observed snapshot comparisons</h4>{trialComparisons.map(({ artifact, data }) => { const paths = Array.isArray(data.changed_field_paths) ? data.changed_field_paths : []; return <article key={artifact.id}><div className="literature-record-meta"><code>{String(data.nct_id ?? artifact.source_id)}</code><span>{data.changed === true ? `${paths.length} changed fields` : "No changed fields"}</span><span>{new Date(artifact.recorded_at * 1000).toLocaleString()}</span></div>{paths.length > 0 ? <p>{paths.slice(0, 20).map(String).join(" · ")}{paths.length > 20 ? ` · and ${paths.length - 20} more` : ""}</p> : null}<small>Observed field changes only; scientific interpretation not performed.</small></article>; })}</div>}</section>}
