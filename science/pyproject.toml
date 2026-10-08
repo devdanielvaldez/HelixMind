@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "medai-science"
+version = "0.1.0"
+description = "Computational biomedical research services for MedAI"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27", "pydantic>=2.7", "typer>=0.12", "PyYAML>=6.0"]
+[project.optional-dependencies]
+bio = ["biopython>=1.83", "pandas>=2.2", "numpy>=1.26", "scipy>=1.13"]
+chemistry = ["rdkit>=2024.3"]
+ml = ["torch>=2.3", "transformers>=4.42", "sentence-transformers>=3.0"]
+rna = ["scanpy>=1.10"]
+mcp = ["mcp>=2.0,<3", "uvicorn>=0.30"]
+dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10"]
+[project.scripts]
+medai-science = "medai_science.cli:app"
+medai-mcp = "medai_science.mcp_server:main"
+[tool.setuptools.packages.find]
+where = ["src"]
