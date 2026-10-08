@@ -1,0 +1,29 @@
+groups:
+  - name: medai-research-operations
+    rules:
+      - alert: MedAIAPIMetricsUnavailable
+        expr: up{job="medai-api"} == 0 or absent(up{job="medai-api"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: MedAI API metrics endpoint is unavailable
+          description: Prometheus has failed to scrape the authenticated MedAI metrics endpoint for at least two minutes.
+
+      - alert: MedAIResearchTaskFailures
+        expr: sum(medai_research_tasks{status="failed"}) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Research tasks have failed
+          description: One or more tasks in the authenticated tenant are in failed state; inspect the session plan and task error before retrying.
+
+      - alert: MedAIResearchReviewBacklog
+        expr: sum(medai_research_tasks{status="needs_review"}) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Research tasks are waiting for human review
+          description: One or more tenant-scoped tasks have remained in needs_review; inspect source receipts and review rationale in MedAI.

@@ -69,6 +69,9 @@ This ledger covers the requested platform rather than hiding unfinished systems 
   - [x] Retain existing numeric quality annotations per source record without summing them as weights; state explicitly that they are neither calibrated probabilities nor independent risk-of-bias assessments.
 - [x] Add Crossref, PMC full text where permitted, preprint, ontology, gene, variant, protein, pathway, chemical, drug, and target adapters across the Python source layer, Rust CLI dispatch, retained MCP artifacts, and AgentMesh AMCP contracts.
   - [x] Add bounded Crossref DOI lookup and bibliographic search with deposited references, stable DOI links, date/license metadata, de-identified query checks, response hashes, CLI/MCP artifacts, and AgentMesh contract; keep citation links distinct from claims/evidence polarity.
+  - [x] Keep Crossref retained-reference counts synchronized with the bounded list after byte-cap pruning and verify both count and truncation metadata in the retention regression.
+  - [x] Reject duplicate JSON keys and non-standard `NaN`/`Infinity` values in Crossref responses before normalization or provenance hashing.
+  - [x] Validate Crossref year/month/day ranges and reject boolean or impossible date parts instead of publishing malformed bibliographic dates.
   - [x] Add exact-DOI bioRxiv/medRxiv metadata lookup through CLI and AgentMesh MCP with version, license, published-version link, bounded fields, omitted abstract, and provider-record hash; distinguish preprint records from peer-reviewed evidence.
   - [x] Add bounded bioRxiv/medRxiv date/category scan with local all-token title/transient-abstract screening, page/date limits, patient-query screening, omitted abstracts, CLI/MCP artifact support, and AgentMesh AMCP contract; label it non-semantic and non-comprehensive.
   - [x] Add bounded OLS4 biomedical ontology search and exact identifier resolution through CLI and budgeted AgentMesh MCP artifacts, retaining term identifiers/synonyms/descriptions with source hashes and treating provider rank as neither confidence nor cross-ontology equivalence.
@@ -169,6 +172,7 @@ This ledger covers the requested platform rather than hiding unfinished systems 
   - [x] Add operator-license-allowlisted, loopback-only model classification of every PMC BioC result sentence candidate (up to 200 per article, processed in batches of 20) into bounded categorical screening labels, anchored to source candidate IDs/offsets and passage-scoped BioC entity IDs; persist labels and hashes without article text, charge each batch, and route through the AgentMesh worker. Evaluated scientific label accuracy and semantic claim alignment remain open.
 - [ ] Implement specialized scientific agents and research director coordination.
   - [x] Add an explicit specialist roster, validate the persisted DAG/dependencies before worker claims, route each research task through its responsible specialist's MCP allowlist, and retain the deterministic agent assignment manifest with per-task outputs.
+  - [x] Reject boolean, fractional, string, zero, and over-limit research budgets at both deterministic plan construction and Research Director coordination boundaries.
   - [x] Audit literal MCP calls in every worker DAG stage against its assigned specialist allowlist; permit the protein analyst's exact-identifier protein node registration while keeping unrelated graph and pharmacology tools denied.
   - [x] Add task-filtered atomic leases and a `medai-science work --agent-id <specialist>` mode so each registered specialist can run as its own AgentMesh-facing worker deployment; preserve the general worker as the default queue consumer.
   - [x] Select provider endpoint, model, timeout, and secret environment reference by the registered specialist for model-backed DAG operations, with a shared configured fallback for roles without a profile.
@@ -196,6 +200,7 @@ This ledger covers the requested platform rather than hiding unfinished systems 
   - [x] Include bounded, privacy-screened graph relationships in the final report only when linked to same-session evidence IDs; show source/polarity receipts without asserting causality or exposing claim bodies, and label quality annotations as uncalibrated.
   - [x] Summarize the latest integrity-verified hypothesis proposal and exact-payload-linked criticism in the report; retain evidence/source references and descriptive dimensions, omit claim bodies, and label candidates and reviews as requiring human scientific review.
   - [x] Add a bounded PubMed bibliography from payload-hash-verified same-session artifacts; expose PMID/title/year/DOI metadata with privacy screening while excluding abstracts and avoiding relevance or quality ranking.
+  - [x] Privacy-screen and Markdown-sanitize the research objective in both the reproducibility snapshot and report; omit patient-flagged objective text from exported bundles and prevent objective newlines from injecting report sections.
   - [x] Expose persisted research bundles in a dedicated workspace view with task outcome hashes, source receipts, graph/evidence counts, timestamps, and explicit interpretation limits.
   - [x] Add hash-verified `bundle-diff` comparison for two captures of the same session, reporting session metadata, task, artifact, evidence, and graph changes with duplicate/dangling identity rejection and explicit review-only interpretation limits.
   - [x] Fetch two persisted bundle artifacts through the tenant-scoped authenticated API and verify both stored payload hashes and embedded session identities before comparison.
@@ -218,10 +223,12 @@ This ledger covers the requested platform rather than hiding unfinished systems 
   - [x] Require the authenticated MedAI capability lifecycle registry for semantic reuse, bind its response digest into the discovery result, match exact ID/version, force absent entries to experimental, and refuse local lifecycle overrides.
   - [x] Add an adjudicated task-capability benchmark calibrator with deterministic fit/holdout split, schema/permission/lifecycle/runtime gate filtering, holdout precision checks, content-hashed reports, model-weight fingerprints, operator-pinned report digests, and fail-closed reuse when no matching policy is configured.
   - [x] Cache the exact materialized embedding model for the MCP process lifetime, bind vectors and pinned reports to its file-content digest, and document the Compose model/report volume configuration; replacing model weights requires an MCP restart.
+  - [x] Define the embedding service as a real provider-neutral structural `Protocol`; local and hosted implementations can satisfy it without inheriting a runtime base class that raises `NotImplementedError`.
   - [x] Require declared mandatory inputs to be guaranteed by the requesting task contract and required outputs to be guaranteed by the capability schema; reject semantic reuse when either side only declares a required field as optional, with regression coverage.
   - [x] Compare nested JSON Schema `additionalProperties` and array-item constraints in the caller-to-capability direction for inputs and capability-to-consumer direction for outputs; add positive and negative regressions and rerun capability lifecycle/AMCP tests (36 passed).
   - [x] Recompute each persisted capability manifest digest and verify row ID/version before using indexed permissions, schemas, or lifecycle metadata; reject altered index records and cover digest mismatch with a regression.
   - [x] Validate persisted embedding JSON, finite numeric values, unit normalization, and a single embedding dimension across the durable index; reject mixed-dimension catalog updates transactionally and test corruption/recovery behavior.
+  - [x] Require the one-sided 95% Wilson lower confidence bound for holdout precision to meet the reuse policy, rather than enabling semantic reuse from point precision alone; retain the bound and method in the pinned report.
   - [ ] Calibrate semantic/equivalence thresholds on independently adjudicated task-capability pairs.
 - [ ] Implement code/MCP/skill/workflow generation with static analysis, signed provenance, and versioned source artifacts.
   - [x] Generate deterministic, versioned MedAI research DAG topology proposals with dependency validation, hash-only source-run receipts, disabled execution, and authenticated-review requirements; persist proposals in reproducibility bundles and expose them in the workspace.
@@ -319,6 +326,7 @@ This ledger covers the requested platform rather than hiding unfinished systems 
     - [x] Add an offline exact allele-match regression case for ClinVar VCV000009589.86 (NC_012920.1:m.3243A>G, MT:3243); its minimal reference fixture validates this coordinate/allele only and is not the canonical mitochondrial reference.
     - [x] Add an offline contract regression anchored to ClinVar VCV000242535.84, which explicitly identifies CFTR c.1210-12T[5] as part of c.[350G>A;1210-12[5]]; confirm its composite haplotype shape is excluded from singleton allele reconciliation. Fixture models the documented shape and is not represented as raw EFetch output.
     - [x] Compare ClinVar VCV000065758.157 PRRT2 c.649dupC (canonical SPDI 9C→10C, right-shifted genomic HGVS) with the externally reported left-normalized chr16:29813694G>GC allele; test the matching G anchor and sourced C-repeat tract against a generated local FASTA. Full GRCh38 flanking-reference validation remains open.
+    - [x] Add the independent ClinVar VCV000206687.64 G>C SNV at the same GRCh38 anchor to the sourced PRRT2 fixture; reconcile it separately from the right-shifted repeat insertion while keeping unsourced flanks explicitly synthetic.
   - [x] Label extracted VCV XML locations as HGVS-right-shifted per ClinVar's documented convention, and retain reference-based normalization as a mandatory reconciliation step.
   - [x] Join ClinVar and Ensembl VEP receipts locally to exact normalized VCF alleles; include alternate-allele indexes for multiallelic records, verify assembly/reference/VCF/report hashes, record identities, and source digests, preserve source observations separately, and reject stale or mismatched receipts without interpreting clinical significance.
 - [ ] Add protein sequence/domain/structure/interaction analyses with database identifiers and model limitations.
@@ -437,11 +445,16 @@ This ledger covers the requested platform rather than hiding unfinished systems 
   - [x] Validate Compose health and dependency wiring in continuous integration.
   - [x] Expose tenant-scoped Prometheus session/task status counts behind administrative authentication, with bounded status labels and no row or content data.
   - [x] Verify the metrics route passes bearer authentication and that task-state counts cannot cross tenant session boundaries.
+  - [x] Add an opt-in Prometheus Compose scraper on an internal API network, load the tenant service bearer through a file-backed Compose secret, and bind the UI to loopback.
+  - [x] Add alerts for scrape absence/failure, failed research tasks, and sustained human-review backlog; validate Prometheus configuration and rule files with promtool in CI.
+  - [x] Route evaluated alerts through an optional Alertmanager service to an operator-configured webhook URL mounted as a secret; validate its configuration in UTF-8 strict mode with amtool in CI and restrict the UI to loopback.
 - [ ] Add accessibility, localization, user/role administration, and collaboration/review UX.
-  - [x] Give the research objective input an explicit accessible name, darken muted text colors to meet WCAG AA contrast against light surfaces, and add a Playwright/axe audit across all eight workspace views, including task/capability review.
+  - [x] Give the research objective input an explicit accessible name, darken muted text colors to meet WCAG AA contrast against light surfaces, and add a Playwright/axe audit across all nine views, including task/capability review and tenant credential administration.
   - [x] Add same-tenant task decision controls and platform-admin capability promotion/deprecation/rollback forms with rationale, validation report capture, authenticated audit history, and non-persistent reviewer credential input.
   - [x] Add an end-to-end browser test that verifies a researcher review request sends the personal bearer, decision, and rationale.
   - [x] Explicitly type the bounded citation graph's DOI node collection so inference does not degrade when browser type declarations are being resolved.
+  - [x] Add role-gated tenant credential administration with one-time token disclosure, scoped listing, constrained role issuance, and revocation through the authenticated AgentMesh API.
+  - [x] Add Playwright coverage for tenant-admin credential creation, role restrictions, one-time token presentation, revocation, and clearing the disclosed token before another browser identity signs in.
   - [ ] Execute the browser audit in CI and resolve findings from the rendered application.
 
 ## Release quality
@@ -451,11 +464,14 @@ This ledger covers the requested platform rather than hiding unfinished systems 
   - [x] Add offline ClinicalTrials.gov lifecycle/provenance/snapshot comparison and genomic bundle replay/integrity regression tests.
   - [x] Add mocked AlphaFold DB tests for current/legacy response schemas, accession binding, and metadata provenance.
   - [x] Verify durable cancellation prevents source calls from starting and cancels an already-running asynchronous HTTP transport; verify MCP error classification in the leased worker.
-  - [ ] Add CI for Rust format/lint/build, Python typing/lint/tests, and web typecheck/build/accessibility.
+  - [x] Add CI for Rust format/lint/build, Python typing/lint/tests, and web typecheck/build/accessibility.
     - [x] Add GitHub Actions gates for Rust fmt/Clippy/tests, Python Ruff/mypy/unittest, and web ESLint/TypeScript/build plus a Playwright/axe accessibility audit.
     - [x] Run Rust fmt, workspace Clippy with warnings denied, complete workspace tests, and release build locally; refactor artifact storage arguments so strict Clippy needs no lint exception.
     - [ ] Generate and commit a frontend lockfile, execute all CI jobs on GitHub, and resolve any newly surfaced static or accessibility findings.
 - [ ] Add SBOM, dependency/license checks, signed releases, migration guide, and operational runbooks.
+  - [x] Generate an SPDX JSON source dependency inventory in CI, retain it as a workflow artifact, and attach it to published GitHub releases; document its limits and outstanding license/provenance controls.
+  - [x] Enforce an explicit Rust dependency license allowlist in CI, with a crate-scoped exception for r-efi's LGPL alternative.
+  - [x] Enforce an explicit fail-closed license allowlist for CI-installed Python runtime/test dependencies, checking every reported license label, including resolved transitives; track optional ml/rna extras and frontend license enforcement as open coverage.
   - [x] Document actual startup, credential/quota administration, AgentMesh workers, backup/restore, audit export/limits, data handling, and common recovery checks; explicitly call out not-yet-implemented production controls.
 - [x] Validate AgentMesh AMCP artifact against the target AgentMesh binary and exercise install/discovery end to end in an isolated temporary catalog.
 - [ ] Meter model tokens, all provider/API calls, CPU/GPU time, and storage against session credits and pause the scheduler at configured limits (session metering currently charges task starts, implemented bounded source operations across PubMed, Crossref, ClinicalTrials.gov, MyGene.info, UniProtKB, AlphaFold, PDBe SIFTS, IntAct, Reactome, PubChem, ChEMBL, openFDA, DailyMed, Open Targets/GWAS Catalog, and PMC, provider-reported model tokens, logical artifact payload bytes, measured CPU for isolated generated Python, and authenticated research API requests including atomic session creation; other API calls without a research-session context, system/provider/GPU compute, and physical storage remain open).

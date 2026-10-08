@@ -14,6 +14,7 @@ services:
       MEDAI_AGENT_CREDIT_LIMITS: ${MEDAI_AGENT_CREDIT_LIMITS:-}
       MEDAI_SERVICE_TENANT_ID: ${MEDAI_SERVICE_TENANT_ID:-local}
       MEDAI_CORS_ORIGINS: ${MEDAI_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    networks: [default, metrics]
     ports:
       - "127.0.0.1:8090:8090"
     init: true
@@ -181,5 +182,70 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
+  prometheus:
+    image: ${MEDAI_PROMETHEUS_IMAGE:-prom/prometheus:v3.15.0}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${MEDAI_PROMETHEUS_RETENTION:-15d}
+    ports:
+      - "127.0.0.1:9090:9090"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    pids_limit: ${MEDAI_PROMETHEUS_PIDS:-128}
+    cpus: ${MEDAI_PROMETHEUS_CPUS:-1.0}
+    mem_limit: ${MEDAI_PROMETHEUS_MEMORY:-1g}
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus-rules.yml:/etc/prometheus/medai-rules.yml:ro
+      - medai-prometheus:/prometheus
+    secrets:
+      - medai_metrics_token
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles: [monitoring]
+    restart: unless-stopped
+    networks: [metrics]
+  alertmanager:
+    image: ${MEDAI_ALERTMANAGER_IMAGE:-prom/alertmanager:v0.34.1}
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --data.retention=${MEDAI_ALERTMANAGER_RETENTION:-120h}
+      - --enable-feature=utf8-strict-mode
+    ports:
+      - "127.0.0.1:9093:9093"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    pids_limit: ${MEDAI_ALERTMANAGER_PIDS:-128}
+    cpus: ${MEDAI_ALERTMANAGER_CPUS:-1.0}
+    mem_limit: ${MEDAI_ALERTMANAGER_MEMORY:-512m}
+    volumes:
+      - ./deploy/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - medai-alertmanager:/alertmanager
+    secrets:
+      - medai_alert_webhook_url
+    networks: [default, metrics]
+    profiles: [monitoring]
+    restart: unless-stopped
 volumes:
   medai-data:
+  medai-prometheus:
+  medai-alertmanager:
+secrets:
+  medai_metrics_token:
+    file: ${MEDAI_METRICS_TOKEN_FILE:-./deploy/metrics-token.example}
+  medai_alert_webhook_url:
+    file: ${MEDAI_ALERT_WEBHOOK_URL_FILE:-./deploy/alert-webhook-url.example}
+networks:
+  metrics:
+    internal: true
