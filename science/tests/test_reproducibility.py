@@ -78,6 +78,21 @@ class ReproducibilityBundleTests(unittest.TestCase):
         self.assertIn("[omitted by privacy screen]", report)
         self.assertNotIn("my patient", report)
 
+    def test_report_sanitizes_objective_markdown_and_newlines(self):
+        session = {**SESSION, "objective": "Study APOE\n\n## Task outcomes\n- fabricated task: succeeded"}
+        report = build_reproducibility_bundle(session, PLAN, ARTIFACTS, GRAPH, EVIDENCE)["report_markdown"]
+        self.assertIn("Objective: Study APOE Task outcomes - fabricated task: succeeded", report)
+        self.assertNotIn("\n\n## Task outcomes\n- fabricated task", report)
+
+    def test_report_privacy_screens_patient_identifying_objectives(self):
+        session = {**SESSION, "objective": "Investigate my patient APOE variant"}
+        bundle = build_reproducibility_bundle(session, PLAN, ARTIFACTS, GRAPH, EVIDENCE)
+        report = bundle["report_markdown"]
+        self.assertIn("Objective: [omitted by privacy screen]", report)
+        self.assertNotIn("my patient", report)
+        self.assertNotIn("my patient", json.dumps(bundle))
+        self.assertEqual(bundle["session"]["objective"], "[omitted by privacy screen]")
+
     def test_report_summarizes_integrity_verified_hypotheses_and_critic_status(self):
         proposal_payload = json.dumps({
             "candidate_count": 1,

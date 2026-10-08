@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from medai_science.evaluation import calibrate_capability_reuse_threshold, evaluate_adjudicated_cases, load_pinned_capability_calibration
+from medai_science.evaluation import _wilson_precision_lower_bound, calibrate_capability_reuse_threshold, evaluate_adjudicated_cases, load_pinned_capability_calibration
 
 
 class BenchmarkEvaluationTests(unittest.TestCase):
@@ -109,6 +109,7 @@ class BenchmarkEvaluationTests(unittest.TestCase):
         self.assertEqual(result["selected_threshold"], 0.9)
         self.assertEqual(result["status"], "holdout_passed")
         self.assertGreaterEqual(result["holdout_metrics"]["n_predicted_reuse"], 20)
+        self.assertGreaterEqual(result["holdout_metrics"]["precision_lower_95_one_sided_wilson"], 0.95)
         with tempfile.TemporaryDirectory() as folder:
             report_path = Path(folder) / "calibration.json"
             report_path.write_text(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8")
@@ -129,6 +130,12 @@ class BenchmarkEvaluationTests(unittest.TestCase):
         benchmark["pairs"] = [{**row, "runtime_active": False} for row in benchmark["pairs"]]
         with self.assertRaisesRegex(ValueError, "at least 10 positive"):
             calibrate_capability_reuse_threshold(benchmark)
+
+    def test_perfect_but_small_holdout_does_not_claim_high_precision_certainty(self):
+        self.assertLess(_wilson_precision_lower_bound(20, 20), 0.95)
+        self.assertGreaterEqual(_wilson_precision_lower_bound(120, 120), 0.95)
+        with self.assertRaisesRegex(ValueError, "positive trials"):
+            _wilson_precision_lower_bound(0, 0)
 
 
 if __name__ == "__main__":

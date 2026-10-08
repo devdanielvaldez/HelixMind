@@ -32,6 +32,9 @@ class ClinVarReconciliationTests(unittest.TestCase):
         # https://www.ncbi.nlm.nih.gov/clinvar/docs/ftp_primer/
         # The published left-normalized representation is chr16:29813694G>GC
         # (https://www.mediasphera.ru/issues/zhurnal-nevrologii-i-psikhiatrii-im-s-s-korsakova/2022/5/1199772982022051128).
+        # ClinVar independently reports the anchor base as NC_000016.10:g.29813694G>C
+        # with canonical SPDI NC_000016.10:29813693:G:C (VCV000206687.64):
+        # https://www.ncbi.nlm.nih.gov/clinvar/variation/206687/
         # Match that anchor and the ClinVar repeat tract; the remaining flanks
         # in this generated FASTA are synthetic and do not stand in for GRCh38.
         position_1_based = 29_813_695
@@ -57,6 +60,7 @@ class ClinVarReconciliationTests(unittest.TestCase):
             vcf.write_text(
                 "##fileformat=VCFv4.3\n##reference=GRCh38\n"
                 "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+                "16\t29813694\t.\tG\tC\t.\tPASS\t.\n"
                 f"16\t{position_1_based}\t.\tC\tCC\t.\tPASS\t.\n",
                 encoding="ascii",
             )
@@ -68,14 +72,27 @@ class ClinVarReconciliationTests(unittest.TestCase):
                 "reference_allele": "C",
                 "alternate_allele": "CC",
             }
-            source = clinvar_record("65758", [location], accession="VCV000065758.157")
-            result = reconcile_clinvar_variants(report, [source], reference, "GRCh38")
+            insertion_source = clinvar_record("65758", [location], accession="VCV000065758.157")
+            anchor_snv = clinvar_record("206687", [{
+                "assembly": "GRCh38",
+                "contig": "16",
+                "position_1_based": 29_813_694,
+                "reference_allele": "G",
+                "alternate_allele": "C",
+            }], accession="VCV000206687.64")
+            result = reconcile_clinvar_variants(report, [insertion_source, anchor_snv], reference, "GRCh38")
 
-        self.assertEqual(result["variants"][0]["status"], "exact_normalized_allele_match")
-        self.assertEqual(result["variants"][0]["position_1_based"], position_1_based - 1)
-        self.assertEqual(result["variants"][0]["reference_allele"], "G")
-        self.assertEqual(result["variants"][0]["alternate_allele"], "GC")
-        self.assertEqual(result["variants"][0]["clinvar_records"][0]["accession"], "VCV000065758.157")
+        by_allele = {row["alternate_allele"]: row for row in result["variants"]}
+        insertion = by_allele["GC"]
+        self.assertEqual(insertion["status"], "exact_normalized_allele_match")
+        self.assertEqual(insertion["position_1_based"], position_1_based - 1)
+        self.assertEqual(insertion["reference_allele"], "G")
+        self.assertEqual(insertion["clinvar_records"][0]["accession"], "VCV000065758.157")
+        anchor = by_allele["C"]
+        self.assertEqual(anchor["status"], "exact_normalized_allele_match")
+        self.assertEqual(anchor["position_1_based"], 29_813_694)
+        self.assertEqual(anchor["reference_allele"], "G")
+        self.assertEqual(anchor["clinvar_records"][0]["accession"], "VCV000206687.64")
 
     def test_independently_curated_clinvar_mitochondrial_snv_matches_exact_local_vcf_allele(self):
         # NCBI ClinVar VCV000009589.86 reports NC_012920.1:m.3243A>G at MT:3243

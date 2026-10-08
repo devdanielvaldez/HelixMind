@@ -18,7 +18,20 @@ MAX_LABELS = 100
 MAX_ECE_BINS = 100
 MIN_CAPABILITY_PAIRS = 50
 MIN_CAPABILITY_HOLDOUT_PREDICTIONS = 20
+_WILSON_95_ONE_SIDED_Z = 1.6448536269514722
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def _wilson_precision_lower_bound(successes: int, trials: int) -> float:
+    """Return a one-sided 95% Wilson score lower bound for binomial precision."""
+    if isinstance(successes, bool) or isinstance(trials, bool) or not isinstance(successes, int) or not isinstance(trials, int) or trials <= 0 or not 0 <= successes <= trials:
+        raise ValueError("precision confidence bound requires 0 <= successes <= positive trials")
+    z = _WILSON_95_ONE_SIDED_Z
+    proportion = successes / trials
+    denominator = 1 + z * z / trials
+    center = proportion + z * z / (2 * trials)
+    margin = z * math.sqrt(proportion * (1 - proportion) / trials + z * z / (4 * trials * trials))
+    return max(0.0, (center - margin) / denominator)
 
 
 def _quadratic_weighted_kappa(left: list[str], right: list[str], levels: list[str]) -> float | None:
@@ -514,9 +527,10 @@ def calibrate_capability_reuse_threshold(
     selected_holdout = [row for row in holdout if row["semantic_similarity"] >= best["threshold"]]
     holdout_tp = sum(row["expected_reuse"] for row in selected_holdout)
     holdout_precision = holdout_tp / len(selected_holdout) if selected_holdout else 0.0
+    holdout_precision_lower_95 = _wilson_precision_lower_bound(holdout_tp, len(selected_holdout)) if selected_holdout else 0.0
     holdout_recall = holdout_tp / holdout_positive
     benchmark_sha256 = hashlib.sha256(json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
-    passes = len(selected_holdout) >= MIN_CAPABILITY_HOLDOUT_PREDICTIONS and holdout_precision >= minimum_precision
+    passes = len(selected_holdout) >= MIN_CAPABILITY_HOLDOUT_PREDICTIONS and holdout_precision_lower_95 >= minimum_precision
     return {
         "schema_version": "1",
         "benchmark_id": document["benchmark_id"],
@@ -527,13 +541,13 @@ def calibrate_capability_reuse_threshold(
         "minimum_precision": float(minimum_precision),
         "selected_threshold": best["threshold"],
         "fit_metrics": best,
-        "holdout_metrics": {"n_eligible": len(holdout), "n_predicted_reuse": len(selected_holdout), "true_positive": holdout_tp, "false_positive": len(selected_holdout) - holdout_tp, "expected_positive": holdout_positive, "expected_negative": holdout_negative, "precision": holdout_precision, "recall": holdout_recall},
+        "holdout_metrics": {"n_eligible": len(holdout), "n_predicted_reuse": len(selected_holdout), "true_positive": holdout_tp, "false_positive": len(selected_holdout) - holdout_tp, "expected_positive": holdout_positive, "expected_negative": holdout_negative, "precision": holdout_precision, "precision_lower_95_one_sided_wilson": holdout_precision_lower_95, "recall": holdout_recall},
         "eligible_pair_count": len(eligible),
         "fit_pair_count": len(fit),
         "holdout_pair_count": len(holdout),
         "reuse_enabled": passes,
         "status": "holdout_passed" if passes else "holdout_failed",
-        "interpretation_limit": "The threshold is evaluated only for this adjudicated task-capability population and embedding model. It does not establish biomedical validity. Contract, permission, lifecycle, and live route gates remain mandatory; deployment requires pinning this exact report digest.",
+        "interpretation_limit": "Reuse is enabled only when the one-sided 95% Wilson lower bound for holdout precision meets the requested minimum and at least 20 holdout reuse predictions are evaluated. The threshold is evaluated only for this adjudicated task-capability population and embedding model. It does not establish biomedical validity. Contract, permission, lifecycle, and live route gates remain mandatory; deployment requires pinning this exact report digest.",
     }
 
 

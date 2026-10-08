@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import re
@@ -25,8 +25,21 @@ def _date_part(record: dict) -> str | None:
         value = record.get(field)
         parts = value.get("date-parts") if isinstance(value, dict) else None
         first = parts[0] if isinstance(parts, list) and parts else None
-        if isinstance(first, list) and first and all(isinstance(x, int) for x in first[:3]):
-            return "-".join(f"{x:02d}" if i > 0 else str(x) for i, x in enumerate(first[:3]))
+        if not isinstance(first, list) or not 1 <= len(first) <= 3:
+            continue
+        if any(isinstance(part, bool) or not isinstance(part, int) for part in first):
+            continue
+        year = first[0]
+        if not 1 <= year <= 9999:
+            continue
+        if len(first) >= 2 and not 1 <= first[1] <= 12:
+            continue
+        if len(first) == 3:
+            try:
+                date(year, first[1], first[2])
+            except ValueError:
+                continue
+        return "-".join(f"{part:02d}" if index > 0 else str(part) for index, part in enumerate(first))
     return None
 
 
@@ -38,6 +51,22 @@ def _text_list(value: object, limit: int = 1000) -> list[str]:
 
 def _bounded_text(value: object, limit: int) -> str | None:
     return value[:limit] if isinstance(value, str) else None
+
+
+def _strict_json_loads(payload: bytes) -> object:
+    """Reject ambiguous object keys and non-standard numeric constants from the provider."""
+    def object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Crossref JSON contains a duplicate object key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"Crossref JSON contains a non-standard numeric constant: {value}")
+
+    return json.loads(payload, object_pairs_hook=object_without_duplicate_keys, parse_constant=reject_constant)
 
 
 def normalize_work(record: dict, retrieved_at: str | None = None) -> dict:
@@ -126,7 +155,7 @@ def build_retention_payload(result: list[dict], max_bytes: int = 240_000) -> dic
         for record in payload["records"]:
             refs = record.get("references", [])
             record["references"] = refs[:max(0, len(refs) - 25)]
-            record["retained_reference_count"] = len(record["references"])
+            record["references_retained_count"] = len(record["references"])
             record["references_retention_truncated"] = True
     if len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()) > max_bytes:
         raise ValueError("Crossref metadata summary cannot fit within artifact retention limit")
@@ -166,8 +195,8 @@ class CrossrefClient:
                     raise ValueError("Crossref did not find this DOI")
                 body = await read_bounded_response(response, _MAX_BYTES, "Crossref")
         try:
-            payload = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            payload = _strict_json_loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
             raise ValueError("Crossref returned invalid JSON") from error
         if not isinstance(payload, dict) or not isinstance(payload.get("message"), dict):
             raise ValueError("Crossref returned an unexpected record shape")

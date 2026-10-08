@@ -60,6 +60,17 @@ class CrossrefTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             asyncio.run(CrossrefClient(transport=httpx.MockTransport(handler)).get_work("10.1234/example.1"))
 
+    def test_rejects_duplicate_json_keys_and_nonstandard_numeric_constants(self):
+        for body in (
+            b'{"message":{"DOI":"10.1234/example.1","DOI":"10.9999/other"}}',
+            b'{"message":{"DOI":"10.1234/example.1","score":NaN}}',
+            b'{"message":{"DOI":"10.1234/example.1","score":Infinity}}',
+        ):
+            with self.subTest(body=body):
+                transport = httpx.MockTransport(lambda _: httpx.Response(200, content=body))
+                with self.assertRaisesRegex(ValueError, "invalid JSON"):
+                    asyncio.run(CrossrefClient(transport=transport).get_work("10.1234/example.1"))
+
     def test_reference_count_is_capped_and_doi_validation_is_strict(self):
         work = _work()
         work["reference"] = [{"DOI": f"10.9999/ref{i}"} for i in range(250)]
@@ -68,6 +79,16 @@ class CrossrefTests(unittest.TestCase):
         self.assertTrue(normalized["references_truncated"])
         with self.assertRaises(ValueError):
             CrossrefClient.validate_doi("patient id: 123456")
+
+    def test_invalid_crossref_date_parts_are_not_misreported_as_publication_dates(self):
+        work = _work()
+        work["published-print"] = {"date-parts": [[True, 3, 2]]}
+        work["published-online"] = {"date-parts": [[2024, 2, 30]]}
+        work["issued"] = {"date-parts": [[2023, 9]]}
+        self.assertEqual(normalize_work(work)["published_date"], "2023-09")
+
+        work["issued"] = {"date-parts": [[2023, 13, 1]]}
+        self.assertIsNone(normalize_work(work)["published_date"])
 
     def test_artifact_retention_strips_free_text_and_enforces_medai_payload_limit(self):
         records = []
@@ -80,6 +101,9 @@ class CrossrefTests(unittest.TestCase):
         self.assertLessEqual(len(encoded), 240_000)
         self.assertNotIn("sensitive copyright text", encoded.decode())
         self.assertEqual(len(payload["complete_result_sha256"]), 64)
+        for record in payload["records"]:
+            self.assertEqual(record["references_retained_count"], len(record["references"]))
+            self.assertEqual(record["references_retention_truncated"], record["references_retained_count"] < 150)
 
 
 if __name__ == "__main__":

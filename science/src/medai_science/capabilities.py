@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
-from typing import Iterable
+from typing import Iterable, Protocol
 
 class Decision(str, Enum):
     REUSE = "reuse"
@@ -32,11 +32,10 @@ class CapabilityMatch:
     score: float
 
 
-class EmbeddingProvider:
+class EmbeddingProvider(Protocol):
     """Structural protocol for a local or hosted, provider-neutral text embedder."""
 
-    def embed(self, text: str) -> list[float]:
-        raise NotImplementedError
+    def embed(self, text: str) -> list[float]: ...
 
 
 def hash_local_embedding_model(model_path: str | Path) -> str:

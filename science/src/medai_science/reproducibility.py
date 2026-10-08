@@ -65,7 +65,8 @@ def _report_label(value: Any, maximum: int = 160) -> str:
         ensure_public_research_query(normalized)
     except ValueError:
         return "[omitted by privacy screen]"
-    return normalized.translate(str.maketrans({"`": "'", "[": "(", "]": ")", "<": "(", ">": ")", "*": "", "_": "", "#": "", "~": "", "|": ""}))
+    sanitized = normalized.translate(str.maketrans({"`": "'", "[": "(", "]": ")", "<": "(", ">": ")", "*": "", "_": "", "#": "", "~": "", "|": ""}))
+    return " ".join(sanitized.split())
 
 
 def _report_code(value: Any, maximum: int = 128) -> str:
@@ -399,15 +400,18 @@ def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], 
         )
         if len(report_assertions) == MAX_REPORT_GRAPH_ASSERTIONS:
             break
+    session_receipt = {key: session.get(key) for key in ("id", "status", "created_at", "depth", "budget", "credits_used")}
+    session_receipt["objective"] = _report_label(session.get("objective"), 2000)
     snapshot = {
         "schema_version": "1",
-        "session": {key: session.get(key) for key in ("id", "objective", "status", "created_at", "depth", "budget", "credits_used")},
+        "session": session_receipt,
         "tasks": task_receipts,
         "artifacts": artifact_receipts,
         "evidence_annotations": evidence_receipts,
         "graph": graph_receipt,
         "limitations": [
             "This bundle contains provenance and structural snapshots, not complete source datasets or article text.",
+            "The session objective is privacy-screened and Markdown-sanitized for export; original objective text is not copied into this bundle.",
             "Evidence polarity and quality are retained annotations and are not independently calibrated.",
             "The bundle hash verifies the captured bundle bytes; it does not establish scientific correctness.",
         ],
@@ -417,7 +421,7 @@ def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], 
         "# Biomedical computational research report",
         "",
         f"Session: `{session_id}`",
-        f"Objective: {session.get('objective', '')}",
+        f"Objective: {_report_label(session.get('objective'), 2000)}",
         f"Status: **{session.get('status', 'unknown')}** | Depth: {session.get('depth', 'unknown')} | Credits: {session.get('credits_used', 0)}/{session.get('budget', 0)}",
         "",
         "## Research record",
