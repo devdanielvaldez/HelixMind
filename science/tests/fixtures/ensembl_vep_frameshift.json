@@ -1,0 +1,16 @@
+{
+  "source": "Ensembl Variant Effect Predictor documentation, repeat-region insertion example",
+  "source_url": "https://static.ensembl.org/info/docs/tools/vep/script/vep_other.html",
+  "observation_date": "2026-10-08",
+  "source_variant": "3 46358467 . A AG",
+  "gene_id": "ENSG00000121807",
+  "transcript_id": "ENST00000292301",
+  "strand": 1,
+  "source_consequences": ["frameshift_variant", "splice_region_variant"],
+  "source_cdna_position": "1425-1426",
+  "source_cds_position": "940-941",
+  "source_protein_position": 314,
+  "source_amino_acids": "S/RX",
+  "source_codons": "agc/aGgc",
+  "fixture_method": "A synthetic local plus-strand CDS places the documented insertion at the documented CDS/protein offset and preserves its local codon context. The fixture independently checks frameshift class, amino-acid change, and protein position; it does not reproduce the full genomic locus, splice model, or transcript sequence."
+}

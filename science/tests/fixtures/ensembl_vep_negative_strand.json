@@ -1,0 +1,50 @@
+{
+  "source": "Ensembl Variant Effect Predictor documentation, example output",
+  "source_url": "https://covid-19.ensembl.org/info/docs/tools/vep/script/vep_other.html",
+  "assembly": "GRCh38",
+  "transcript_id": "ENST00000366667",
+  "gene_id": "ENSG00000135744",
+  "strand": -1,
+  "cases": [
+    {
+      "name": "rs699",
+      "source_variant": "1:230710048 A>G",
+      "source_cds_position": 803,
+      "source_protein_position": 268,
+      "source_codon_change": "aTg/aCg",
+      "expected_consequence": "missense_variant",
+      "expected_reference_amino_acid": "M",
+      "expected_alternate_amino_acid": "T",
+      "local_fixture_position": 2,
+      "local_reference": "A",
+      "local_alternate": "G"
+    },
+    {
+      "name": "var_2_alt_T",
+      "source_variant": "1:230710514 A>T",
+      "source_cds_position": 337,
+      "source_protein_position": 113,
+      "source_codon_change": "Ttg/Atg",
+      "expected_consequence": "missense_variant",
+      "expected_reference_amino_acid": "L",
+      "expected_alternate_amino_acid": "M",
+      "local_fixture_position": 468,
+      "local_reference": "A",
+      "local_alternate": "T"
+    },
+    {
+      "name": "var_2_alt_G",
+      "source_variant": "1:230710514 A>G",
+      "source_cds_position": 337,
+      "source_protein_position": 113,
+      "source_codon_change": "Ttg/Ctg",
+      "expected_consequence": "synonymous_variant",
+      "expected_reference_amino_acid": "L",
+      "expected_alternate_amino_acid": "L",
+      "local_fixture_position": 468,
+      "local_reference": "A",
+      "local_alternate": "G"
+    }
+  ],
+  "fixture_method": "The local reference is a synthetic negative-strand CDS preserving the source codons and CDS offsets under test. Local genomic coordinates are projected so that reverse-strand transcript coordinate equals 805 minus local genomic coordinate. The two var_2 alternate alleles are supplied as one multiallelic VCF record. This validates codon/orientation and allele-splitting logic against the independent VEP output; it does not reproduce the full human genomic locus or transcript model."
+}

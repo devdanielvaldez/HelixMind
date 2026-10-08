@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Contract fixture anchored to ClinVar VCV000242535.84. This is not a downloaded
+EFetch response: ClinVar's public record identifies c.1210-12T[5] as a
+2 bp deletion and explicitly says it is part of the c.[350G>A;1210-12[5]]
+haplotype. The two simple alleles below model that documented composite shape
+to make parser behavior deterministic and offline.
+Source: https://www.ncbi.nlm.nih.gov/clinvar/variation/VCV000242535.84/
+Accessed 2026-10-08.
+-->
+<VariationArchiveSet>
+  <VariationArchive VariationID="242535" Accession="VCV000242535.84">
+    <ClassifiedRecord>
+      <Haplotype>
+        <SimpleAllele><Location><SequenceLocation Assembly="GRCh38" Chr="7" start="117548629" stop="117548629" Accession="NC_000007.14" referenceAllele="G" alternateAllele="A"/></Location></SimpleAllele>
+        <SimpleAllele><Location><SequenceLocation Assembly="GRCh38" Chr="7" start="117548630" stop="117548631" Accession="NC_000007.14" referenceAllele="TT" alternateAllele=""/></Location></SimpleAllele>
+      </Haplotype>
+    </ClassifiedRecord>
+  </VariationArchive>
+</VariationArchiveSet>
