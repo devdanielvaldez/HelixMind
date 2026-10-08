@@ -1,0 +1,28 @@
+name: Live provider contracts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 7 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-provider-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gnomad:
+    name: gnomAD GraphQL schema and documented examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e science
+      - name: Query two maintainer-published GRCh38 examples through the production adapter
+        run: PYTHONPATH=science/src python science/scripts/verify_gnomad_live.py

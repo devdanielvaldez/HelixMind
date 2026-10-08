@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust format, lint, and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  science:
+    name: Python science tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: science/pyproject.toml
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev,mcp,bio,chemistry]"
+        working-directory: science
+      - run: ruff check src tests
+        working-directory: science
+      - run: mypy src/medai_science
+        working-directory: science
+      - run: python -m unittest discover -s tests -v
+        working-directory: science
+
+  deployment-config:
+    name: Compose deployment configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose service dependencies and healthcheck configuration
+        run: docker compose config --quiet
+        env:
+          MEDAI_API_BEARER_TOKEN: ci-placeholder-api-secret-01234567890123456789
+          MEDAI_WEB_SESSION_SECRET: ci-placeholder-web-secret-01234567890123456789
+
+  web:
+    name: Web typecheck, build, and browser audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package.json
+      - run: npm install --no-audit --no-fund
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: node --test scripts/browser-session.test.mjs
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:a11y
+        env:
+          CI: "true"
