@@ -1,0 +1,327 @@
+# Biomedical Autonomous Research Intelligence
+
+MedAI is a computational biomedical research platform designed around reproducible evidence, extensible scientific capabilities, and governed execution. It combines **Rust** for the durable runtime, CLI, API, and policy boundary; **Python** for scientific connectors and analysis; and **TypeScript/Next.js** for the research workspace.
+
+AgentMesh is the capability governance and MCP service-mesh layer. MedAI defines biomedical intent and scientific provenance; AgentMesh validates and routes portable AMCP capability packages and MCP tools. Generated code is not silently activated.
+
+The Research Director validates the durable task graph, assigns each stage to a domain specialist, and records a hash-addressed coordination manifest. Each specialist worker uses a service credential bound to its registered role; the MCP server validates that identity and the API enforces the role's task allowlist on leases, writes, and budget charges. Run `medai-science work --agent-id literature_librarian` (or another registered specialist ID) to deploy a worker that atomically leases only its assigned task IDs. Compose includes a separate `agentmesh-specialist` profile; set `MEDAI_SCIENTIFIC_AGENT_ID` per deployment to run different roles. Configure optional hard per-session specialist ceilings with `MEDAI_AGENT_CREDIT_LIMITS='{"scientific_critic":40,"research_director":10}'`; task starts and source/model charges count toward both specialist and session budgets, and exhausted work is routed to human review. AgentMesh route changes require an authenticated control-plane connection, an exact reviewed plan digest, and a platform-admin approval receipt; the synchronizer journals changes and rolls back confirmed writes when post-apply verification fails.
+
+See [the operations runbook](docs/OPERATIONS.md) for deployment configuration, tenant credentials/quotas, AgentMesh workers, backup/restore, and incident review.
+
+## Start locally
+
+Prerequisites: Rust 1.85+, Python 3.11+, Node.js 20+.
+
+```sh
+cargo run -p medai -- investigate "Alzheimer disease"
+cargo run -p medai -- research
+cargo run -p medai-api
+```
+
+In another terminal:
+
+```sh
+cd web
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`. The workspace browses persisted sessions, task plans, Crossref citation links, biomedical entities/relationships, hypothesis and critic artifacts, and the local capability registry. By default, the Rust CLI and API use `.medai/medai.sqlite`. Set `MEDAI_DB` (or pass `medai --db PATH`) so the CLI and API share another exact database path; `MEDAI_HOME` changes the CLI's default database directory when `MEDAI_DB` is unset. The API binds to loopback by default.
+
+Create and verify consistent local database snapshots with the Rust CLI:
+
+```bash
+medai database backup ./backups/medai-2026-10-07.sqlite
+medai database verify ./backups/medai-2026-10-07.sqlite
+medai database restore ./backups/medai-2026-10-07.sqlite --confirm-no-writers
+```
+
+Backups include the committed SQLite state (including WAL contents), pass structural and foreign-key integrity checks before publication, receive a SHA-256 digest, use private file permissions on Unix, and never overwrite an existing destination. Restore first verifies the source, saves a verified pre-restore snapshot, copies through SQLite's online backup API, checks integrity, and reopens the database through normal schema migrations. Stop the API and all workers before running restore; the required confirmation flag records this maintenance precondition. The rollback snapshot path is printed in the receipt. Remote/object-store retention remains pending.
+
+Run the API, MCP service, and web workspace with Docker Compose:
+
+```sh
+cp .env.example .env
+# Set NCBI_EMAIL in .env before using PubMed tools; export a local Compose API secret.
+export MEDAI_API_BEARER_TOKEN="$(openssl rand -hex 32)"
+docker compose up --build
+```
+
+The MCP endpoint is published at `http://127.0.0.1:8091/mcp`. Point AgentMesh at it by running `agentmesh serve --config integrations/agentmesh/config/agentmesh-medai.yaml`; connect MCP clients to AgentMesh's `http://127.0.0.1:8080/mcp` gateway.
+
+For durable research execution and scheduled literature/trial watches, first start the AgentMesh gateway with that configuration, then enable the worker profile with `docker compose --profile agentmesh-worker up --build -d`. Set `MEDAI_AGENTMESH_URL` if the gateway is not reachable at `http://host.docker.internal:8080/mcp`. For PubMed watches, set `NCBI_EMAIL`, then call `medai_literature_watch_register` with a session ID, public research query, and interval of at least 86400 seconds. The worker uses a durable lease, charges the session budget, and searches a two-interval overlapping PubMed entry-date window, capped at 200 PMIDs. For up to 20 newly discovered PMIDs per refresh it retains title, publication date, journal, DOI, and PMCID with a content hash; it does not retain abstracts or promote discoveries to validated claims. Overflow is marked incomplete for review. Use `medai_literature_watch_list`, `medai_literature_watch_events`, `medai_literature_watch_papers`, and `medai_literature_watch_disable` to review or stop a watch. ClinicalTrials.gov watches use `medai_trials_watch_register` with a session ID, NCT ID, and interval of at least 3600 seconds; the worker retains versioned snapshots and field diffs. Use `medai_trials_watch_list`, `medai_trials_watch_events`, and `medai_trials_watch_disable` to review or stop a trial watch.
+
+The AgentMesh worker uses a source-record ceiling of 10 for standard investigations and 20 for deep investigations, bounded by the session budget. Pass `--paper-limit` to `medai-science execute` or `medai-science work` to set an explicit ceiling from 1 to 20; the execution receipt records the resolved value.
+
+Scientific source adapters:
+
+```sh
+cd science
+python -m venv .venv
+. .venv/bin/activate
+pip install -e .
+export NCBI_EMAIL=researcher@example.org
+medai-science papers "APOE microglia" --limit 20
+medai-science trials "Alzheimer disease" --limit 20
+medai-science trial NCT01234567
+medai-science trial NCT01234567 --bundle-dir ./bundles/trial-NCT01234567
+medai-science bundle-verify ./bundles/trial-NCT01234567 --replay
+medai-science compound aspirin
+medai-science drug aspirin
+medai-science drug-interactions aspirin warfarin
+medai-science crossref "APOE microglia"
+medai-science gene APOE --species human
+medai-science skills list
+medai-science variant rs429358
+medai-science preprint medrxiv 10.1101/2020.09.09.20191205
+medai-science preprints-search biorxiv "TREM2 microglia" --start-date 2026-01-01 --end-date 2026-01-31 --category neuroscience --limit 20 --max-pages 2
+medai-science ontology-search "Alzheimer disease" --ontology mondo --limit 20
+medai-science ontology-term MONDO_0004979 --ontology mondo
+medai-science gene-panel 214 --version 2.1
+medai-science gencc-gene HGNC:983 --limit 25
+medai-science gencc-disease MONDO:0004979 --limit 100
+medai-science clingen-gene HGNC:10990 --limit 50
+medai-science clingen-disease MONDO:0014175 --limit 50
+medai-science orphadata-disease 61
+medai-science variant-reconcile cohort.report.json clinvar-results.json GRCh38.fa --genome-build GRCh38
+medai-science variant-annotate-vep cohort.report.json --genome-build GRCh38
+medai-science variant-reconcile-sources cohort.report.json clinvar-reconciliation.json vep-annotation.json
+medai-science variant-frequency 1-55051215-G-GA
+medai-science variant-reconcile-gnomad cohort.report.json gnomad-frequency.json
+medai-science protein TREM2 --organism-id 9606
+medai-science protein-record P05067
+medai-science protein-mapping P05067 --max-structures 10
+medai-science structure P05067
+medai-science interactions P05067 --limit 100 --organism-id 9606
+medai-science pathways "APOE,TREM2,APP" --species "Homo sapiens"
+medai-science pathways "APOE,TREM2,APP" --bundle-dir ./bundles/alzheimer-pathways
+medai-science bundle-verify ./bundles/alzheimer-pathways --replay
+medai-science genome-vcf cohort.vcf.gz --genome-build GRCh38 --reference-fasta GRCh38.fa --transcript-gff3 annotation.gff3 --output cohort.report.json
+medai-science genome-vcf cohort.vcf.gz --genome-build GRCh38 --reference-fasta GRCh38.fa --transcript-gff3 annotation.gff3 --bundle-dir ./ALZ-variant-analysis
+MEDAI_API_BEARER_TOKEN=... medai-science genome-vcf cohort.vcf.gz --genome-build GRCh38 --submit-session RES-2026-000128
+medai-science bundle-verify ./ALZ-variant-analysis
+medai-science bundle-verify ./ALZ-variant-analysis --replay
+medai-science sequence-fasta reference.fa --molecule-type nucleotide --bundle-dir ./reference-qc
+medai-science sequence-fastq reads.fastq.gz --bundle-dir ./reads-qc
+medai-science bundle-verify ./reference-qc --replay
+medai-science bundle-verify ./reads-qc --replay
+medai-science compound aspirin --bundle-dir ./aspirin-descriptors
+medai-science bundle-verify ./aspirin-descriptors --replay
+medai-science benchmark-evaluate adjudicated-benchmark.json --bins 10
+```
+
+`genome-vcf --submit-session RES-...` analyzes the VCF locally and submits only a bounded aggregate receipt to the authenticated tenant-scoped research session. Variant alleles, coordinates, genotype counts, sample identifiers, and the source VCF remain local. The worker validates receipt provenance but cannot verify the receipt against the source file or make clinical interpretations.
+
+`benchmark-evaluate` accepts categorical benchmark schemas v1/v2 and ordinal multi-domain quality schema v3. Schema v3 requires a source digest per case, two distinct primary reviewers, and a distinct adjudicator for every case with a disagreement. It reports domain-specific agreement, quadratic weighted kappa, prediction exact/within-one-level accuracy, abstention coverage, ordinal error, and calibration of exact-label confidence. Scale meanings and order come from the benchmark protocol; the tool does not generate evidence grades. The checked-in evaluator tests use synthetic fixtures only, so scientific validation requires a separately assembled and independently adjudicated dataset.
+
+During `drugs.investigate`, the AgentMesh pharmacology specialist can follow exact PubChem compound identifiers provided in PMC BioC extraction receipts through PubChem identity resolution and ChEMBL profile lookup. It does not infer drug identity from a paper's free text; compound co-occurrence is not evidence of a disease mechanism or therapeutic effect.
+
+`variant-annotate-vep` accepts only a MedAI VCF analysis report that validated its alleles against the supplied local reference FASTA, sends only supported sequence alleles, and requires the VEP assembly to match the report. It retains selected transcript consequence fields and source-record hashes; it does not make pathogenicity or clinical judgments. The adapter uses Ensembl's [VEP regional REST endpoint](https://rest.ensembl.org/documentation/info/vep_region_post) and the GRCh37 service for GRCh37 reports.
+
+`variant-reconcile-sources` joins a ClinVar reconciliation receipt and an Ensembl VEP annotation to the exact local, reference-normalized VCF report used to produce both. It verifies build, reference, VCF/report digests, local record and alternate-allele indexes, and source identities; keeps ClinVar assertions and VEP consequences in separate fields; and rejects stale or mismatched receipts. The join is a provenance and identity operation only: it does not adjudicate disagreements, assign evidence strength, or interpret pathogenicity. For a private replay bundle, `genome-vcf` accepts `--clinvar-results clinvar-results.json` with `--reference-fasta`; combine it with `--annotate-vep` to capture both source receipts and the local cross-source join. `bundle-verify --replay` re-runs local normalization and reconciliation without re-querying either provider.
+
+`variant-frequency` looks up one exact GRCh38 variant ID in gnomAD v4 and retains genome and exome allele counts/frequencies as separate callsets with a source-record digest and retrieval time. It canonicalizes ID spelling, but does not verify the reference allele or normalize indels. The local VCF pipeline reference-checks alleles and left-aligns simple insertions/deletions; complex unequal-length alleles are explicitly marked as not left-aligned. Use the local analysis report for exact reconciliation, and inspect the normalization status before interpreting complex variants. If AC and AN are both zero, AF is retained as `null` because no frequency is known; the adapter rejects a numeric AF for a zero allele number. This follows gnomAD's [documented display change for AN=0](https://gnomad.broadinstitute.org/news/2023-08-modify-population-frequency-table/). The request uses the `variantId` and `datasetId` GraphQL variables and selects `variant_id`, `genome`, and `exome` frequency fields from the [maintainers' published GraphQL example](https://discuss.gnomad.broadinstitute.org/t/blocked-when-using-api-to-get-af/149); the adapter paces requests for the documented 10-per-minute browser API limit and is intended for individual lookups, not cohort-scale queries. Run `PYTHONPATH=science/src python3 science/scripts/verify_gnomad_live.py` from the repository root, or dispatch the `Live provider contracts` GitHub Actions workflow, to validate two variants shown in that provider example against the live API. The live check has not passed in the current restricted-DNS environment. `variant-reconcile-gnomad` joins receipts to a reference-validated local report by exact normalized allele identity and rejects mismatched assemblies, identities, duplicate receipts, and inconsistent AC/AN/AF values. Genome and exome observations must not be summed as if they represented disjoint cohorts. These population observations do not establish individual genotype, pathogenicity, disease causality, or clinical risk. The AgentMesh capability `biomedical.variant-frequency-gnomad` applies the same single-allele lookup through a budgeted MCP artifact. Pass the receipt JSON as `--gnomad-frequency-receipts` to `genome-vcf` together with `--reference-fasta` and `--bundle-dir` to preserve it in a private replay bundle; verification recomputes the local join without contacting gnomAD.
+
+`gene-panel` retrieves one exact numeric PanelApp ID and, optionally, a pinned version. PanelApp's source-native confidence levels, inheritance labels, phenotype and evidence fields are retained independently; they are not combined with Open Targets or GWAS scores. PanelApp documents numeric panel lookup, version selection, and gene entities in its [API and usage guidance](https://panelapp.genomicsengland.co.uk/).
+
+`gencc-gene` and `gencc-disease` query GenCC's new-format submission export by exact HGNC gene or MONDO disease ID. The CC0 snapshot is cached privately with ETag/Last-Modified conditional refresh and a 24-hour minimum interval, respecting GenCC's documented weekly updates and download quota. Each submitter assertion remains a separate record; MedAI does not compute a consensus or combine its classifications with other gene-disease sources. The export omits restricted OMIM data. See GenCC's [download and programmatic access terms](https://thegencc.org/download).
+
+`clingen-gene` and `clingen-disease` query ClinGen Gene-Disease Validity by exact HGNC identifier/symbol or MONDO identifier. The official summary CSV is hash-checked, privately cached and conditionally refreshed. Each expert-panel classification keeps its mode of inheritance, SOP, panel, date, report URL and row hash. ClinGen classifications remain separate from GenCC, PanelApp and association scores, and summarize a time-specific expert curation rather than all published literature. See the official [ClinGen downloads and APIs](https://search.clinicalgenome.org/kb/downloads) and [gene-disease validity SOP](https://www.clinicalgenome.org/docs/gene-disease-validity-standard-operating-procedure/).
+
+`orphadata-disease` retrieves Orphadata's typed rare-disease gene associations by exact numeric ORPHAcode. The result retains Orphanet's association type/status, validation references, gene identifiers, response and per-association digests, release date, and CC BY 4.0 attribution. AgentMesh exposes the operation as `biomedical.gene-disease-orphadata`; an explicit `ORPHA:<code>` in the research objective resumes through this source. Orphanet status is kept source-native and is not converted into a probability or cross-source evidence grade. See the official [Orphadata API](https://api.orphadata.com/) and [gene product description](https://www.orphadata.com/docs/OrphadataFreeAccessProductsDescription.pdf).
+
+AgentMesh also exposes `biomedical.capability-generate-r-proposal` and `biomedical.capability-validate-r-proposal`. Drafts are installation-signed and stored disabled; validation rechecks the same-session artifact digest and signature before running caller-provided cases in `MEDAI_R_SANDBOX_IMAGE`. Validation receipts retain hashes and bounded outcomes, not raw inputs or results. R proposals receive deterministic review-only AMCP packages that can be exported and registered pending review. The production invocation route accepts R only after exact lifecycle approval and an authenticated active AgentMesh route, then runs the signed source in the pinned no-network R sandbox. Same-language R proposals can be paired-benchmarked on an identical contract and corpus; benchmarks never alter lifecycle state.
+
+The `genes.curate` worker can add exact HGNC and MONDO nodes plus one assertion node per retained ClinGen or GenCC record. It also registers explicit ORPHAcode disease nodes and Orphadata assertion nodes when each source record carries exactly one HGNC reference; missing or ambiguous gene IDs route the result to review. Each graph edge points to the source artifact. The worker accepts an explicit EFO/MONDO CURIE, or searches OLS when the objective contains a literal preferred disease label and uses only a unique stable identifier returned for that label. OLS searches are retained as artifacts; synonyms, provider rank, and EFO↔MONDO equivalence are not used. Ambiguous IDs in one ontology require review. Open Targets and GWAS rows remain separate with their own same-session source artifacts. Exact Ensembl gene identifiers become gene nodes; GWAS rows with only a reported name remain source-specific mapping candidates. Open Targets scores stay as native metadata and are not merged with GWAS evidence or other curation scales. Graph edges record the provider's assertion and do not establish a causal mechanism.
+
+Generated capability proposals receive an installation-local HMAC-SHA256 signature after model and budget provenance is attached. The sandbox validation tool verifies the signature, signing key ID, proposal payload, and source hash before execution. Docker Compose persists the private key in the shared data volume; set `MEDAI_PROVENANCE_KEY_FILE` to choose another path. This signature provides installation-local tamper detection and origin, not external identity or non-repudiation.
+
+The final `skills.learn` DAG stage evaluates disjoint batches of three completed reproducibility bundles visible to the authenticated tenant. It derives a disabled, signed `SKILL.md` candidate only when the same core task sequence succeeded in all three sessions, stores it under `MEDAI_SKILLS_DIR/tenants/<sha256(tenant_id)>`, and records its evidence in the current session before the final reproducibility report. The MCP learner, candidate reader, and AMCP exporter all resolve the partition from `/v1/auth/whoami`; tool arguments cannot select another tenant. Skill versions are immutable; candidates require human review and are not executed or exported to AgentMesh automatically. The observed task completion fraction describes workflow history, not scientific accuracy. Existing candidates in the former unpartitioned directory are not automatically assigned to a tenant.
+
+`medai-science skills list --registry-dir <tenant-registry>` verifies installation signatures and lists local learned Skill candidates. For CLI administration, the registry directory is `MEDAI_SKILLS_DIR/tenants/<sha256(tenant_id)>`; the MCP Skill learner uses completed MedAI sessions through its authenticated AgentMesh worker. Importing and registering reviewed Skills into AgentMesh remains a separate lifecycle task.
+
+If a historical bundle or signed Skill index fails integrity checks, `skills.learn` records a `needs_review` artifact and does not write a candidate or modify the registry index. That self-learning issue does not block the active research report.
+
+The NCBI contact address is required for E-utilities. An API key can be supplied as `NCBI_API_KEY`. The science service uses an optional SQLite ESearch cache (`MEDAI_PUBMED_SEARCH_CACHE`, configured in Compose at `/data/pubmed-search-cache.sqlite`) with a five-minute TTL and a 1,000-query entry ceiling; expired entries are pruned and oldest entries are evicted. It stores only a digest of the exact screened query, the bounded PMID page, and PubMed's total-hit count; query text, abstracts, and fetched article records are never cached. EFetch still retrieves records from NCBI. The cache lives on the private application data volume and can be disabled by unsetting the variable. ClinicalTrials.gov records retain their raw registry snapshot plus normalized study status, dates, design, outcomes, intervention, eligibility, locations, retrieval time, and a payload hash following the provider's [Study Data Structure](https://clinicaltrials.gov/data-api/about-api/study-data-structure). Each snapshot links to the study's official [record history](https://clinicaltrials.gov/study/NCT04912492?tab=history); MedAI's automated diffs still cover only snapshots it captured, because the documented v2 adapter does not backfill provider versions. Registry criteria remain quoted source material; MedAI does not assess an individual's eligibility or recommend participation. Source access, use limits, and data licenses remain subject to each provider's requirements.
+
+The web Literature view searches retained paper payloads and source identifiers across the entire selected session, then returns matching records in batches of 100 through a database-bounded `(recorded_at,id)` cursor. Additional matching pages are fetched on demand. Crossref citation links remain displayed separately because citation metadata does not establish evidential support.
+
+Crossref lookups accept a DOI or bibliographic query; set `CROSSREF_MAILTO` to identify the integration to Crossref's polite API pool. Citation links are bibliographic metadata and do not establish that a work supports or contradicts a claim.
+
+`preprint` performs an exact DOI lookup on bioRxiv or medRxiv and retains bounded metadata, version, license, and any provider-supplied published-version DOI with a source-record hash. It omits the abstract from the result and retained artifact. `preprints-search` scans a bounded date/category slice (at most three provider pages and 93 inclusive calendar dates) and screens title plus transient abstract text for all query tokens; abstracts are not retained. This lexical screen is neither semantic nor comprehensive, and preprint metadata does not establish peer review or publication equivalence. The official [bioRxiv API](https://api.biorxiv.org/) and [medRxiv API](https://api.medrxiv.org/) document the DOI and paginated date/category endpoints.
+
+`ontology-search` and `ontology-term` query the EMBL-EBI [OLS4 API](https://www.ebi.ac.uk/ols4/api-docs). Search results preserve ontology IDs, labels, synonyms, descriptions, obsolescence fields, retrieval time, and a normalized-record hash. The exact resolver accepts only case-insensitive equality against a returned `obo_id`, `short_form`, or IRI; provider rank is not a confidence score, and imported or cross-ontology terms are not assumed equivalent.
+
+The AgentMesh `medai_drug_interaction_cross_source_review` resolves both public drug names to distinct RxNorm ingredient IDs, screens versioned openFDA and DailyMed labels, and, when `NCBI_EMAIL` is configured, searches PubMed for up to five records using bounded RxNorm ingredient names plus interaction, pharmacokinetic, pharmacodynamic, and selected exposure/outcome terms. Each record is retained as a distinct PMID-linked artifact with PubMed publication types, MeSH headings, and endpoint-term retrieval signals. These indexed fields prioritize manual review; they do not establish independent study evidence, pair exposure, comparator, dose, route, outcome direction, or a drug interaction. Reviewers must inspect the original articles and assess conflicts across studies and label versions.
+
+For bounded source-anchored screening, `medai_drug_interaction_review_sources` compares up to ten lexically ranked sentence pairs from one selected same-session openFDA/DailyMed label artifact and either a PubMed candidate or a linked PMC full-text screen. PMC screening re-fetches BioC, verifies the source digest and sentence anchors, and requires an exact operator-allowlisted article license plus a loopback model provider. Full-text sentences are transient; retained receipts contain only categorical labels and source hashes/offsets. A configured model provider is required. The output always sets `interaction_verdict` to null and requires human review; it cannot establish interaction, contradiction, direction, quality, or clinical relevance.
+
+The AgentMesh capability `biomedical.variant-records-clinvar` searches ClinVar by an rsID, accession, gene, or other public term using NCBI E-utilities. It retains bounded variation summaries, source-record hashes, accessions, precise single-allele locations by assembly, and retrieval timestamps. `variant-reconcile` compares those records with a local reference-validated VCF report, requiring the same genome build and exact reference FASTA; both allele representations are normalized against that FASTA before matching. ClinVar aggregates submitted interpretations; MedAI does not re-evaluate them or provide patient-specific clinical guidance. Independent review of repeat-context indels and complex-record exclusions remains open.
+
+`genome-vcf`, `sequence-fasta`, and `sequence-fastq` are local-only parsers. They validate file structure, record input digests, omit sample/record identifiers and sequences from summaries, and make no network requests. VCF requires an explicit reference build. Supplying `--reference-fasta` enables exact REF verification, minimal representation, and left alignment for simple insertions/deletions; complex unequal-length alleles are flagged when left alignment is unsupported. The optional `--transcript-gff3` maps validated sequence alleles against local GFF3 transcripts and the supplied reference, records the annotation digest, and reports supported coding protein consequences plus transcript overlaps. It supports NCBI translation tables 1 and 2; inconsistent phases, unsupported tables, boundary-spanning alleles, and reference mismatches are reported without guessing. Annotated exon junctions also support positional canonical splice donor/acceptor and splice-region labels using Ensembl's [consequence definitions](https://static.ensembl.org/info/genome/variation/prediction/predicted_data.html); these labels do not predict splice function. Synthetic consequence tests cover canonical splice positions on both strands, nearby splice-region positions, and intronic negatives, plus start loss, stop gain, frameshift, in-frame insertion/deletion, missense, and synonymous changes. Versioned fixtures compare missense/synonymous outputs and one repeat-region frameshift to published Ensembl VEP examples; the latter preserves codon offset on a synthetic sequence and does not reproduce the source locus or splice-region annotation. This local analyzer does not predict pathogenicity, clinical significance, or match the full Ensembl VEP consequence set. `--annotate-vep` explicitly sends only reference-validated alleles to Ensembl VEP; together with `--bundle-dir`, it captures the provider receipt and binds its assembly, allele list, source hashes, and local report/reference digests into the private bundle. Replay reruns only the local analysis and rechecks the retained VEP receipt; it does not call VEP again or treat its stored source-record hashes as independently authenticated. `--bundle-dir` creates a new directory with mode 0700, copies exact input files with mode 0600, and captures the report, parameters, runtime versions, implementation hashes, and source files used. VCF, FASTA, and FASTQ bundles can be hash-verified and replayed; replay is allowed only when the installed scientific source hashes match and never executes code from the bundle. Bundle verification rejects symlinks and paths that escape the bundle directory. Treat bundles as sensitive genomic data. FASTQ quality is interpreted as Phred+33 and never auto-detected. Keep genomic inputs and reports in an appropriately protected local environment; do not submit patient genomic data to public-source commands.
+
+To capture and replay a local genome analysis with an Ensembl VEP cross-check:
+
+```bash
+medai-science genome-vcf cohort.vcf --genome-build GRCh38 --reference-fasta reference.fa --transcript-gff3 transcripts.gff3 --annotate-vep --bundle-dir ./bundles/cohort-vep
+medai-science bundle-verify ./bundles/cohort-vep --replay
+```
+
+`structure` looks up AlphaFold DB predictions by UniProt accession through the current `alphafold.com` API and returns model identifiers, version metadata, confidence summaries, and mmCIF/PDB download URLs with source-record hashes. The adapter uses the post-June-2026 field names and accepts legacy aliases for older cached responses. pLDDT is a local per-residue confidence estimate; it does not establish domain arrangement, binding, biological activity, or experimental validation. See the provider's [API field migration](https://www.ebi.ac.uk/pdbe/news/breaking-changes-afdb-predictions-api) and [confidence guidance](https://www.alphafold.ebi.ac.uk/faq).
+
+`protein-record` retrieves a bounded full UniProtKB JSON entry and reports annotated sequence regions and PDB cross-reference metadata with the raw record hash. Add `--bundle-dir PATH` to capture the CC BY 4.0 source record, attributed report, exact extractor code, and hashes in a private offline-replayable bundle; `bundle-verify PATH --replay` checks the captured code and recomputes the extracted features. `interactions` queries IntAct through PSICQUIC and preserves MITAB rows, assay method, publication IDs, organism IDs, interaction IDs, biological roles, and confidence strings. It groups unordered stable-identifier pairs while retaining taxonomy and participant roles, separates exact duplicate rows from unique PubMed records, and reports method/type heterogeneity. Participant role handling follows the [PSI-MITAB 2.7 specification](https://psicquic.github.io/MITAB27Format.html). Its default organism filter requires both interactors to be human. Provider confidence values are not calibrated probabilities or combined, and the reconciler does not claim independent experimental replication.
+
+`pathways` can capture the exact gene input and bounded Reactome response with `--bundle-dir PATH`. The request digest binds endpoint, species, page size, sort order, and normalized identifiers. Offline `bundle-verify PATH --replay` checks response integrity, request binding, and the captured adapter version without contacting Reactome. This validates the retained response, not Reactome authorship, and does not rerun the over-representation calculation.
+
+`trial NCT... --bundle-dir PATH` captures one public ClinicalTrials.gov v2 record, its normalized snapshot, retrieval time, and adapter source in a private bundle. `bundle-verify PATH --replay` recomputes normalized fields from the captured source record and requires the same installed adapter and Python version; it makes no provider request. The replay checks data consistency, not registry authorship, study quality, participant suitability, or clinical outcomes.
+
+The literature workspace reports citation in-degree, tracked references, and deterministic PageRank for the DOI graph captured from Crossref artifacts. These metrics describe connectivity only within the session's potentially incomplete citation graph; they do not grade paper quality, claim support, evidence strength, or novelty.
+
+`protein-mapping` resolves PDB identifiers from the UniProtKB entry and retrieves per-residue mappings from [PDBe SIFTS XML](https://www.ebi.ac.uk/pdbe/docs/sifts/quick.html), up to `--max-structures` entries. It keeps UniProt positions, PDB residue numbers, author residue numbers, chains, and each source XML digest distinct. It cross-checks `_pdbx_sifts_xref_db.observed` in the PDBe updated mmCIF to report whether atomic coordinates are present; unavailable or ambiguous matches remain unknown. The [SIFTS schema](https://www.ebi.ac.uk/pdbe/docs/sifts/efamily.html) distinguishes entity, segment, residue, and cross-reference coordinates. The wwPDB [dictionary definition](https://mmcif.pdb.org/dictionaries/mmcif_ma.dic/Items/_pdbx_sifts_xref_db.observed.html) defines the observation flag.
+
+Compound bundles require exactly one PubChem match with locally computed RDKit descriptors. They capture the normalized chemical identity, SMILES, source-record digest, descriptor values, RDKit/Python versions, and implementation hash. `bundle-verify --replay` recomputes descriptors offline and requires matching RDKit and implementation versions. These descriptors are not predictions of activity, exposure, safety, or efficacy.
+
+## Leased research worker
+
+Install the MCP client extra and start the API, MedAI MCP service, and AgentMesh gateway. Configure MEDAI_AGENTMESH_URL to point at the gateway, then run these commands from science:
+
+    pip install -e '.[mcp]'
+    export MEDAI_AGENTMESH_URL=http://127.0.0.1:8080/mcp
+    medai-science execute RES-<session-id> --max-tasks 32 --paper-limit 10
+    medai-science work --watch --poll-seconds 30
+
+The worker claims work through AgentMesh, executes objective normalization, PubMed/Crossref and ClinicalTrials.gov discovery, resumable literature extraction, evidence inventories, contradiction-search candidate retrieval, graph snapshots, hypothesis proposal/criticism, and a final reproducibility report. Exact BioC NCBI Gene identifiers are resolved through MyGene.info; exact human gene mappings can drive bounded Reactome over-representation and budget-aware UniProt, AlphaFold, IntAct, and optional SIFTS retrieval. PubMed labels, publication type names and IDs, journal/ISSN metadata, pagination, language, MeSH descriptor/qualifier IDs, DOI, and PMC identifiers are retained as provider metadata; the evidence inventory counts these fields descriptively and does not infer design quality. Unlabeled abstract passages remain unclassified. PMC BioC parsing retains only a structural receipt and hashes in the session artifact store, while article text remains transient. Source annotations do not create causal graph edges. The contradiction-search task can emit cross-paper directional-disagreement leads when local-model labels share an exact normalized entity and result category, then run a bounded semantic pair screen through the local model. Both stages link to source artifacts and hashes and require human review; neither proves contradiction or substitutes for evaluated semantic alignment. PubMed contradiction-search results also remain unassessed candidates. Tasks that need a user dataset or have no validated executor stay in review or are skipped with an explicit reason; the worker does not report unsupported stages as completed research.
+
+Optional model calls support OpenAI-compatible chat-completion endpoints, the native Anthropic Messages API, and Google's Gemini GenerateContent API. Configure the shared provider with `MEDAI_MODEL_PROVIDER_TYPE` (`openai-compatible`, `anthropic`, or `gemini`), `MEDAI_MODEL_BASE_URL`, and `MEDAI_MODEL_NAME`; `MEDAI_MODEL_API_KEY`, `MEDAI_MODEL_PROVIDER_NAME`, and `MEDAI_MODEL_TIMEOUT_SECONDS` configure authentication, attribution, and timeout. `MEDAI_MODEL_MAX_OUTPUT_TOKENS` sets the shared provider-call output ceiling (default 4096; maximum 32768). Anthropic uses `https://api.anthropic.com/v1` and required structured tool calls. Gemini uses `https://generativelanguage.googleapis.com/v1beta` and an API key. `MEDAI_AGENT_MODEL_POLICIES` can map a specialist ID to its own `provider_type`, `base_url`, `model`, `provider_name`, `timeout_seconds`, `max_output_tokens`, and `api_key_env`; secret values stay in environment/secret-manager variables. The MCP runtime selects the policy from the DAG task's registered specialist for planning, literature reranking, PMC extraction/alignment, capability drafting, and hypothesis criticism. Local endpoints may use HTTP on loopback; remote endpoints require HTTPS. Models return bounded structured data, and each result retains prompt/response hashes and provider token usage. Model-backed operations charge reported prompt plus completion tokens to the session budget; `MEDAI_MODEL_TOKENS_PER_CREDIT` sets the rounded-up conversion rate and defaults to 1000 tokens per execution credit, while operation fixed charges remain separate. Missing or inconsistent usage is rejected before model results are persisted, and over-budget charges fail closed. The deterministic path remains available when no provider is configured. See `biomedical.research-objective-plan` for the AgentMesh AMCP contract.
+
+PubMed results can be optionally reranked by title relevance through the same configured provider. The model sees only the research query and bounded PMID/title pairs, returns an exact permutation of source PMIDs and ordinal relevance tiers, and cannot add or remove records. This order is a retrieval aid, not evidence grading; its metadata is stored separately from source paper records under the AgentMesh capability `biomedical.paper-pubmed-search`. Provider errors retain PubMed's original ordering.
+
+When the configured provider is available, `medai_hypotheses_criticize` adds bounded model-generated refutation questions, alternative explanations, and methodological checks for at most 10 candidates per request. Each candidate call is separately charged to session credits; outputs can cite only the retained evidence IDs supplied in context and retain provider/model/hash/token provenance. Before sending context, the adapter checks every text field for common patient identifiers and refuses the model call if one is detected. The deterministic evidence and graph leads remain available without a model. Model text remains an unverified review lead, never an evidence polarity judgment or scientific verdict.
+
+The PMC retrieval tool optionally classifies source-provided BioC result sentence candidates during the same trusted retrieval operation. This requires an exact operator-reviewed source license in `MEDAI_PMC_ALLOWED_MODEL_LICENSES` (pipe-separated values; empty by default) and sends bounded article text only to a loopback model endpoint. It processes up to 200 result candidates in batches of 20, charges per batch, requires a classification for every candidate, and accepts only candidate IDs and BioC entity identifiers attached to that passage. Candidate receipts retain sentence-level document offsets, local offsets, lengths, hashes and model provenance without sentence text; BioC `<sentence>` elements and passage-contained sentences share the same anchor representation. These labels are uncalibrated and are not claims or evidence polarity; per-article reuse terms still apply to the upstream PMC processing.
+
+AgentMesh's `contradictions.search` worker may screen up to ten cross-paper result-candidate pairs with `medai_papers_align_pmc_claims` (`biomedical.paper-claim-semantic-screen`). It accepts only candidate IDs linked to two distinct same-session annotation artifacts, refreshes both PMC records, verifies source and sentence hashes, and requires both exact article licenses in `MEDAI_PMC_ALLOWED_MODEL_LICENSES`. Full sentences and bounded title/abstract/methods context are sent only to a loopback model; the retained artifact contains relation/comparability/reason categories, offsets, hashes, candidate IDs, and model provenance. Each pair reserves five session credits for two PMC refreshes and one inference. Outputs are uncalibrated screening labels that require human scientific review; they do not establish a contradiction.
+
+Experimental Python capability proposals can be exercised locally with `medai-science capability-run-python --source-file capability.py --input-json input.json --test-cases-json cases.json --image "$MEDAI_PYTHON_SANDBOX_IMAGE"`. The image must already exist locally and be pinned by sha256 digest. The runner disables network, mounts inputs read-only with `noexec`, `nosuid`, and `nodev`, applies CPU/memory/process/time/output limits, and compares exact JSON results against supplied cases. This records a test receipt only: it does not mark the capability scientifically verified, register it, or promote it. Docker daemon and kernel isolation remain part of the trust boundary; multi-tenant deployments need a hardened isolated runner.
+
+Experimental R source can be exercised directly with `medai-science capability-run-r --source-file capability.R --input-json input.json --test-cases-json cases.json --image "$MEDAI_R_SANDBOX_IMAGE"`. The R image must be cached locally, pinned by sha256 digest, and include `Rscript` plus `jsonlite`. R runs without network in the same resource-limited, read-only bundle container policy; JSON input/output schemas and expected cases are checked by MedAI after the container returns. AgentMesh-generated R proposals are signed, source-bound to deterministic review-only AMCP packages, exportable for operator review, and invocable after the production lifecycle and active-route checks. Same-language R version comparisons use the paired benchmark route; neither passing validation nor benchmarking auto-promotes a proposal. The CLI only records an experimental test receipt.
+
+Experimental WASI Preview 1 modules use a JSON object on stdin and return one JSON object on stdout: `medai-science capability-run-wasm --module-file capability.wasm --input-json input.json --test-cases-json cases.json --image "$MEDAI_WASM_SANDBOX_IMAGE"`. The image must already be cached locally, pinned by sha256 digest, and contain a Wasmtime CLI supporting `-W fuel` and `-W max-memory-size`. Docker runs without network, with a read-only module mount, no WASI filesystem preopens, and bounded memory, fuel, CPU, wall time, and output. MedAI validates the JSON contract and supplied expected-output cases. This experimental runner does not register or promote modules, and tests against a mocked Docker CLI do not establish behavior of a real Wasmtime image.
+
+With `MEDAI_MODEL_BASE_URL` and `MEDAI_MODEL_NAME` configured, AgentMesh exposes `medai_capabilities_generate_python_proposal` under `biomedical.capability-generate-python-proposal`. It drafts a deterministic `run(input)` module against a caller-provided contract, rejects source that fails the sandbox static policy, and persists the disabled proposal with model, prompt, response, and source hashes. It consumes five session credits. This operation does not execute the generated module; reviewers must supply independent expected-output cases to the pinned-image sandbox before any separate lifecycle review.
+
+The generator also persists a separate AMCP review package for the proposal. Its inputs bind the runtime research session and task, fixed source tenant/session and exact proposal artifact ID/hash, source capability ID, AgentMesh capability ID/version, and scientific input schema; this lets the capability be reused in later sessions of its originating tenant while preserving provenance. Its output retains the proposal's output schema and explicitly reports no scientific test validation. Generated AMCP IDs use a deterministic `biomedical.generated.*` namespace. The package remains unregistered and disabled. Registering it and exposing a production-only runtime route are separate review-gated work tracked in `TASKS.md`.
+
+Export the retained package with `medai-science agentmesh export-generated-amcp <session-id> <amcp-artifact-id> <output.yaml>` and `MEDAI_API_BEARER_TOKEN`. The command verifies the same-session AMCP and signed source artifacts, recomputes their hashes/signature/static source policy/package binding, and refuses to overwrite the output. The package starts as review material; the execution handler accepts it only after explicit production approval and exact active-route verification described below.
+
+For a verified registration proposal, use `medai-science agentmesh register-generated-amcp <session-id> <amcp-artifact-id> --catalog <agentmesh-catalog>` with an authenticated `platform_admin` token. It repeats source verification, validates and installs the package in the selected local AgentMesh catalog, and registers the identical AMCP metadata in MedAI as `pending_review`. This command does not approve the capability, enable a route, or make the generated MCP reference executable.
+
+After the capability receives an explicit production lifecycle decision and its exact route is active in the authenticated AgentMesh tenant/namespace snapshot, `medai_capabilities_execute_generated` accepts the AMCP-bound source identity plus `input_data`. It rechecks the tenant, signed source artifact, source/package hashes, lifecycle package and route, validates the retained input/output schemas, and invokes Python or R in its language-specific pinned no-network sandbox. The transient result is returned to the caller; MedAI persists only hashes, route/lifecycle provenance, resource limits, and measured CPU in an execution receipt. Execution consumes two fixed credits plus rounded-up sandbox CPU credits. WASM execution and automatic scientific verification remain separate capabilities.
+
+`medai_capabilities_validate_python_proposal` under `biomedical.capability-validate-python-proposal` accepts a proposal artifact ID, one runtime input, and bounded expected-output cases. The proposal must include object input and output JSON Schemas using the supported contract subset; MedAI validates the caller's runtime/test values before charging, then checks every generated output inside the isolated runner against those schemas. Unsupported schema keywords fail closed. The static source policy rejects reflective builtins, dunder access, and `str.format`/`format_map` (which can encode attribute traversal outside the AST); generated code can use f-strings. The MCP process must have access to Docker and `MEDAI_PYTHON_SANDBOX_IMAGE` must name a locally cached image pinned by sha256 digest; no image pull or sandbox networking is allowed. Cancellation stops and reaps the active Docker runner. The persisted receipt records source hash, test outcomes, image, resource limits, and measured Python process CPU microseconds, while omitting raw input, expected values, generated output, and stderr. Measured CPU is charged after a valid runner receipt at a rounded-up rate configured by `MEDAI_CPU_SECONDS_PER_CREDIT` (default 10 seconds per credit); the existing fixed validation charge is separate. The measurement covers capability loading, its requested invocation, and supplied tests, but excludes request parsing, Docker daemon and host scheduling overhead. Runs terminated before producing a valid receipt cannot report measured CPU and incur only the fixed validation charge. A passing receipt does not register, enable, or promote the proposal.
+
+Public-source adapters reject common formats for email addresses, phone numbers, dates of birth, and patient-record identifiers. Pattern checks cannot identify every form of sensitive information; review research objectives before using public sources.
+
+## CLI
+
+The API accepts an optional `MEDAI_API_BEARER_TOKEN` in loopback development. Any non-loopback `MEDAI_BIND` requires a token of at least 32 non-whitespace bytes; `/health` remains public and all research routes require `Authorization: Bearer …`. Generate one before starting Compose with `export MEDAI_API_BEARER_TOKEN="$(openssl rand -hex 32)"`. Compose passes the service token only to the API, MCP, and worker. Browser users sign in with their own API credential; Next.js validates it and stores it in an encrypted `HttpOnly` session cookie. The browser calls the same-origin `/api/medai` proxy, so bearer credentials are not exposed to client JavaScript. `MEDAI_CORS_ORIGINS` configures exact allowed origins for direct API integrations.
+
+`GET /v1/research/{session_id}/artifacts` returns at most 200 records per request by default. Set `limit` from 1 to 200 and follow `next_cursor` with both `after_recorded_at` and `after_id` to read further pages. Optional `kind` and exact `source_id` filters run in SQLite; `search` performs a bounded text search and requires a page limit. The response always includes `next_cursor` and `page_size`, so callers can detect and continue incomplete reads rather than treating one page as the full history.
+
+The API records request method, path without query parameters, HTTP status, duration, actor, and the authenticated tenant in a local SHA-256-linked audit chain. Each response includes `X-MedAI-Request-ID`. Platform administrators can page through `/v1/admin/audit` and verify the complete chain with `/v1/admin/audit/verify`. Tenant administrators can page through `/v1/admin/audit` and download bounded NDJSON pages from `/v1/admin/audit/export`; pass `after_sequence` and `limit` to continue, and use `X-MedAI-Next-Cursor` when present. Exports contain only events recorded for that exact tenant. Request bodies, authorization values, and query strings are not stored. Audit rows created before tenant attribution was added remain verifiable but unassigned and therefore are not included in tenant exports. Configure `MEDAI_AUDIT_RETENTION_DAYS` and `MEDAI_AUDIT_ARCHIVE_DIR` to enable periodic archival (default interval: one day); a platform administrator can also call `POST /v1/admin/audit/archive` to run it immediately. Verification covers archive files and live rows, but the chain is not an external immutable log.
+
+For multi-tenant API access, configure `MEDAI_API_TOKENS` as a JSON array of records with `token` (at least 32 non-whitespace bytes), opaque `subject`, `tenant_id`, and `role` (`reader`, `researcher`, `tenant_admin`, `platform_admin`, or `service`). Service credentials may additionally set `scientific_agent_id` to one registered specialist ID (for example `literature_librarian`); this restricts claims, transitions, lease renewals, checkpoints, and credit charges to that specialist's assigned task IDs. Claims require an explicit task-ID filter. The binding applies to the API bearer actually used on the request, not to the caller-supplied `worker_id`. Example: `[{"token":"<secret>","subject":"worker-literature","tenant_id":"lab-a","role":"service","scientific_agent_id":"literature_librarian"}]`. Set the same token as `MEDAI_SPECIALIST_API_TOKEN` in that specialist worker. The worker sends it as private MCP request metadata; the MCP server checks the authenticated identity endpoint, and all API calls made while handling that MCP request use that scoped bearer. AgentMesh proxies the unchanged MCP request body, allowing this binding without forwarding caller Authorization headers. Session creation, listing, summaries, direct session routes, and recurring worker queues are tenant scoped. A reader can inspect records; researcher and higher roles can write; platform audit routes and global queue claims require platform admin or service. Existing databases migrate sessions to tenant `local`; the legacy `MEDAI_API_BEARER_TOKEN` remains the unbound service credential for general MCP/worker use. Browser requests use the validated per-user session credential; the server token is never used as a browser fallback.
+
+Platform administrators can manage API credentials at `/v1/admin/credentials`; tenant administrators can manage only credentials in their own tenant and can grant only `reader` or `researcher`. Creation returns a randomly generated bearer once. The database stores its SHA-256 digest, and listing never returns the bearer or digest. Revocation at `DELETE /v1/admin/credentials/{id}` takes effect immediately and survives restart, including for credentials still present in the environment registry. Existing configured credentials are imported idempotently at startup; rotate one by creating a replacement and revoking the old credential. The web workspace validates interactive login with `/v1/auth/me` and uses encrypted `HttpOnly` sessions; tenant deactivation and audit archive retention are managed separately.
+
+Platform administrators provision tenant limits with `PUT /v1/admin/tenants/{tenant_id}/quota` and can inspect usage with `GET` on the same path. Tenant administrators can inspect their own quota and usage only. Defaults are 25 active sessions, 100,000 credits per session, and 1,000,000 credits allocated across active sessions. Creating a session returns `429` when a limit would be exceeded; the SQLite transaction serializes concurrent creates so they cannot overbook a tenant. Completed, cancelled, failed, and budget-exhausted sessions release their allocation. Limits can be changed without rewriting prior sessions.
+
+Compose runs the API, science MCP, worker and web containers with read-only root filesystems, non-root service users, dropped Linux capabilities, `no-new-privileges`, private bounded temporary filesystems, and process/CPU/memory limits. Set `MEDAI_API_PIDS`/`MEDAI_API_CPUS`/`MEDAI_API_MEMORY` and the matching `MEDAI_MCP_*`, `MEDAI_WORKER_*`, or `MEDAI_WEB_*` variables to adjust resource ceilings for the host; `/data` remains the persistent writable volume for API and scientific service state.
+
+```sh
+medai investigate "Alzheimer disease"
+medai investigate "Alzheimer disease" --api
+medai autopilot --objective "Alzheimer disease" --depth deep --budget 50 --paper-limit 20
+medai gene APOE --species human
+medai variant rs429358
+medai protein-record P05067
+medai drug metformin
+medai papers "APOE microglia" --limit 20
+medai science bundle-verify ./protein-record --replay
+medai science bundle-diff ./research-baseline.json ./research-current.json
+medai science research-diff RES-<id> ART-<baseline> ART-<current>
+medai science agentmesh sync-status --state-file .medai/agentmesh/sync-state.json
+medai research --api
+medai research RES-<api-session-id> --api
+medai research RES-<api-session-id> --api --watch --poll-seconds 30
+medai investigate "ALS" --depth deep --budget 250
+medai research RES-<session-id>
+medai worker claim RES-<session-id> --worker-id worker-a --limit 2
+medai worker renew RES-<session-id> objective.normalize --worker-id worker-a
+medai worker finish RES-<session-id> objective.normalize --worker-id worker-a --status succeeded --output "scope normalized"
+medai worker recover RES-<session-id>
+medai research
+medai evidence add RES-<session-id> "APOE is associated with Alzheimer disease" PubMed --source-id PMID --polarity supports --quality 0.8
+medai graph add-node RES-<session-id> APOE gene "Apolipoprotein E"
+medai graph add-node RES-<session-id> alzheimer disease "Alzheimer disease"
+medai graph add-edge RES-<session-id> APOE ASSOCIATED_WITH alzheimer 0.7 --evidence-id EVD-<evidence-id>
+medai graph list RES-<session-id>
+medai citations RES-<session-id>
+medai citations RES-<session-id> --doi 10.1234/example
+medai capabilities
+medai capabilities propose biomedical.example 0.1.0 tool "Example capability" manifest.json
+medai capabilities promote biomedical.example 0.1.0 --to verified --reviewer scientist --reason "validation reviewed" --validation checks.json
+medai capabilities history biomedical.example 0.1.0
+medai capabilities rollback biomedical.example 0.1.0 --reviewer scientist --reason "regression in newer release" --validation checks.json
+medai agentmesh
+```
+
+`medai investigate` creates a local SQLite session by default. Add `--api` to create it through the authenticated API; this scopes the session to the credential's tenant and enforces tenant quotas. Set `MEDAI_API_URL` (defaults to `http://127.0.0.1:8090`) and `MEDAI_API_BEARER_TOKEN`. Bearer tokens are sent in the HTTPS Authorization header (HTTP is allowed only for loopback) and never placed in process arguments. The API returns the created session as JSON.
+
+`medai autopilot --objective TEXT` creates a tenant-scoped session through `medai-science research-create`, then dispatches its bounded task DAG through the AgentMesh-backed `medai-science execute` runtime. It requires `MEDAI_API_BEARER_TOKEN`, a reachable authenticated MedAI API, and the configured AgentMesh/science runtime. `--depth`, `--budget`, `--paper-limit` (1–20), and `--max-tasks` (1–256) bound the run. The session is persisted before execution starts; if execution fails, the command prints the session ID and a resume command: `medai science execute SESSION_ID`.
+
+`medai research --api` lists sessions visible to the authenticated tenant. `medai research SESSION_ID --api` shows task states, retry availability, and execution-credit totals for an API-created session. Add `--watch` to poll every 30 seconds by default (`--poll-seconds` accepts 5–3600). The authenticated status endpoint is read-only and does not consume session credits. `terminal` means the DAG has no ready or running tasks; blocked tasks can remain behind a failed or review-required dependency. It describes scheduler state, not scientific validity.
+
+Use `medai cancel SESSION_ID --api` to request cooperative cancellation of one tenant-owned API session. The API checks session ownership and the cancellation is observed by active AgentMesh-facing workers; local sessions continue to use `medai cancel SESSION_ID`.
+
+`medai science research-diff SESSION BASELINE_ARTIFACT CURRENT_ARTIFACT` reads two stored bundle artifacts through that same tenant-scoped API, checks the artifact payload and embedded bundle hashes, and prints structural changes for human review. Each artifact read consumes the configured API request credits for its session.
+
+Biomedical domain commands are dispatched by the Rust `medai` binary to the installed Python `medai-science` runtime. The bridge passes arguments directly without shell interpretation and accepts only registered scientific subcommands. Set `MEDAI_SCIENCE_BIN` when the runtime executable is not named `medai-science` or is outside `PATH`; prefix a command with `science` to make that boundary explicit.
+
+Graph entities and relationships are stored per research session. Graph relationships require evidence IDs from that same session. Quality and relationship confidence are explicit annotations, not calibrated probabilities. Previously unscoped graph data is isolated under an internal legacy workspace and is not exposed in new sessions.
+
+## System boundaries
+
+Evidence inventory semantics and the current PubMed publication-type mapping are documented in [Evidence methodology](docs/EVIDENCE_METHODOLOGY.md).
+
+- A research session is a durable work record, not evidence that an investigation ran to completion.
+- Each new session persists a dependency-aware task graph. A task moves through guarded states and emits an append-only event; the graph unlocks a dependent task only after its prerequisites succeed or are explicitly skipped.
+- Source records and claims retain identifiers and provenance; extracted interpretation must remain distinguishable from source observations.
+- Source artifacts are retained per session with content hashes and provider record identifiers.
+- Artifacts are attributed to a running plan task; task starts and supported external literature queries consume auditable session execution credits. The budget API reports logical UTF-8 payload bytes retained per session; each complete MiB consumes one credit, newly inserted artifact rows are counted, and idempotent duplicate rows add no bytes or charge. An insertion that would exceed the budget is rolled back. This measures artifact payload bytes, not SQLite indexes, WAL files, or filesystem overhead.
+- Evidence quality fields are explicit annotations, not model confidence or causal effect estimates.
+- Candidate hypotheses require contrary-evidence search and human scientific review.
+- Clinical decisions, diagnosis, prescribing, patient-specific recommendations, and wet-lab execution are outside the autonomous execution boundary.
+- Do not submit patient or other sensitive data to public literature APIs.
+- Autonomous capability creation produces an experimental proposal. Security review, scientific evaluation, benchmark evidence, and authorized promotion are required before execution.
+
+Capability discovery supports `medai-science capabilities-search` and the AgentMesh tool `medai_capabilities_search_semantic`. First, a platform administrator can import the checked-in contracts as disabled review proposals with `MEDAI_API_BEARER_TOKEN=... medai-science agentmesh register-capabilities`; importing never promotes a route, and repeated imports verify the stored content hash. Review and validate proposals in the workspace before promotion. Search uses a pre-downloaded local SentenceTransformer model, persists normalized vectors in SQLite, and checks JSON input/output contracts, effects, permissions, lifecycle state from the authenticated MedAI capability registry, and the exact active route in the authenticated AgentMesh runtime before recommending reuse. Lifecycle state is bound to exact capability ID/version; a local AMCP status cannot promote a capability, and registry entries absent from the MedAI API remain experimental. Configure `MEDAI_API_URL` and `MEDAI_API_BEARER_TOKEN` for lifecycle state, plus `AGENTMESH_CONTROL_URL`, `AGENTMESH_ADMIN_TOKEN`, `AGENTMESH_TENANT`, `AGENTMESH_NAMESPACE`, and `MEDAI_AGENTMESH_SERVICE`; the runtime client validates the control-plane API version, scope, and snapshot digest. A route snapshot proves routing state, not scientific validity. Search recommends `reuse` only with an operator-pinned, holdout-passing calibration report for the exact embedding-model file digest. Without that report it still ranks candidates but blocks reuse. To produce a report from an independently adjudicated task-capability-pair dataset, run `medai-science capability-calibrate pairs.json --output /private/path/capability-calibration.json --minimum-precision 0.95`, inspect its fit/holdout results and `benchmark_sha256`, then pin the report's exact SHA-256 with `--calibration-file` and `--calibration-sha256` on `capabilities-search`. The dataset requires at least 50 pairs with task hash, exact capability ID/version, human `expected_reuse` label, semantic score, contract/permission compatibility, approved lifecycle, active-route status, an embedding model ID, and a documented adjudication protocol. The repository does not contain such an independently adjudicated corpus, so it does not ship a calibrated policy. Install the science extra with `cd science && pip install '.[ml]'` and place the model on disk before searching. For the MCP server, set `MEDAI_AGENTMESH_CAPABILITY_DIR`, `MEDAI_CAPABILITY_INDEX`, `MEDAI_CAPABILITY_CALIBRATION_FILE`, and `MEDAI_CAPABILITY_CALIBRATION_SHA256`; the server uses its request-scoped MedAI bearer to fetch lifecycle state. Local lifecycle override files are refused for semantic reuse decisions.
+
+## Architecture
+
+```text
+Next.js research workspace
+        │ same-origin server proxy with service bearer token
+Rust medai-api ───── Rust medai-core / SQLite
+        │                         │
+        └── AgentMesh MCP / AMCP ─┘
+                  │
+         Python scientific services
+         PubMed · ClinicalTrials.gov · analysis packages
+```
+
+See [architecture](docs/ARCHITECTURE.md), [AgentMesh integration](integrations/agentmesh/README.md), [project plan and task status](TASKS.md), and [operations](docs/OPERATIONS.md).
+
+## Current implementation boundary
+
+The implementation includes a Rust API/CLI and durable SQLite research runtime, Python biomedical adapters and analysis, a TypeScript/Next.js review workspace, AgentMesh AMCP registration and route governance, tenant-aware research workers, source-linked evidence/hypothesis review, and signed generated Python/R proposals. Generated code remains disabled until separately reviewed; the supported production invocation path rechecks lifecycle and AgentMesh route state and runs Python or R only in its language-specific digest-pinned, no-network Docker sandbox. WASI currently has an experimental local runner only; generated WASM proposal lifecycle integration and production invocation remain open. PostgreSQL/object storage/graph adapters, independently adjudicated scientific evaluation corpora, production deployment and operational review also remain open in `TASKS.md`.
