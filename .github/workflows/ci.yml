@@ -59,6 +59,45 @@ jobs:
         working-directory: science
       - run: mypy src/medai_science
         working-directory: science
+      - name: Provision immutable Python sandbox image for real container integration tests
+        run: |
+          docker pull python:3.12-slim
+          image_ref=$(docker image inspect --format='{{index .RepoDigests 0}}' python:3.12-slim)
+          printf '%s\n' "$image_ref" | grep -Eq '^.+@sha256:[0-9a-f]{64}$'
+          echo "MEDAI_PYTHON_SANDBOX_IMAGE=$image_ref" >> "$GITHUB_ENV"
+      - name: Build immutable R sandbox image for real container integration tests
+        run: |
+          docker pull rocker/r-ver:4.4.3
+          base_image=$(docker image inspect --format='{{index .RepoDigests 0}}' rocker/r-ver:4.4.3)
+          printf '%s\n' "$base_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$'
+          docker build --build-arg "R_BASE_IMAGE=$base_image" -f science/sandbox/r/Dockerfile -t medai-r-sandbox .
+          image_id=$(docker image inspect --format='{{.Id}}' medai-r-sandbox)
+          printf '%s\n' "$image_id" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          echo "MEDAI_R_SANDBOX_IMAGE=$image_id" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release -p medai-wasm-fixture --target wasm32-wasip1
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+        with:
+          version: "49.0.2"
+          github_token: ${{ github.token }}
+      - name: Build immutable Wasmtime sandbox image and provision real guest fixture
+        run: |
+          set -eu
+          docker pull debian:bookworm-slim
+          base_image=$(docker image inspect --format='{{index .RepoDigests 0}}' debian:bookworm-slim)
+          printf '%s\n' "$base_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$'
+          context=science/sandbox/wasm/.ci-context
+          mkdir -p "$context"
+          trap 'rm -rf "$context"' EXIT
+          cp "$(command -v wasmtime)" "$context/wasmtime"
+          docker build --build-arg "WASMTIME_BASE_IMAGE=$base_image" -f science/sandbox/wasm/Dockerfile -t medai-wasmtime-sandbox "$context"
+          image_id=$(docker image inspect --format='{{.Id}}' medai-wasmtime-sandbox)
+          printf '%s\n' "$image_id" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          echo "MEDAI_WASM_SANDBOX_IMAGE=$image_id" >> "$GITHUB_ENV"
+          echo "MEDAI_WASM_FIXTURE_MODULE=$GITHUB_WORKSPACE/target/wasm32-wasip1/release/medai-wasm-fixture.wasm" >> "$GITHUB_ENV"
       - run: python -m unittest discover -s tests -v
         working-directory: science
 
@@ -68,10 +107,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate Compose service dependencies and healthcheck configuration
-        run: docker compose config --quiet
+        run: docker compose config --format json > /tmp/medai-compose.json
         env:
+          COMPOSE_PROFILES: agentmesh-worker,agentmesh-specialist,monitoring
           MEDAI_API_BEARER_TOKEN: ci-placeholder-api-secret-01234567890123456789
+          MEDAI_MCP_BEARER_TOKEN: ci-placeholder-mcp-secret-01234567890123456789
           MEDAI_WEB_SESSION_SECRET: ci-placeholder-web-secret-01234567890123456789
+      - name: Verify API, provider-egress, and metrics network separation
+        run: node scripts/verify-compose-network-isolation.mjs /tmp/medai-compose.json
       - name: Validate Prometheus scrape and alert rules
         run: >-
           docker run --rm --entrypoint=/bin/promtool
@@ -109,7 +152,7 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npm run lint
       - run: npx tsc --noEmit
-      - run: node --test scripts/browser-session.test.mjs
+      - run: node --test scripts/browser-session.test.mjs scripts/localization.test.mjs
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm run test:a11y
@@ -121,7 +164,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Generate and publish the source dependency SBOM
@@ -133,4 +176,4 @@ jobs:
           output-file: medai-source.spdx.json
           syft-version: v1.54.1
           upload-artifact: true
-          upload-release-assets: true
+          upload-release-assets: false

@@ -26,6 +26,30 @@ _PAPER_CONTEXT_ENUMS = {
 }
 
 
+def semantic_claim_pair_marker(source_a: dict[str, Any], source_b: dict[str, Any]) -> str:
+    """Build a resumable pair key that includes source artifact identity.
+
+    Candidate IDs are local to one extracted document and commonly repeat across
+    papers (for example, ``sentence-0``). They cannot identify a cross-paper pair
+    on their own.
+    """
+    identity_fields = ("artifact_id", "document_id", "source_sha256", "candidate_id")
+
+    def identity(source: dict[str, Any]) -> tuple[str, ...]:
+        if not isinstance(source, dict):
+            raise ValueError("semantic claim pair source must be an object")
+        values = tuple(source.get(field) for field in identity_fields)
+        if any(not isinstance(value, str) or not value for value in values):
+            raise ValueError("semantic claim pair source lacks stable artifact and candidate identity")
+        if len(values[2]) != 64 or any(char not in "0123456789abcdef" for char in values[2]):
+            raise ValueError("semantic claim pair source has an invalid source digest")
+        return values
+
+    pair = sorted((identity(source_a), identity(source_b)))
+    encoded = json.dumps(pair, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    return "semantic-claim-pair:" + hashlib.sha256(encoded).hexdigest()
+
+
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:

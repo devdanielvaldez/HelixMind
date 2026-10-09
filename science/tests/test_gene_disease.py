@@ -63,7 +63,13 @@ class GeneDiseaseTests(unittest.IsolatedAsyncioTestCase):
             await client.gwas_catalog("MONDO_0004979")
 
     async def test_gwas_rejects_missing_or_malformed_collections_instead_of_returning_no_hits(self):
-        for payload in ({"_embedded": {}}, {"unrelated": []}, {"associations": [{"mappedGenes": 42}]}):
+        for payload in (
+            {"_embedded": {}},
+            {"unrelated": []},
+            {"associations": [{"associationId": "A1"}]},
+            {"associations": [{"mappedGenes": None}]},
+            {"associations": [{"mappedGenes": 42}]},
+        ):
             client = GeneDiseaseClient(lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(lambda _, body=payload: httpx.Response(200, json=body)), **kwargs))
             with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, "association|mapped-gene"):
                 await client.gwas_catalog("EFO_0000249")

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import httpx
 
-from medai_science.llm import AnthropicMessagesJSONProvider, GeminiGenerateContentJSONProvider, ModelProviderError, OpenAICompatibleJSONProvider, _validate_schema, configured_model_provider
+from medai_science.llm import AnthropicMessagesJSONProvider, GeminiGenerateContentJSONProvider, ModelCompletion, ModelProviderError, OpenAICompatibleJSONProvider, _validate_schema, complete_structured_json, configured_model_provider
 
 
 SCHEMA = {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 40}}}
@@ -27,7 +27,56 @@ class ChunkStream(httpx.AsyncByteStream):
         return None
 
 
+class InjectedStructuralProvider:
+    """A provider satisfying the public contract without subclassing an adapter."""
+
+    def __init__(self, completion):
+        self.completion = completion
+        self.calls = 0
+
+    async def complete_json(self, **_kwargs):
+        self.calls += 1
+        return self.completion
+
+
 class ModelProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_common_task_boundary_accepts_structural_provider_and_revalidates_its_output(self):
+        provider = InjectedStructuralProvider(ModelCompletion(
+            {"query": "Alzheimer disease"}, "injected-local", "fixture", "a" * 64, "b" * 64,
+            {"total_tokens": 2}, 32,
+        ))
+        completion = await complete_structured_json(
+            provider, system="plan", prompt="objective", schema_name="query_plan", schema=SCHEMA,
+        )
+        self.assertEqual(completion.value, {"query": "Alzheimer disease"})
+        self.assertEqual(provider.calls, 1)
+
+    async def test_common_task_boundary_rejects_bad_schema_usage_and_provenance(self):
+        invalid_completions = [
+            ModelCompletion({"unexpected": True}, "test", "m", "a" * 64, "b" * 64, {"total_tokens": 1}, 32),
+            ModelCompletion({"query": "x"}, "test", "m", "a" * 64, "b" * 64, {}, 32),
+            ModelCompletion({"query": "x"}, "test", "m", "bad", "b" * 64, {"total_tokens": 1}, 32),
+        ]
+        for completion in invalid_completions:
+            provider = InjectedStructuralProvider(completion)
+            with self.subTest(completion=completion), self.assertRaises(ModelProviderError):
+                await complete_structured_json(provider, system="plan", prompt="objective", schema_name="query_plan", schema=SCHEMA)
+
+    async def test_common_task_boundary_rejects_oversized_prompts_before_provider_call(self):
+        provider = InjectedStructuralProvider(None)
+        with self.assertRaisesRegex(ValueError, "model prompt exceeds"):
+            await complete_structured_json(provider, system="s" * 32_769, prompt="", schema_name="query_plan", schema=SCHEMA)
+        self.assertEqual(provider.calls, 0)
+
+    async def test_common_task_boundary_caps_normalized_output_from_injected_providers(self):
+        schema = {"type": "object", "required": ["data"], "properties": {"data": {"type": "string", "maxLength": 1_100_000}}}
+        provider = InjectedStructuralProvider(ModelCompletion(
+            {"data": "x" * 1_048_577}, "injected-local", "fixture", "a" * 64, "b" * 64,
+            {"total_tokens": 1}, 32,
+        ))
+        with self.assertRaisesRegex(ModelProviderError, "structured output exceeds"):
+            await complete_structured_json(provider, system="plan", prompt="objective", schema_name="bounded", schema=schema)
+
     async def test_selects_an_independent_registered_agent_model_policy_and_secret_reference(self):
         policies = {
             "scientific_critic": {

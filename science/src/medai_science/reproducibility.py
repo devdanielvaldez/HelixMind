@@ -17,6 +17,7 @@ from medai_science.sources.safety import ensure_public_research_query
 
 MAX_BUNDLE_JSON_BYTES = 16 * 1024 * 1024
 MAX_REPORT_GRAPH_ASSERTIONS = 25
+RESEARCH_BUNDLE_SCHEMA_VERSION = "2"
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -312,14 +313,15 @@ def _require_unique_ids(rows: list[Any], label: str) -> set[str]:
     return identifiers
 
 
-def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], artifacts: list[dict[str, Any]], graph: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], artifacts: list[dict[str, Any]], graph: dict[str, Any], evidence: list[dict[str, Any]], citation_links: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     if not isinstance(session, dict) or not isinstance(plan, dict) or not isinstance(graph, dict):
         raise ValueError("session, plan, and graph must be objects")
     session_id = session.get("id")
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("research session must have an identifier")
     tasks = plan.get("tasks", [])
-    if not isinstance(tasks, list) or not isinstance(artifacts, list) or not isinstance(evidence, list):
+    citation_links = [] if citation_links is None else citation_links
+    if not isinstance(tasks, list) or not isinstance(artifacts, list) or not isinstance(evidence, list) or not isinstance(citation_links, list):
         raise ValueError("plan, artifacts, and evidence must be lists or objects")
     _require_unique_ids(tasks, "task list")
     if plan.get("session_id") not in (None, session_id):
@@ -329,8 +331,16 @@ def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], 
     for item in artifacts:
         if item.get("session_id") != session_id:
             raise ValueError("reproducibility inputs cannot include cross-session artifacts")
-        if not isinstance(item.get("id"), str) or not isinstance(item.get("sha256"), str) or len(item["sha256"]) != 64 or any(character not in "0123456789abcdef" for character in item["sha256"]):
-            raise ValueError("every artifact receipt requires a stable id and SHA-256 hash")
+        payload = item.get("payload")
+        digest = item.get("sha256")
+        if (
+            not isinstance(item.get("id"), str)
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(payload, str)
+            or hashlib.sha256(payload.encode("utf-8")).hexdigest() != digest
+        ):
+            raise ValueError("every artifact receipt must have a stable ID and a digest matching its exact retained payload bytes")
         artifact_receipts.append({key: item.get(key) for key in ("id", "task_id", "kind", "source", "source_id", "sha256", "recorded_at")})
     graph_nodes = graph.get("nodes", [])
     graph_edges = graph.get("edges", [])
@@ -343,6 +353,26 @@ def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], 
     node_ids = {node.get("id") for node in graph_nodes if isinstance(node, dict)}
     evidence_ids = {item.get("id") for item in evidence if isinstance(item, dict)}
     artifact_ids = {item.get("id") for item in artifact_receipts if isinstance(item, dict)}
+    citation_receipts = []
+    citation_identities: set[tuple[str, str]] = set()
+    for item in citation_links:
+        if not isinstance(item, dict) or item.get("session_id") != session_id:
+            raise ValueError("citation graph contains a cross-session or malformed link")
+        citing, cited = item.get("citing_doi"), item.get("cited_doi")
+        source_artifact_id = item.get("source_artifact_id")
+        reference_index = item.get("reference_index")
+        def valid_doi(value: Any) -> bool:
+            return isinstance(value, str) and len(value) <= 255 and bool(re.fullmatch(r"10\.[0-9]{4,9}/[-A-Za-z0-9._;()/:]+", value))
+        if (not valid_doi(citing) or not valid_doi(cited) or citing != citing.lower() or cited != cited.lower()
+                or not isinstance(source_artifact_id, str) or source_artifact_id not in artifact_ids
+                or (reference_index is not None and (isinstance(reference_index, bool) or not isinstance(reference_index, int) or not 0 <= reference_index < 200))):
+            raise ValueError("citation graph link has invalid DOI, source artifact, or reference index provenance")
+        identity = (citing, cited)
+        if identity in citation_identities:
+            raise ValueError("citation graph contains a duplicate DOI edge")
+        citation_identities.add(identity)
+        citation_receipts.append({"citing_doi": citing, "cited_doi": cited, "source_artifact_id": source_artifact_id, "reference_index": reference_index})
+    citation_receipts.sort(key=lambda row: (row["citing_doi"], row["cited_doi"], row["source_artifact_id"]))
     graph_receipt = {
         "nodes": [{key: node.get(key) for key in ("id", "kind", "label")} for node in graph_nodes],
         "edges": [],
@@ -369,9 +399,42 @@ def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], 
                 or len(linked_artifacts) != len(set(linked_artifacts))):
             raise ValueError("graph snapshot contains a dangling node, evidence, or artifact reference")
         graph_receipt["edges"].append({"source": edge.get("source"), "relation": edge.get("relation"), "target": edge.get("target"), "evidence_ids": linked, "artifact_ids": linked_artifacts})
-    evidence_receipts = [{key: item.get(key) for key in ("id", "source", "source_id", "polarity", "quality")} for item in evidence]
-    if any(item.get("session_id") != session_id for item in evidence):
-        raise ValueError("reproducibility inputs cannot include cross-session evidence")
+    evidence_receipts = []
+    for item in evidence:
+        if item.get("session_id") != session_id:
+            raise ValueError("reproducibility inputs cannot include cross-session evidence")
+        claim = item.get("claim")
+        provenance = item.get("provenance")
+        quality = item.get("quality")
+        if (
+            not isinstance(claim, str)
+            or not claim.strip()
+            or not isinstance(item.get("source"), str)
+            or not item["source"].strip()
+            or item.get("polarity") not in {"supports", "contradicts", "context"}
+            or isinstance(quality, bool)
+            or not isinstance(quality, (int, float))
+            or not math.isfinite(quality)
+            or not 0 <= quality <= 1
+            or not isinstance(provenance, str)
+        ):
+            raise ValueError("reproducibility evidence contains invalid claim, source, polarity, or quality fields")
+        try:
+            parsed_provenance = json.loads(
+                provenance,
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except (ValueError, json.JSONDecodeError, RecursionError) as error:
+            raise ValueError("reproducibility evidence provenance is not strict JSON") from error
+        if not isinstance(parsed_provenance, dict):
+            raise ValueError("reproducibility evidence provenance must be a JSON object")
+        evidence_receipts.append({
+            key: item.get(key) for key in ("id", "source", "source_id", "polarity", "quality")
+        } | {
+            "claim_sha256": hashlib.sha256(claim.encode("utf-8")).hexdigest(),
+            "provenance_sha256": hashlib.sha256(provenance.encode("utf-8")).hexdigest(),
+        })
     task_receipts = [{"id": task.get("id"), "status": task.get("status"), "attempts": task.get("attempts"), "output_sha256": _canonical_hash(task.get("output")) if task.get("output") is not None else None, "error_sha256": _canonical_hash(task.get("error")) if task.get("error") is not None else None} for task in tasks if isinstance(task, dict)]
     nodes_by_id = {node["id"]: node for node in graph_receipt["nodes"]}
     evidence_by_id = {item["id"]: item for item in evidence_receipts}
@@ -403,12 +466,13 @@ def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], 
     session_receipt = {key: session.get(key) for key in ("id", "status", "created_at", "depth", "budget", "credits_used")}
     session_receipt["objective"] = _report_label(session.get("objective"), 2000)
     snapshot = {
-        "schema_version": "1",
+        "schema_version": RESEARCH_BUNDLE_SCHEMA_VERSION,
         "session": session_receipt,
         "tasks": task_receipts,
         "artifacts": artifact_receipts,
         "evidence_annotations": evidence_receipts,
         "graph": graph_receipt,
+        "citation_graph": {"edges": citation_receipts, "interpretation_limit": "Captured Crossref citation metadata only; coverage may be incomplete and edges do not indicate claim support, contradiction, quality, or evidence strength."},
         "limitations": [
             "This bundle contains provenance and structural snapshots, not complete source datasets or article text.",
             "The session objective is privacy-screened and Markdown-sanitized for export; original objective text is not copied into this bundle.",
@@ -429,6 +493,7 @@ def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], 
         f"- Source artifacts: {len(artifact_receipts)}",
         f"- Evidence annotations: {len(evidence_receipts)}",
         f"- Graph nodes and edges: {len(graph_receipt['nodes'])} / {len(graph_receipt['edges'])}",
+        f"- Captured Crossref citation links: {len(citation_receipts)}",
         f"- Reproducibility bundle SHA-256: `{snapshot['bundle_sha256']}`",
         "",
         "## Task outcomes",
@@ -445,6 +510,14 @@ def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], 
     else:
         report_lines.append("- No evidence-linked graph statements were retained in this session snapshot.")
     report_lines.extend(_literature_report_section(artifacts, session_id))
+    report_lines.extend(["", "## Captured Crossref citation links"])
+    if citation_receipts:
+        report_lines.extend(f"- `{row['citing_doi']}` cites `{row['cited_doi']}` (artifact `{row['source_artifact_id']}`; reference index {row['reference_index'] if row['reference_index'] is not None else 'unavailable'})." for row in citation_receipts[:100])
+        if len(citation_receipts) > 100:
+            report_lines.append(f"- Report display is limited to 100 of {len(citation_receipts)} retained links; all links remain in the hash-verified bundle.")
+    else:
+        report_lines.append("- No captured Crossref citation links were present in this session snapshot.")
+    report_lines.append("- These links are bibliographic metadata and do not establish scientific support, contradiction, paper quality, or evidence strength.")
     report_lines.extend(_hypothesis_report_sections(artifacts, session_id, evidence))
     report_lines.extend([
         "",
@@ -461,14 +534,7 @@ def build_reproducibility_bundle(session: dict[str, Any], plan: dict[str, Any], 
 def compare_reproducibility_bundles(baseline: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     """Report hash-verified structural changes between two captures of one research session."""
     def validate(bundle: Any, label: str) -> dict[str, Any]:
-        if not isinstance(bundle, dict):
-            raise ValueError(f"{label} bundle must be an object")
-        digest = bundle.get("bundle_sha256")
-        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-            raise ValueError(f"{label} bundle hash is missing or malformed")
-        snapshot = {key: value for key, value in bundle.items() if key not in {"bundle_sha256", "report_markdown"}}
-        if _canonical_hash(snapshot) != digest:
-            raise ValueError(f"{label} bundle hash verification failed")
+        bundle = _verify_research_bundle(bundle, label)
         session = bundle.get("session")
         if not isinstance(session, dict) or not isinstance(session.get("id"), str) or not session["id"]:
             raise ValueError(f"{label} bundle session identity is malformed")
@@ -517,11 +583,79 @@ def compare_reproducibility_bundles(baseline: dict[str, Any], current: dict[str,
         "tasks": diff(keyed(before.get("tasks"), lambda row: row.get("id"), "task"), keyed(after.get("tasks"), lambda row: row.get("id"), "task")),
         "artifacts": diff(keyed(before.get("artifacts"), lambda row: row.get("id"), "artifact"), keyed(after.get("artifacts"), lambda row: row.get("id"), "artifact")),
         "evidence_annotations": diff(keyed(before.get("evidence_annotations"), lambda row: row.get("id"), "evidence"), keyed(after.get("evidence_annotations"), lambda row: row.get("id"), "evidence")),
+        "citation_graph_edges": diff(
+            keyed((before.get("citation_graph") or {}).get("edges", []) if isinstance(before.get("citation_graph"), dict) else [], lambda row: json.dumps([row.get("citing_doi"), row.get("cited_doi")], separators=(",", ":")), "citation edge"),
+            keyed((after.get("citation_graph") or {}).get("edges", []) if isinstance(after.get("citation_graph"), dict) else [], lambda row: json.dumps([row.get("citing_doi"), row.get("cited_doi")], separators=(",", ":")), "citation edge"),
+        ),
         "graph_nodes": diff(keyed(left_graph.get("nodes"), lambda row: row.get("id"), "graph node"), keyed(right_graph.get("nodes"), lambda row: row.get("id"), "graph node")),
         "graph_edges": diff(
             keyed(left_graph.get("edges"), graph_edge_key, "graph edge"),
             keyed(right_graph.get("edges"), graph_edge_key, "graph edge"),
         ),
+    }
+
+    def linked_ids(edge: dict[str, Any], field: str) -> set[str]:
+        value = edge.get(field, [])
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value) or len(value) != len(set(value)):
+            raise ValueError(f"graph edge {field} must contain unique stable identifiers")
+        return set(value)
+
+    def validate_graph_references(bundle: dict[str, Any], label: str) -> None:
+        graph = bundle.get("graph")
+        if not isinstance(graph, dict):
+            raise ValueError(f"{label} bundle graph snapshot must be an object")
+        nodes = keyed(graph.get("nodes"), lambda row: row.get("id"), f"{label} graph node")
+        evidence = keyed(bundle.get("evidence_annotations"), lambda row: row.get("id"), f"{label} evidence")
+        artifacts = keyed(bundle.get("artifacts"), lambda row: row.get("id"), f"{label} artifact")
+        edges = keyed(graph.get("edges"), graph_edge_key, f"{label} graph edge")
+        for edge in edges.values():
+            if edge.get("source") not in nodes or edge.get("target") not in nodes:
+                raise ValueError(f"{label} graph snapshot contains a dangling node reference")
+            edge_evidence = linked_ids(edge, "evidence_ids")
+            edge_artifacts = linked_ids(edge, "artifact_ids")
+            if not edge_evidence.issubset(evidence) or not edge_artifacts.issubset(artifacts):
+                raise ValueError(f"{label} graph snapshot contains a dangling evidence or artifact reference")
+
+    validate_graph_references(before, "baseline")
+    validate_graph_references(after, "current")
+    changed_artifact_ids = set(changes["artifacts"]["added"] + changes["artifacts"]["removed"] + changes["artifacts"]["modified"])
+    changed_evidence_ids = set(changes["evidence_annotations"]["added"] + changes["evidence_annotations"]["removed"] + changes["evidence_annotations"]["modified"])
+
+    # Trace only explicit artifact/evidence references carried by graph edges.
+    # This is a review queue for downstream records, not an inference that the
+    # underlying biology or an edge's meaning changed.
+    impacted_edges: dict[str, dict[str, Any]] = {}
+    for capture, graph in (("baseline", left_graph), ("current", right_graph)):
+        for edge in graph["edges"]:
+            if not isinstance(edge, dict):
+                raise ValueError("graph edge snapshot contains a malformed record")
+            edge_key = graph_edge_key(edge)
+            artifact_refs = linked_ids(edge, "artifact_ids")
+            evidence_refs = linked_ids(edge, "evidence_ids")
+            affected_artifacts = sorted(artifact_refs & changed_artifact_ids)
+            affected_evidence = sorted(evidence_refs & changed_evidence_ids)
+            if not affected_artifacts and not affected_evidence:
+                continue
+            row = impacted_edges.setdefault(edge_key, {
+                "source": edge["source"],
+                "relation": edge["relation"],
+                "target": edge["target"],
+                "present_in": [],
+                "changed_artifact_ids": [],
+                "changed_evidence_ids": [],
+            })
+            row["present_in"].append(capture)
+            row["changed_artifact_ids"] = sorted(set(row["changed_artifact_ids"]) | set(affected_artifacts))
+            row["changed_evidence_ids"] = sorted(set(row["changed_evidence_ids"]) | set(affected_evidence))
+    affected_graph_edges = sorted(impacted_edges.values(), key=lambda row: (row["source"], row["relation"], row["target"]))
+    affected_graph_nodes = sorted({node for edge in affected_graph_edges for node in (edge["source"], edge["target"])})
+    impact = {
+        "changed_artifact_ids": sorted(changed_artifact_ids),
+        "changed_evidence_annotation_ids": sorted(changed_evidence_ids),
+        "affected_graph_edges": affected_graph_edges,
+        "affected_graph_node_ids": affected_graph_nodes,
+        "review_required": bool(affected_graph_edges),
+        "interpretation": "Edges are listed only when their retained source-artifact or evidence identifiers changed between captures. This is a traceability-based review signal; it does not establish a biological change or invalidate an edge.",
     }
     has_changes = any(any(values for values in category.values()) for category in changes.values())
     return {
@@ -531,8 +665,53 @@ def compare_reproducibility_bundles(baseline: dict[str, Any], current: dict[str,
         "current_bundle_sha256": after["bundle_sha256"],
         "review_required": has_changes,
         "changes": changes,
+        "change_impact": impact,
         "interpretation_limit": "This comparison detects structural changes in retained research records. The unkeyed bundle hashes verify internal consistency, not producer identity. The comparison does not establish why evidence changed, whether a result is scientifically correct, or whether a clinical conclusion should change.",
     }
+
+
+def _verify_research_bundle(bundle: Any, label: str) -> dict[str, Any]:
+    if not isinstance(bundle, dict):
+        raise ValueError(f"{label} bundle must be an object")
+    if bundle.get("schema_version") not in {"1", RESEARCH_BUNDLE_SCHEMA_VERSION}:
+        raise ValueError(f"{label} bundle schema version is unsupported")
+    digest = bundle.get("bundle_sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError(f"{label} bundle hash is missing or malformed")
+    snapshot = {key: value for key, value in bundle.items() if key not in {"bundle_sha256", "report_markdown"}}
+    if _canonical_hash(snapshot) != digest:
+        raise ValueError(f"{label} bundle hash verification failed")
+    if bundle["schema_version"] == RESEARCH_BUNDLE_SCHEMA_VERSION:
+        receipts = bundle.get("evidence_annotations")
+        if not isinstance(receipts, list) or any(
+            not isinstance(item, dict)
+            or any(not isinstance(item.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", item[field])
+                   for field in ("claim_sha256", "provenance_sha256"))
+            for item in receipts
+        ):
+            raise ValueError(f"{label} schema v2 evidence receipts are malformed")
+    citations = bundle.get("citation_graph")
+    if citations is not None:
+        if not isinstance(citations, dict) or not isinstance(citations.get("edges"), list):
+            raise ValueError(f"{label} citation graph is malformed")
+        artifact_ids = {item.get("id") for item in bundle.get("artifacts", []) if isinstance(item, dict)}
+        identities: set[tuple[str, str]] = set()
+        for edge in citations["edges"]:
+            if not isinstance(edge, dict):
+                raise ValueError(f"{label} citation graph contains a malformed edge")
+            citing, cited, source = edge.get("citing_doi"), edge.get("cited_doi"), edge.get("source_artifact_id")
+            if (not isinstance(citing, str) or not re.fullmatch(r"10\.[0-9]{4,9}/[-A-Za-z0-9._;()/:]+", citing)
+                    or not isinstance(cited, str) or not re.fullmatch(r"10\.[0-9]{4,9}/[-A-Za-z0-9._;()/:]+", cited)
+                    or citing != citing.lower() or cited != cited.lower() or source not in artifact_ids):
+                raise ValueError(f"{label} citation graph contains invalid DOI or artifact provenance")
+            index = edge.get("reference_index")
+            if index is not None and (isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < 200):
+                raise ValueError(f"{label} citation graph contains an invalid reference index")
+            identity = (citing, cited)
+            if identity in identities:
+                raise ValueError(f"{label} citation graph contains a duplicate DOI edge")
+            identities.add(identity)
+    return bundle
 
 
 def parse_research_bundle_artifact(artifact: Any, expected_session_id: str) -> dict[str, Any]:
@@ -549,10 +728,11 @@ def parse_research_bundle_artifact(artifact: Any, expected_session_id: str) -> d
     if hashlib.sha256(payload.encode("utf-8")).hexdigest() != digest:
         raise ValueError("research bundle artifact payload hash verification failed")
     try:
-        bundle = json.loads(payload)
-    except json.JSONDecodeError as error:
+        bundle = json.loads(payload, object_pairs_hook=_unique_json_object, parse_constant=_reject_json_constant)
+    except (ValueError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError("research bundle artifact payload is not valid JSON") from error
-    if not isinstance(bundle, dict) or not isinstance(bundle.get("session"), dict) or bundle["session"].get("id") != expected_session_id:
+    bundle = _verify_research_bundle(bundle, "research bundle")
+    if not isinstance(bundle.get("session"), dict) or bundle["session"].get("id") != expected_session_id:
         raise ValueError("research bundle payload belongs to a different session")
     return bundle
 
@@ -677,6 +857,8 @@ def create_genomics_bundle(
     external_vep: dict[str, Any] | None = None,
     clinvar_records: list[dict[str, Any]] | None = None,
     gnomad_frequency_receipts: list[dict[str, Any]] | None = None,
+    dbsnp_receipt: dict[str, Any] | None = None,
+    dbsnp_sequence_accession_to_contig: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Capture bounded local VCF analysis inputs and exact module hashes for private replay."""
     from medai_science.genomics import analyze_vcf
@@ -698,6 +880,16 @@ def create_genomics_bundle(
     clinvar_reconciliation = None
     source_reconciliation = None
     gnomad_frequency_reconciliation = None
+    dbsnp_reconciliation = None
+    if (dbsnp_receipt is None) != (dbsnp_sequence_accession_to_contig is None):
+        raise ValueError("dbSNP bundles require both a RefSNP receipt and its explicit sequence-accession map")
+    if dbsnp_receipt is not None:
+        if reference is None:
+            raise ValueError("dbSNP placement bundles require the exact local reference FASTA")
+        from medai_science.dbsnp_reconciliation import reconcile_dbsnp_placements
+        dbsnp_reconciliation = reconcile_dbsnp_placements(
+            report, dbsnp_receipt, reference, genome_build, dbsnp_sequence_accession_to_contig,
+        )
     if gnomad_frequency_receipts is not None:
         if reference is None:
             raise ValueError("gnomAD frequency bundles require the exact local reference FASTA")
@@ -775,6 +967,29 @@ def create_genomics_bundle(
             reconciliation_bytes = (json.dumps(gnomad_frequency_reconciliation, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
             _write_private(reconciliation_path, reconciliation_bytes)
             artifacts.append({"path": external_gnomad_reconciliation_path, "size": reconciliation_path.stat().st_size, "sha256": _sha256(reconciliation_path)})
+        external_dbsnp_receipt_path = None
+        external_dbsnp_reconciliation_path = None
+        external_dbsnp_sequence_map_path = None
+        if dbsnp_receipt is not None and dbsnp_reconciliation is not None:
+            external_dbsnp_receipt_path = "external/dbsnp-ref-snp.json"
+            dbsnp_receipt_path = target / external_dbsnp_receipt_path
+            dbsnp_bytes = (json.dumps(dbsnp_receipt, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+            if len(dbsnp_bytes) > 8_000_000:
+                raise ValueError("dbSNP source receipt exceeds the 8 MB bundle limit")
+            _write_private(dbsnp_receipt_path, dbsnp_bytes)
+            artifacts.append({"path": external_dbsnp_receipt_path, "size": dbsnp_receipt_path.stat().st_size, "sha256": _sha256(dbsnp_receipt_path)})
+            external_dbsnp_sequence_map_path = "external/dbsnp-sequence-map.json"
+            sequence_map_path = target / external_dbsnp_sequence_map_path
+            sequence_map_bytes = (json.dumps(dbsnp_sequence_accession_to_contig, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+            if len(sequence_map_bytes) > 128_000:
+                raise ValueError("dbSNP sequence-accession map exceeds the 128 KB bundle limit")
+            _write_private(sequence_map_path, sequence_map_bytes)
+            artifacts.append({"path": external_dbsnp_sequence_map_path, "size": sequence_map_path.stat().st_size, "sha256": _sha256(sequence_map_path)})
+            external_dbsnp_reconciliation_path = "external/dbsnp-reconciliation.json"
+            dbsnp_reconciliation_path = target / external_dbsnp_reconciliation_path
+            dbsnp_reconciliation_bytes = (json.dumps(dbsnp_reconciliation, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+            _write_private(dbsnp_reconciliation_path, dbsnp_reconciliation_bytes)
+            artifacts.append({"path": external_dbsnp_reconciliation_path, "size": dbsnp_reconciliation_path.stat().st_size, "sha256": _sha256(dbsnp_reconciliation_path)})
         source_root = Path(__file__).resolve().parent
         module_rows = []
         module_names = ["__init__.py", "genomics.py", "transcripts.py"]
@@ -786,6 +1001,8 @@ def create_genomics_bundle(
                 module_names.append("variant_source_reconciliation.py")
         if gnomad_frequency_receipts is not None:
             module_names.extend(["reproducibility.py", "variant_source_reconciliation.py", "sources/gnomad.py", "sources/bounded_http.py"])
+        if dbsnp_receipt is not None:
+            module_names.extend(["reproducibility.py", "dbsnp_reconciliation.py", "sources/dbsnp.py", "sources/bounded_http.py"])
         module_names = list(dict.fromkeys(module_names))
         for module_name in module_names:
             source = source_root / module_name
@@ -801,7 +1018,7 @@ def create_genomics_bundle(
         manifest = {
             "schema_version": "1",
             "created_at_unix": int(__import__("time").time()),
-            "analysis": {"workflow": "genomics.vcf", "genome_build": genome_build, "max_variants": max_variants, "reference_fasta": "inputs/reference.fa" if reference else None, "transcript_gff3": "inputs/annotation.gff3" if annotation else None, "external_vep": external_validation_path, "external_clinvar_records": external_clinvar_path, "external_clinvar_reconciliation": external_clinvar_reconciliation_path, "external_source_reconciliation": external_source_reconciliation_path, "external_gnomad_frequency_receipts": external_gnomad_receipts_path, "external_gnomad_frequency_reconciliation": external_gnomad_reconciliation_path},
+            "analysis": {"workflow": "genomics.vcf", "genome_build": genome_build, "max_variants": max_variants, "reference_fasta": "inputs/reference.fa" if reference else None, "transcript_gff3": "inputs/annotation.gff3" if annotation else None, "external_vep": external_validation_path, "external_clinvar_records": external_clinvar_path, "external_clinvar_reconciliation": external_clinvar_reconciliation_path, "external_source_reconciliation": external_source_reconciliation_path, "external_gnomad_frequency_receipts": external_gnomad_receipts_path, "external_gnomad_frequency_reconciliation": external_gnomad_reconciliation_path, "external_dbsnp_receipt": external_dbsnp_receipt_path, "external_dbsnp_reconciliation": external_dbsnp_reconciliation_path, "external_dbsnp_sequence_map": external_dbsnp_sequence_map_path},
             "network_accessed": False,
             "runtime": {"python": os.sys.version.split()[0]},
             "scientific_modules": module_rows,
@@ -813,7 +1030,7 @@ def create_genomics_bundle(
         target.chmod(0o700)
         for directory in sorted((path for path in target.rglob("*") if path.is_dir()), reverse=True):
             directory.chmod(0o700)
-        return {"bundle_dir": str(target), "artifact_count": len(artifacts), "manifest_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "external_vep_captured": external_vep is not None, "external_clinvar_captured": clinvar_records is not None, "cross_source_reconciliation_captured": source_reconciliation is not None, "external_gnomad_frequency_captured": gnomad_frequency_receipts is not None, "network_accessed": False}
+        return {"bundle_dir": str(target), "artifact_count": len(artifacts), "manifest_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "external_vep_captured": external_vep is not None, "external_clinvar_captured": clinvar_records is not None, "cross_source_reconciliation_captured": source_reconciliation is not None, "external_gnomad_frequency_captured": gnomad_frequency_receipts is not None, "external_dbsnp_captured": dbsnp_receipt is not None, "network_accessed": False}
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
         raise
@@ -895,6 +1112,153 @@ def create_sequence_bundle(
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
         raise
+
+
+def create_structure_bundle(
+    bundle_dir: str | Path,
+    report: dict[str, Any],
+    input_path: str | Path,
+    structure_format: str,
+) -> dict[str, Any]:
+    """Capture a bounded local PDB/mmCIF file and the parser for private offline replay."""
+    from medai_science.structure_analysis import MAX_MMCIF_BYTES, MAX_PDB_BYTES, summarize_mmcif, summarize_pdb
+
+    normalized_format = structure_format.casefold() if isinstance(structure_format, str) else ""
+    if normalized_format not in {"pdb", "mmcif"}:
+        raise ValueError("structure bundle format must be pdb or mmcif")
+    source = Path(input_path).expanduser().resolve()
+    maximum = MAX_MMCIF_BYTES if normalized_format == "mmcif" else MAX_PDB_BYTES
+    if not source.is_file() or source.stat().st_size < 1 or source.stat().st_size > maximum:
+        raise ValueError(f"structure input must be a regular file containing 1..{maximum} bytes")
+    target = Path(bundle_dir).expanduser().resolve()
+    if target.exists():
+        raise ValueError("structure bundle directory already exists")
+    with source.open("rb") as handle:
+        payload = handle.read(maximum + 1)
+    if not 1 <= len(payload) <= maximum:
+        raise ValueError(f"structure input must contain 1..{maximum} bytes")
+    recompute = summarize_mmcif if normalized_format == "mmcif" else summarize_pdb
+    expected_report = recompute(payload, label=report.get("label") if isinstance(report, dict) else None)
+    if not isinstance(report, dict) or report != expected_report:
+        raise ValueError("structure report does not match the supplied coordinate file and parser")
+    target.mkdir(parents=True, mode=0o700)
+    try:
+        suffix = ".mmcif" if normalized_format == "mmcif" else ".pdb"
+        relative_input = "inputs/structure" + suffix
+        destination = target / relative_input
+        destination.parent.mkdir(parents=True, mode=0o700)
+        shutil.copyfile(source, destination)
+        destination.chmod(0o600)
+        input_digest = _sha256(destination)
+        if input_digest != report.get("input_sha256") or destination.stat().st_size != len(payload):
+            raise ValueError("structure input changed between analysis and bundle capture")
+        report_path = target / "report.json"
+        _write_private(report_path, (json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8"))
+        artifacts = [
+            {"path": relative_input, "size": destination.stat().st_size, "sha256": input_digest},
+            {"path": "report.json", "size": report_path.stat().st_size, "sha256": _sha256(report_path)},
+        ]
+        source_module = Path(__file__).resolve().parent / "structure_analysis.py"
+        captured_module = target / "code" / "medai_science" / "structure_analysis.py"
+        captured_module.parent.mkdir(parents=True, mode=0o700)
+        shutil.copyfile(source_module, captured_module)
+        captured_module.chmod(0o600)
+        code_digest = _sha256(captured_module)
+        artifacts.append({"path": "code/medai_science/structure_analysis.py", "size": captured_module.stat().st_size, "sha256": code_digest})
+        runtime = {"python": os.sys.version.split()[0]}
+        if normalized_format == "mmcif":
+            try:
+                import Bio
+            except ImportError as error:
+                raise RuntimeError("install medai-science[bio] to bundle mmCIF analyses") from error
+            runtime["biopython"] = getattr(Bio, "__version__", "unknown")
+        manifest = {
+            "schema_version": "1",
+            "created_at_unix": int(__import__("time").time()),
+            "analysis": {"workflow": "protein.coordinate_summary", "format": normalized_format, "input": relative_input, "label": report.get("label"), "input_sha256": input_digest},
+            "network_accessed": False,
+            "runtime": runtime,
+            "scientific_modules": [{"module": "medai_science.structure_analysis", "path": "code/medai_science/structure_analysis.py", "sha256": code_digest}],
+            "artifacts": artifacts,
+            "report_sha256": _sha256(report_path),
+            "interpretation_limit": "Offline replay verifies structural file parsing and summary equivalence only; it does not establish protein identity, function, binding, structure quality, or experimental validity.",
+        }
+        manifest_path = target / "manifest.json"
+        _write_private(manifest_path, (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+        target.chmod(0o700)
+        for directory in sorted((path for path in target.rglob("*") if path.is_dir()), reverse=True):
+            directory.chmod(0o700)
+        return {"bundle_dir": str(target), "artifact_count": len(artifacts), "manifest_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "network_accessed": False}
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
+def verify_structure_bundle(bundle_dir: str | Path, replay: bool = False) -> dict[str, Any]:
+    """Verify a captured coordinate summary and optionally replay the exact installed parser."""
+    bundle = Path(bundle_dir).expanduser().resolve()
+    manifest_path = bundle / "manifest.json"
+    if not bundle.is_dir() or manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("structure bundle manifest is missing")
+    manifest = _read_bundle_json(manifest_path, "structure bundle manifest")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("analysis"), dict):
+        raise ValueError("structure bundle manifest is malformed")
+    settings = manifest["analysis"]
+    structure_format = settings.get("format")
+    if manifest.get("schema_version") != "1" or settings.get("workflow") != "protein.coordinate_summary" or structure_format not in {"pdb", "mmcif"} or manifest.get("network_accessed") is not False:
+        raise ValueError("bundle does not describe a supported offline structure workflow")
+    runtime = manifest.get("runtime")
+    if not isinstance(runtime, dict) or not isinstance(runtime.get("python"), str) or (structure_format == "mmcif" and not isinstance(runtime.get("biopython"), str)):
+        raise ValueError("structure bundle runtime metadata is malformed")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or len(artifacts) != 3:
+        raise ValueError("structure bundle artifact manifest is malformed")
+    expected_paths = {"report.json", "code/medai_science/structure_analysis.py", "inputs/structure.mmcif" if structure_format == "mmcif" else "inputs/structure.pdb"}
+    if {item.get("path") for item in artifacts if isinstance(item, dict)} != expected_paths:
+        raise ValueError("structure bundle artifact paths do not match the workflow")
+    verified = []
+    for item in artifacts:
+        relative = item.get("path") if isinstance(item, dict) else None
+        path = _safe_bundle_file(bundle, relative)
+        if path.stat().st_size != item.get("size") or _sha256(path) != item.get("sha256"):
+            raise ValueError(f"structure bundle artifact hash or size mismatch: {relative}")
+        verified.append(relative)
+    input_relative = "inputs/structure.mmcif" if structure_format == "mmcif" else "inputs/structure.pdb"
+    input_path = _safe_bundle_file(bundle, input_relative)
+    from medai_science.structure_analysis import MAX_MMCIF_BYTES, MAX_PDB_BYTES
+    maximum = MAX_MMCIF_BYTES if structure_format == "mmcif" else MAX_PDB_BYTES
+    if input_path.stat().st_size < 1 or input_path.stat().st_size > maximum:
+        raise ValueError("captured structure input is outside the parser size bounds")
+    report_path = _safe_bundle_file(bundle, "report.json")
+    if settings.get("input") != input_relative or settings.get("input_sha256") != _sha256(input_path) or manifest.get("report_sha256") != _sha256(report_path):
+        raise ValueError("structure bundle inputs or report are not bound to the manifest")
+    captured_report = _read_bundle_json(report_path, "structure report")
+    if not isinstance(captured_report, dict) or captured_report.get("input_sha256") != settings.get("input_sha256") or captured_report.get("label") != settings.get("label") or captured_report.get("coordinates_retained") is not False:
+        raise ValueError("structure report identity or coordinate-retention metadata is invalid")
+    captured_module = _safe_bundle_file(bundle, "code/medai_science/structure_analysis.py")
+    code_digest = _sha256(captured_module)
+    if manifest.get("scientific_modules") != [{"module": "medai_science.structure_analysis", "path": "code/medai_science/structure_analysis.py", "sha256": code_digest}]:
+        raise ValueError("structure bundle parser-code receipt is invalid")
+    if not replay:
+        return {"valid": True, "replayed": False, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path)}
+    _verify_python_runtime(manifest)
+    import medai_science.structure_analysis as module
+    if _sha256(Path(module.__file__).resolve()) != code_digest:
+        raise ValueError("installed structure parser differs from the captured bundle code")
+    if structure_format == "mmcif":
+        try:
+            import Bio
+        except ImportError as error:
+            raise RuntimeError("install medai-science[bio] to replay this mmCIF bundle") from error
+        if manifest.get("runtime", {}).get("biopython") != getattr(Bio, "__version__", "unknown"):
+            raise ValueError("installed Biopython version differs from the captured structure bundle runtime")
+    from medai_science.structure_analysis import summarize_mmcif, summarize_pdb
+    payload = input_path.read_bytes()
+    recomputed = summarize_mmcif if structure_format == "mmcif" else summarize_pdb
+    report = recomputed(payload, label=settings.get("label"))
+    if report != captured_report:
+        raise ValueError("replayed structure summary differs from the captured report")
+    return {"valid": True, "replayed": True, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "network_accessed": False}
 
 
 def create_compound_bundle(bundle_dir: str | Path, match: dict[str, Any]) -> dict[str, Any]:
@@ -1030,6 +1394,14 @@ def verify_genomics_bundle(bundle_dir: str | Path, replay: bool = False) -> dict
         raise ValueError("captured gnomAD frequency receipts and reconciliation paths must appear together")
     if has_gnomad_frequency and not settings.get("reference_fasta"):
         raise ValueError("gnomAD frequency bundle replay requires its captured reference FASTA")
+    dbsnp_receipt_path = settings.get("external_dbsnp_receipt")
+    dbsnp_reconciliation_path = settings.get("external_dbsnp_reconciliation")
+    dbsnp_sequence_map_path = settings.get("external_dbsnp_sequence_map")
+    has_dbsnp = dbsnp_receipt_path is not None
+    if len({has_dbsnp, dbsnp_reconciliation_path is not None, dbsnp_sequence_map_path is not None}) != 1:
+        raise ValueError("captured dbSNP receipt, reconciliation, and sequence map must appear together")
+    if has_dbsnp and not settings.get("reference_fasta"):
+        raise ValueError("dbSNP placement bundle replay requires its captured reference FASTA")
     clinvar_records = None
     clinvar_receipt = None
     source_receipt = None
@@ -1066,8 +1438,25 @@ def verify_genomics_bundle(bundle_dir: str | Path, replay: bool = False) -> dict
         recomputed_gnomad = reconcile_gnomad_frequency(captured_report, gnomad_receipts)
         if recomputed_gnomad != gnomad_reconciliation:
             raise ValueError("recomputed gnomAD frequency reconciliation differs from the captured receipt")
+    dbsnp_receipt = None
+    dbsnp_sequence_map = None
+    dbsnp_reconciliation = None
+    if has_dbsnp:
+        try:
+            dbsnp_receipt = _read_bundle_json(_safe_bundle_file(bundle, dbsnp_receipt_path), "dbSNP RefSNP receipt")
+            dbsnp_sequence_map = _read_bundle_json(_safe_bundle_file(bundle, dbsnp_sequence_map_path), "dbSNP sequence-accession map")
+            dbsnp_reconciliation = _read_bundle_json(_safe_bundle_file(bundle, dbsnp_reconciliation_path), "dbSNP reconciliation receipt")
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("captured dbSNP bundle receipts are malformed") from error
+        from medai_science.dbsnp_reconciliation import reconcile_dbsnp_placements
+        recomputed_dbsnp = reconcile_dbsnp_placements(
+            captured_report, dbsnp_receipt, _safe_bundle_file(bundle, settings["reference_fasta"]),
+            settings["genome_build"], dbsnp_sequence_map,
+        )
+        if recomputed_dbsnp != dbsnp_reconciliation:
+            raise ValueError("recomputed dbSNP placement reconciliation differs from the captured receipt")
     if not replay:
-        return {"valid": True, "replayed": False, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path), "external_vep_receipt_verified": has_external_validation, "external_clinvar_receipt_verified": has_clinvar, "cross_source_reconciliation_verified": source_reconciliation_path is not None, "external_gnomad_frequency_verified": has_gnomad_frequency, "external_source_requeried": False}
+        return {"valid": True, "replayed": False, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path), "external_vep_receipt_verified": has_external_validation, "external_clinvar_receipt_verified": has_clinvar, "cross_source_reconciliation_verified": source_reconciliation_path is not None, "external_gnomad_frequency_verified": has_gnomad_frequency, "external_dbsnp_placement_verified": has_dbsnp, "external_source_requeried": False}
     _verify_python_runtime(manifest)
     from medai_science.genomics import analyze_vcf
     import medai_science.genomics as genomics_module
@@ -1078,6 +1467,7 @@ def verify_genomics_bundle(bundle_dir: str | Path, replay: bool = False) -> dict
         modules["medai_science.reproducibility"] = __import__("medai_science.reproducibility", fromlist=["verify_genomics_bundle"])
         modules["medai_science.sources.ensembl_vep"] = __import__("medai_science.sources.ensembl_vep", fromlist=["EnsemblVEPClient"])
     if has_clinvar:
+        modules["medai_science.reproducibility"] = __import__("medai_science.reproducibility", fromlist=["verify_genomics_bundle"])
         modules["medai_science.clinvar_reconciliation"] = __import__("medai_science.clinvar_reconciliation", fromlist=["reconcile_clinvar_variants"])
     if source_reconciliation_path is not None:
         modules["medai_science.variant_source_reconciliation"] = __import__("medai_science.variant_source_reconciliation", fromlist=["reconcile_variant_sources"])
@@ -1085,6 +1475,11 @@ def verify_genomics_bundle(bundle_dir: str | Path, replay: bool = False) -> dict
         modules["medai_science.reproducibility"] = __import__("medai_science.reproducibility", fromlist=["verify_genomics_bundle"])
         modules["medai_science.variant_source_reconciliation"] = __import__("medai_science.variant_source_reconciliation", fromlist=["reconcile_gnomad_frequency"])
         modules["medai_science.sources.gnomad"] = __import__("medai_science.sources.gnomad", fromlist=["GnomADClient"])
+        modules["medai_science.sources.bounded_http"] = __import__("medai_science.sources.bounded_http", fromlist=["read_bounded_response"])
+    if has_dbsnp:
+        modules["medai_science.reproducibility"] = __import__("medai_science.reproducibility", fromlist=["verify_genomics_bundle"])
+        modules["medai_science.dbsnp_reconciliation"] = __import__("medai_science.dbsnp_reconciliation", fromlist=["reconcile_dbsnp_placements"])
+        modules["medai_science.sources.dbsnp"] = __import__("medai_science.sources.dbsnp", fromlist=["DbSNPClient"])
         modules["medai_science.sources.bounded_http"] = __import__("medai_science.sources.bounded_http", fromlist=["read_bounded_response"])
     for row in manifest.get("scientific_modules", []):
         module = modules.get(row.get("module"))
@@ -1113,7 +1508,12 @@ def verify_genomics_bundle(bundle_dir: str | Path, replay: bool = False) -> dict
         replay_gnomad = reconcile_gnomad_frequency(replay_report, gnomad_receipts)
         if replay_gnomad != gnomad_reconciliation:
             raise ValueError("replayed gnomAD frequency reconciliation differs from the captured receipt")
-    return {"valid": True, "replayed": True, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "external_vep_receipt_verified": has_external_validation, "external_clinvar_receipt_verified": has_clinvar, "cross_source_reconciliation_verified": source_reconciliation_path is not None, "external_gnomad_frequency_verified": has_gnomad_frequency, "external_source_requeried": False}
+    if has_dbsnp:
+        from medai_science.dbsnp_reconciliation import reconcile_dbsnp_placements
+        replay_dbsnp = reconcile_dbsnp_placements(replay_report, dbsnp_receipt, reference, settings["genome_build"], dbsnp_sequence_map)
+        if replay_dbsnp != dbsnp_reconciliation:
+            raise ValueError("replayed dbSNP placement reconciliation differs from the captured receipt")
+    return {"valid": True, "replayed": True, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "external_vep_receipt_verified": has_external_validation, "external_clinvar_receipt_verified": has_clinvar, "cross_source_reconciliation_verified": source_reconciliation_path is not None, "external_gnomad_frequency_verified": has_gnomad_frequency, "external_dbsnp_placement_verified": has_dbsnp, "external_source_requeried": False}
 
 
 def verify_sequence_bundle(bundle_dir: str | Path, replay: bool = False) -> dict[str, Any]:
@@ -1242,6 +1642,152 @@ def verify_compound_bundle(bundle_dir: str | Path, replay: bool = False) -> dict
     replayed = PubChemClient._rdkit_descriptors(smiles)
     if replayed != rdkit:
         raise ValueError("replayed RDKit descriptors differ from the captured report")
+    return {"valid": True, "replayed": True, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"]}
+
+
+def create_chembl_profile_replay(profile: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild a ChEMBL profile from retained rows and their page receipts."""
+    from medai_science.sources.chembl import ChEMBLClient
+
+    if not isinstance(profile, dict) or profile.get("source") != "ChEMBL web services" or profile.get("research_only") is not True:
+        raise ValueError("ChEMBL bundle requires a normalized research-only ChEMBL profile")
+    inchikey = profile.get("inchikey")
+    if not isinstance(inchikey, str) or not re.fullmatch(r"[A-Z]{14}-[A-Z]{10}-[A-Z]", inchikey):
+        raise ValueError("ChEMBL bundle requires an exact standard InChIKey")
+    if not profile.get("molecule_matches"):
+        raise ValueError("ChEMBL bundle requires at least one exact source molecule match")
+    limits = profile.get("record_limits")
+    if not isinstance(limits, dict):
+        raise ValueError("ChEMBL bundle requires complete source page receipts")
+
+    def records(kind: str, key: str, source: str) -> list[dict[str, Any]]:
+        rows = profile.get(kind)
+        receipt = limits.get(kind)
+        if not isinstance(rows, list) or not isinstance(receipt, dict):
+            raise ValueError(f"ChEMBL bundle is missing {kind} records or page receipt")
+        validated = []
+        retrieved_at = None
+        for item in rows:
+            if not isinstance(item, dict) or item.get("source") != source or not isinstance(item.get("record"), dict):
+                raise ValueError(f"ChEMBL {kind} source receipt is malformed")
+            record = item["record"]
+            if item.get("record_sha256") != _canonical_hash(record):
+                raise ValueError(f"ChEMBL {kind} source record digest is invalid")
+            current_time = item.get("retrieved_at")
+            if not isinstance(current_time, str) or (retrieved_at is not None and current_time != retrieved_at):
+                raise ValueError("ChEMBL source receipts must share one captured retrieval timestamp")
+            retrieved_at = current_time
+            validated.append(record)
+        total = receipt.get("provider_total")
+        if total is not None and (type(total) is not int or total < len(validated)):
+            raise ValueError(f"ChEMBL {kind} provider total is invalid")
+        if receipt.get("returned") != len(validated) or receipt.get("limit") != 50 or receipt.get("truncated") != (total is not None and total > 50):
+            raise ValueError(f"ChEMBL {kind} page receipt does not match retained rows")
+        return validated
+
+    molecule_rows = records("molecule_matches", "molecules", "ChEMBL")
+    mechanism_rows = records("mechanisms", "mechanisms", "ChEMBL mechanism")
+    indication_rows = records("indications", "drug_indications", "ChEMBL drug indication")
+    warning_rows = records("warnings", "drug_warnings", "ChEMBL drug warning")
+    timestamps = {item["retrieved_at"] for kind in ("molecule_matches", "mechanisms", "indications", "warnings") for item in profile[kind]}
+    if len(timestamps) != 1:
+        raise ValueError("ChEMBL bundle must have one shared retrieval timestamp")
+    payloads = (
+        {"molecules": molecule_rows, "page_meta": {"total_count": limits["molecule_matches"].get("provider_total")}},
+        {"mechanisms": mechanism_rows, "page_meta": {"total_count": limits["mechanisms"].get("provider_total")}},
+        {"drug_indications": indication_rows, "page_meta": {"total_count": limits["indications"].get("provider_total")}},
+        {"drug_warnings": warning_rows, "page_meta": {"total_count": limits["warnings"].get("provider_total")}},
+    )
+    recomputed = ChEMBLClient.normalize_investigation(inchikey, *payloads, next(iter(timestamps)))
+    if recomputed != profile:
+        raise ValueError("ChEMBL profile differs from its exact-identity source records")
+    return recomputed
+
+
+def create_chembl_bundle(bundle_dir: str | Path, profile: dict[str, Any]) -> dict[str, Any]:
+    """Capture an exact-identity ChEMBL profile for deterministic offline replay."""
+    create_chembl_profile_replay(profile)
+    inchikey = profile["inchikey"]
+
+    target = Path(bundle_dir).expanduser().resolve()
+    if target.exists():
+        raise ValueError("ChEMBL bundle directory already exists")
+    target.mkdir(parents=True, mode=0o700)
+    try:
+        report_path = target / "drug.json"
+        _write_private(report_path, (json.dumps(profile, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode())
+        artifacts = [{"path": "drug.json", "size": report_path.stat().st_size, "sha256": _sha256(report_path)}]
+        source = Path(__file__).resolve().parent / "sources" / "chembl.py"
+        captured = target / "code" / "medai_science" / "sources" / "chembl.py"
+        captured.parent.mkdir(parents=True, mode=0o700)
+        shutil.copyfile(source, captured)
+        captured.chmod(0o600)
+        code_digest = _sha256(captured)
+        artifacts.append({"path": "code/medai_science/sources/chembl.py", "size": captured.stat().st_size, "sha256": code_digest})
+        manifest = {
+            "schema_version": "1", "created_at_unix": int(__import__("time").time()),
+            "analysis": {"workflow": "drug.chembl_profile", "inchikey": inchikey},
+            "network_accessed_during_replay": False,
+            "runtime": {"python": os.sys.version.split()[0]},
+            "scientific_modules": [{"module": "medai_science.sources.chembl", "path": "code/medai_science/sources/chembl.py", "sha256": code_digest}],
+            "artifacts": artifacts, "report_sha256": _sha256(report_path),
+            "interpretation_limit": "Replay recomputes MedAI normalization from the captured ChEMBL rows; it does not requery ChEMBL or establish source authorship, pharmacologic validity, or clinical relevance.",
+        }
+        manifest_path = target / "manifest.json"
+        _write_private(manifest_path, (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode())
+        target.chmod(0o700)
+        for directory in sorted((path for path in target.rglob("*") if path.is_dir()), reverse=True):
+            directory.chmod(0o700)
+        return {"bundle_dir": str(target), "artifact_count": len(artifacts), "manifest_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "network_accessed_during_replay": False}
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
+def verify_chembl_bundle(bundle_dir: str | Path, replay: bool = False) -> dict[str, Any]:
+    """Verify captured ChEMBL receipts and optionally recompute the profile offline."""
+    bundle = Path(bundle_dir).expanduser().resolve()
+    manifest_path = bundle / "manifest.json"
+    if not bundle.is_dir() or manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("ChEMBL bundle manifest is missing")
+    manifest = _read_bundle_json(manifest_path, "ChEMBL bundle manifest")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("analysis"), dict) or manifest["analysis"].get("workflow") != "drug.chembl_profile" or manifest.get("network_accessed_during_replay") is not False:
+        raise ValueError("bundle does not describe an offline ChEMBL profile workflow")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ValueError("ChEMBL bundle artifact manifest is empty")
+    expected_paths = {"drug.json", "code/medai_science/sources/chembl.py"}
+    if {item.get("path") for item in artifacts if isinstance(item, dict)} != expected_paths or len(artifacts) != len(expected_paths):
+        raise ValueError("ChEMBL bundle must bind exactly the profile and normalization source artifacts")
+    verified = []
+    for item in artifacts:
+        relative = item.get("path") if isinstance(item, dict) else None
+        path = _safe_bundle_file(bundle, relative)
+        if path.stat().st_size != item.get("size") or _sha256(path) != item.get("sha256"):
+            raise ValueError(f"ChEMBL bundle artifact hash or size mismatch: {relative}")
+        verified.append(relative)
+    report_path = _safe_bundle_file(bundle, "drug.json")
+    if _sha256(report_path) != manifest.get("report_sha256"):
+        raise ValueError("ChEMBL bundle report hash mismatch")
+    profile = _read_bundle_json(report_path, "ChEMBL profile")
+    if not isinstance(profile, dict) or profile.get("inchikey") != manifest["analysis"].get("inchikey"):
+        raise ValueError("ChEMBL profile identity does not match the manifest")
+    if not replay:
+        return {"valid": True, "replayed": False, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path)}
+    _verify_python_runtime(manifest)
+    import medai_science.sources.chembl as chembl_module
+    captured_code = _safe_bundle_file(bundle, "code/medai_science/sources/chembl.py")
+    code_digest = _sha256(captured_code)
+    module_receipts = manifest.get("scientific_modules")
+    if (
+        not isinstance(module_receipts, list)
+        or module_receipts != [{"module": "medai_science.sources.chembl", "path": "code/medai_science/sources/chembl.py", "sha256": code_digest}]
+        or _sha256(Path(chembl_module.__file__).resolve()) != code_digest
+    ):
+        raise ValueError("installed ChEMBL normalization implementation differs from captured bundle code")
+    recomputed = create_chembl_profile_replay(profile)
+    if recomputed != profile:
+        raise ValueError("replayed ChEMBL profile differs from the captured report")
     return {"valid": True, "replayed": True, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"]}
 
 
@@ -1389,12 +1935,15 @@ def create_pathway_bundle(bundle_dir: str | Path, result: dict[str, Any]) -> dic
     request_digest = _canonical_hash({"endpoint": ReactomeClient.endpoint, "parameters": parameters, "identifiers": genes})
     if result.get("input_sha256") != input_digest or result.get("request_sha256") != request_digest or not isinstance(result.get("result"), dict):
         raise ValueError("Reactome result does not match its exact input identifiers")
+    response_digest = result.get("response_sha256")
+    if response_digest is not None and (not isinstance(response_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", response_digest)):
+        raise ValueError("Reactome source response digest is malformed")
     target = Path(bundle_dir).expanduser().resolve()
     if target.exists():
         raise ValueError("pathway bundle directory already exists")
     target.mkdir(parents=True, mode=0o700)
     try:
-        captured = {key: result.get(key) for key in ("source", "source_url", "retrieved_at", "species", "input_identifiers", "input_sha256", "analysis_parameters", "request_sha256", "result", "interpretation_limit")}
+        captured = {key: result.get(key) for key in ("source", "source_url", "retrieved_at", "species", "input_identifiers", "input_sha256", "analysis_parameters", "request_sha256", "response_sha256", "result", "interpretation_limit")}
         raw = (json.dumps(captured, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
         if len(raw) > 8 * 1024 * 1024:
             raise ValueError("Reactome result exceeds the 8 MiB bundle limit")
@@ -1408,7 +1957,7 @@ def create_pathway_bundle(bundle_dir: str | Path, result: dict[str, Any]) -> dic
         code.chmod(0o600)
         code_hash = _sha256(code)
         artifacts.append({"path": "code/medai_science/sources/reactome.py", "size": code.stat().st_size, "sha256": code_hash})
-        manifest = {"schema_version": "1", "created_at_unix": int(__import__("time").time()), "analysis": {"workflow": "pathways.reactome_overrepresentation", "species": result["species"], "input_sha256": input_digest, "request_sha256": request_digest, "parameters": parameters}, "network_accessed_during_replay": False, "runtime": {"python": os.sys.version.split()[0]}, "scientific_modules": [{"module": "medai_science.sources.reactome", "path": "code/medai_science/sources/reactome.py", "sha256": code_hash}], "artifacts": artifacts, "report_sha256": _sha256(report), "interpretation_limit": "Replay verifies the captured provider response and its exact input/query-parameter binding offline; it does not rerun Reactome or authenticate provider authorship."}
+        manifest = {"schema_version": "1", "created_at_unix": int(__import__("time").time()), "analysis": {"workflow": "pathways.reactome_overrepresentation", "species": result["species"], "input_sha256": input_digest, "request_sha256": request_digest, "response_sha256": response_digest, "parameters": parameters}, "network_accessed_during_replay": False, "runtime": {"python": os.sys.version.split()[0]}, "scientific_modules": [{"module": "medai_science.sources.reactome", "path": "code/medai_science/sources/reactome.py", "sha256": code_hash}], "artifacts": artifacts, "report_sha256": _sha256(report), "interpretation_limit": "Replay verifies the captured provider response and its exact input/query-parameter binding offline; it does not rerun Reactome or authenticate provider authorship."}
         manifest_path = target / "manifest.json"
         _write_private(manifest_path, (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode())
         target.chmod(0o700)
@@ -1448,7 +1997,10 @@ def verify_pathway_bundle(bundle_dir: str | Path, replay: bool = False) -> dict[
     genes = ReactomeClient.validate(report.get("input_identifiers"), report.get("species"), parameters.get("pageSize"))
     digest = hashlib.sha256("\n".join(genes).encode()).hexdigest()
     request_digest = _canonical_hash({"endpoint": ReactomeClient.endpoint, "parameters": parameters, "identifiers": genes})
-    if report.get("source") != "Reactome Analysis Service" or report.get("source_url") != ReactomeClient.endpoint or report.get("input_sha256") != digest or digest != manifest["analysis"].get("input_sha256") or report.get("request_sha256") != request_digest or request_digest != manifest["analysis"].get("request_sha256") or parameters != manifest["analysis"].get("parameters") or not isinstance(report.get("result"), dict):
+    response_digest = report.get("response_sha256")
+    if response_digest is not None and (not isinstance(response_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", response_digest)):
+        raise ValueError("captured Reactome source response digest is malformed")
+    if report.get("source") != "Reactome Analysis Service" or report.get("source_url") != ReactomeClient.endpoint or report.get("input_sha256") != digest or digest != manifest["analysis"].get("input_sha256") or report.get("request_sha256") != request_digest or request_digest != manifest["analysis"].get("request_sha256") or response_digest != manifest["analysis"].get("response_sha256") or parameters != manifest["analysis"].get("parameters") or not isinstance(report.get("result"), dict):
         raise ValueError("captured Reactome response is not bound to its exact validated input")
     if not replay:
         return {"valid": True, "replayed": False, "artifact_count": len(artifacts), "bundle_sha256": _sha256(manifest_path)}
@@ -1587,6 +2139,90 @@ def verify_clinical_trial_bundle(bundle_dir: str | Path, replay: bool = False) -
     return {"valid": True, "replayed": True, "artifact_count": len(verified), "bundle_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "network_accessed": False}
 
 
+def create_intact_bundle(bundle_dir: str | Path, result: dict[str, Any]) -> dict[str, Any]:
+    """Capture minimized, source-linked IntAct records for deterministic offline reconciliation replay."""
+    from medai_science.sources.intact import build_retention_payload
+
+    retained = build_retention_payload(result)
+    target = Path(bundle_dir).expanduser().resolve()
+    if target.exists():
+        raise ValueError("IntAct bundle directory already exists")
+    target.mkdir(parents=True, mode=0o700)
+    try:
+        report = target / "interactions.json"
+        report_bytes = (json.dumps(retained, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+        if len(report_bytes) > 4 * 1024 * 1024:
+            raise ValueError("IntAct interaction receipt exceeds the 4 MiB bundle limit")
+        _write_private(report, report_bytes)
+        artifacts = [{"path": "interactions.json", "size": report.stat().st_size, "sha256": _sha256(report)}]
+        source = Path(__file__).resolve().parent / "protein_interactions.py"
+        code = target / "code" / "medai_science" / "protein_interactions.py"
+        code.parent.mkdir(parents=True, mode=0o700)
+        shutil.copyfile(source, code)
+        code.chmod(0o600)
+        code_hash = _sha256(code)
+        artifacts.append({"path": "code/medai_science/protein_interactions.py", "size": code.stat().st_size, "sha256": code_hash})
+        manifest = {
+            "schema_version": "1",
+            "created_at_unix": int(__import__("time").time()),
+            "analysis": {"workflow": "protein.intact_interactions", "query_accession": retained["query_accession"], "organism_filter": retained["organism_filter"], "requested_limit": retained["retrieval_coverage"]["requested_limit"], "response_sha256": retained["response_sha256"]},
+            "network_accessed_during_replay": False,
+            "runtime": {"python": os.sys.version.split()[0]},
+            "scientific_modules": [{"module": "medai_science.protein_interactions", "path": "code/medai_science/protein_interactions.py", "sha256": code_hash}],
+            "artifacts": artifacts,
+            "report_sha256": _sha256(report),
+            "attribution": "IntAct PSICQUIC; source URL and retrieval timestamp are retained in interactions.json.",
+            "interpretation_limit": "Replay recomputes the deterministic grouping from minimized records and checks bundle integrity; retained source-row hashes are provenance receipts, not cryptographic authentication of the provider response. Replay does not requery IntAct, establish independent interaction evidence, or adjudicate record-level reuse terms.",
+        }
+        manifest_path = target / "manifest.json"
+        _write_private(manifest_path, (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+        target.chmod(0o700)
+        for directory in sorted((path for path in target.rglob("*") if path.is_dir()), reverse=True):
+            directory.chmod(0o700)
+        return {"bundle_dir": str(target), "artifact_count": len(artifacts), "manifest_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "network_accessed_during_replay": False}
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
+def verify_intact_bundle(bundle_dir: str | Path, replay: bool = False) -> dict[str, Any]:
+    """Verify a minimized IntAct receipt; optionally rerun only the deterministic local reconciliation."""
+    bundle = Path(bundle_dir).expanduser().resolve()
+    manifest_path = bundle / "manifest.json"
+    manifest = _read_bundle_json(manifest_path, "IntAct bundle manifest")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("analysis"), dict) or manifest["analysis"].get("workflow") != "protein.intact_interactions" or manifest.get("network_accessed_during_replay") is not False:
+        raise ValueError("bundle does not describe an offline IntAct interaction workflow")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or {item.get("path") for item in artifacts if isinstance(item, dict)} != {"interactions.json", "code/medai_science/protein_interactions.py"}:
+        raise ValueError("IntAct bundle artifact manifest is malformed")
+    for item in artifacts:
+        path = _safe_bundle_file(bundle, item.get("path"))
+        if path.stat().st_size != item.get("size") or _sha256(path) != item.get("sha256"):
+            raise ValueError("IntAct bundle artifact integrity check failed")
+    report_path = _safe_bundle_file(bundle, "interactions.json")
+    if _sha256(report_path) != manifest.get("report_sha256"):
+        raise ValueError("IntAct bundle report hash mismatch")
+    report = _read_bundle_json(report_path, "IntAct interaction receipt")
+    from medai_science.sources.intact import build_retention_payload
+    try:
+        validated = build_retention_payload(report)
+    except (TypeError, ValueError) as error:
+        raise ValueError("captured IntAct interaction receipt failed source or reconciliation validation") from error
+    if validated != report:
+        raise ValueError("captured IntAct interaction receipt contains noncanonical or non-minimized fields")
+    settings = manifest["analysis"]
+    if settings.get("query_accession") != report.get("query_accession") or settings.get("organism_filter") != report.get("organism_filter") or settings.get("requested_limit") != report.get("retrieval_coverage", {}).get("requested_limit") or settings.get("response_sha256") != report.get("response_sha256"):
+        raise ValueError("captured IntAct receipt does not match its request manifest")
+    if not replay:
+        return {"valid": True, "replayed": False, "artifact_count": len(artifacts), "bundle_sha256": _sha256(manifest_path)}
+    _verify_python_runtime(manifest)
+    import medai_science.protein_interactions as interactions_module
+    code = _safe_bundle_file(bundle, "code/medai_science/protein_interactions.py")
+    if _sha256(Path(interactions_module.__file__).resolve()) != _sha256(code):
+        raise ValueError("installed IntAct reconciliation module differs from captured bundle code")
+    return {"valid": True, "replayed": True, "artifact_count": len(artifacts), "bundle_sha256": _sha256(manifest_path), "report_sha256": manifest["report_sha256"], "network_accessed": False}
+
+
 def verify_analysis_bundle(bundle_dir: str | Path, replay: bool = False) -> dict[str, Any]:
     """Dispatch integrity/replay verification to the workflow named in its manifest."""
     manifest_path = Path(bundle_dir).expanduser().resolve() / "manifest.json"
@@ -1597,16 +2233,22 @@ def verify_analysis_bundle(bundle_dir: str | Path, replay: bool = False) -> dict
     if not isinstance(manifest, dict) or not isinstance(manifest.get("analysis"), dict):
         raise ValueError("analysis bundle manifest is malformed")
     workflow = manifest["analysis"].get("workflow")
+    if workflow == "protein.coordinate_summary":
+        return verify_structure_bundle(bundle_dir, replay)
     if workflow in {"sequence.fasta", "sequence.fastq"}:
         return verify_sequence_bundle(bundle_dir, replay)
     if workflow == "compound.rdkit_descriptors":
         return verify_compound_bundle(bundle_dir, replay)
+    if workflow == "drug.chembl_profile":
+        return verify_chembl_bundle(bundle_dir, replay)
     if workflow == "protein.uniprot_features":
         return verify_protein_bundle(bundle_dir, replay)
     if workflow == "pathways.reactome_overrepresentation":
         return verify_pathway_bundle(bundle_dir, replay)
     if workflow == "trials.clinicaltrials_v2_snapshot":
         return verify_clinical_trial_bundle(bundle_dir, replay)
+    if workflow == "protein.intact_interactions":
+        return verify_intact_bundle(bundle_dir, replay)
     if workflow == "genomics.vcf":
         return verify_genomics_bundle(bundle_dir, replay)
     raise ValueError(f"analysis bundle uses an unsupported workflow: {workflow!r}")

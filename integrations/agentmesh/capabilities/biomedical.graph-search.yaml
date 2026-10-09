@@ -1,0 +1,45 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.graph-search
+  version: 0.1.0
+  intent: Search session-scoped biomedical graph entities and their incident, provenance-backed relationships with explicit response limits.
+contract:
+  inputs:
+    type: object
+    required: [session_id, query]
+    properties:
+      session_id: { type: string, minLength: 1, maxLength: 128 }
+      query: { type: string, minLength: 1, maxLength: 256 }
+  outputs:
+    type: object
+    required: [session_id, nodes, edges, truncated, limits]
+    properties:
+      session_id: { type: string }
+      nodes: { type: array, maxItems: 100, items: { type: object } }
+      edges: { type: array, maxItems: 500, items: { type: object } }
+      truncated:
+        type: object
+        required: [nodes, edges]
+        properties:
+          nodes: { type: boolean }
+          edges: { type: boolean }
+      limits:
+        type: object
+        required: [nodes, edges]
+        properties:
+          nodes: { type: integer, minimum: 1, maximum: 100 }
+          edges: { type: integer, minimum: 1, maximum: 500 }
+      matching: { type: string }
+  successEvidence:
+    - id: graph-search-session-scope
+      assertion: every_returned_node_and_edge_belongs_to_the_requested_research_session
+      acceptedTypes: [state_assertion]
+  effects: [read_only]
+  idempotency: guaranteed
+  recovery: retry
+authority:
+  permissions: [biomedical.graph.read]
+implementations:
+  - id: medai-bounded-graph-search
+    kind: mcp
+    reference: mcp://medai/medai_graph_search

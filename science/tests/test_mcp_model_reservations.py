@@ -37,8 +37,10 @@ class SessionBudgetedProviderTests(unittest.IsolatedAsyncioTestCase):
                 order.append("reserve")
                 return httpx.Response(200, json={})
             order.append("settle")
-            settlements.append(json.loads(request.content)["actual_credits"])
-            return httpx.Response(200, json={"state": "settled"})
+            body = json.loads(request.content)
+            settlements.append(body["actual_credits"])
+            reservation_id = request.url.path.split("/")[-2]
+            return httpx.Response(200, json={"reservation_id": reservation_id, "state": "settled", "charged_credits": body["actual_credits"]})
 
         transport = httpx.MockTransport(api)
         provider = SessionBudgetedJSONProvider(FakeProvider(order), "RES-1", "objective.normalize", transport)
@@ -51,14 +53,18 @@ class SessionBudgetedProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_call_retains_full_reservation_as_uncertain(self):
         order = []
         settlements = []
+        reserved_credits = []
 
         async def api(request):
             if request.url.path.endswith("/budget/reservations"):
                 order.append("reserve")
+                reserved_credits.append(json.loads(request.content)["credits"])
                 return httpx.Response(200, json={})
             order.append("settle")
-            settlements.append(json.loads(request.content)["actual_credits"])
-            return httpx.Response(200, json={"state": "uncertain"})
+            body = json.loads(request.content)
+            settlements.append(body["actual_credits"])
+            reservation_id = request.url.path.split("/")[-2]
+            return httpx.Response(200, json={"reservation_id": reservation_id, "state": "uncertain", "charged_credits": reserved_credits[0]})
 
         provider = SessionBudgetedJSONProvider(FakeProvider(order, fail=True), "RES-1", "objective.normalize", httpx.MockTransport(api))
         with patch.dict(os.environ, {"MEDAI_MODEL_TOKENS_PER_CREDIT": "1000"}), patch("medai_science.budgeted_model.api_headers", return_value={}):
@@ -66,6 +72,25 @@ class SessionBudgetedProviderTests(unittest.IsolatedAsyncioTestCase):
                 await provider.complete_json(system="system", prompt="prompt", schema_name="test", schema={"type": "object"})
         self.assertEqual(order, ["reserve", "provider", "settle"])
         self.assertEqual(settlements, [None])
+
+    async def test_successful_model_output_is_rejected_when_settlement_is_uncertain(self):
+        settlements = []
+        reserved_credits = []
+
+        async def api(request):
+            if request.url.path.endswith("/budget/reservations"):
+                reserved_credits.append(json.loads(request.content)["credits"])
+                return httpx.Response(200, json={})
+            body = json.loads(request.content)
+            settlements.append(body["actual_credits"])
+            reservation_id = request.url.path.split("/")[-2]
+            return httpx.Response(200, json={"reservation_id": reservation_id, "state": "uncertain", "charged_credits": reserved_credits[0]})
+
+        provider = SessionBudgetedJSONProvider(FakeProvider([]), "RES-1", "objective.normalize", httpx.MockTransport(api))
+        with patch.dict(os.environ, {"MEDAI_MODEL_TOKENS_PER_CREDIT": "1000"}), patch("medai_science.budgeted_model.api_headers", return_value={}):
+            with self.assertRaisesRegex(RuntimeError, "expected reservation settlement state"):
+                await provider.complete_json(system="system", prompt="prompt", schema_name="test", schema={"type": "object"})
+        self.assertEqual(settlements, [1, None])
 
     async def test_budget_rejection_prevents_provider_call(self):
         order = []

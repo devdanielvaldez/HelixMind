@@ -163,26 +163,49 @@ def structure_pmc_receipt(parsed: dict[str, Any], *, pmid: str, pmc_id: str, sou
     }
 
 
-def source_entity_node(entity: dict[str, Any], *, receipt_id: str, receipt_sha256: str, pmc_id: str) -> dict[str, Any] | None:
-    """Map a provider-normalized stable identifier to a provenance-linked graph node."""
+def canonical_source_entity_id(entity: dict[str, Any]) -> str | None:
+    """Return a namespace-qualified ID only for an explicit source namespace."""
     identifier = entity.get("identifier")
     entity_type = entity.get("entity_type")
     if not isinstance(identifier, str) or not identifier.strip() or not isinstance(entity_type, str) or not entity_type.strip():
         return None
-    namespace = entity.get("database") or "BioC"
+    namespace = entity.get("database")
     if not isinstance(namespace, str) or not namespace.strip():
-        namespace = "BioC"
+        return None
     identifier, namespace, entity_type = identifier.strip(), namespace.strip(), entity_type.strip()
-    node_id = f"{re.sub(r'[^A-Za-z0-9._-]+', '_', namespace)}:{identifier}"
+    source_identifier = identifier
+    node_namespace = re.sub(r"[^A-Za-z0-9._-]+", "_", namespace)
     if entity_type.casefold() == "gene" and namespace.casefold() in {"ncbi gene", "ncbi_gene", "ncbigene"}:
         match = re.fullmatch(r"(?:NCBI(?:Gene)?[:_])?([0-9]+)", identifier, flags=re.IGNORECASE)
         if match:
-            node_id = f"NCBIGene:{match.group(1)}"
+            node_namespace, identifier = "NCBIGene", match.group(1)
+    elif entity_type.casefold() == "protein" and namespace.casefold() in {"uniprot", "uniprotkb"}:
+        # BioC sources commonly label UniProtKB accessions as "UniProt";
+        # converge that alias on the same stable namespace used by UniProt tools.
+        if not re.fullmatch(
+            r"(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})(?:-[1-9][0-9]*)?",
+            identifier,
+            flags=re.IGNORECASE,
+        ):
+            return None
+        node_namespace, identifier = "UniProtKB", identifier.upper()
+    return f"{node_namespace}:{identifier}"
+
+
+def source_entity_node(entity: dict[str, Any], *, receipt_id: str, receipt_sha256: str, pmc_id: str) -> dict[str, Any] | None:
+    """Map a provider-normalized stable identifier to a provenance-linked graph node."""
+    node_id = canonical_source_entity_id(entity)
+    if node_id is None:
+        return None
+    identifier = entity["identifier"].strip()
+    source_identifier = identifier
+    namespace = entity["database"].strip()
+    entity_type = entity["entity_type"].strip()
     return {
         "id": node_id,
         "kind": entity_type,
-        "label": identifier,
-        "metadata": {"source": "PMC BioC annotation", "source_artifact_id": receipt_id, "source_artifact_sha256": receipt_sha256, "database": namespace, "identifier": identifier, "pmc_id": pmc_id},
+        "label": source_identifier,
+        "metadata": {"source": "PMC BioC annotation", "source_artifact_id": receipt_id, "source_artifact_sha256": receipt_sha256, "database": namespace, "identifier": source_identifier, "pmc_id": pmc_id},
     }
 
 

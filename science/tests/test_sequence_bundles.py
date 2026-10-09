@@ -11,6 +11,53 @@ from medai_science.reproducibility import create_sequence_bundle, verify_analysi
 
 
 class SequenceBundleTests(unittest.TestCase):
+    def test_fasta_reports_each_iupac_symbol_and_gc_denominators(self):
+        with tempfile.TemporaryDirectory(prefix="medai-fasta-ambiguity-") as temp:
+            source = Path(temp) / "reference.fa"
+            source.write_text(">reference\nACGTNRYK\n", encoding="ascii")
+            report = inspect_fasta(source, "nucleotide", 10)
+            self.assertEqual(report["sequence_symbol_counts"], {"A": 1, "C": 1, "G": 1, "K": 1, "N": 1, "R": 1, "T": 1, "Y": 1})
+            self.assertEqual(report["ambiguous_symbol_counts"], {"K": 1, "N": 1, "R": 1, "Y": 1})
+            self.assertEqual(report["ambiguous_symbol_count"], 4)
+            self.assertEqual(report["gc_fraction"], 0.25)
+            self.assertEqual(report["gc_fraction_unambiguous"], 0.5)
+            source.write_text(">reference\nNRYK\n", encoding="ascii")
+            all_ambiguous = inspect_fasta(source, "nucleotide", 10)
+            self.assertIsNone(all_ambiguous["gc_fraction_unambiguous"])
+
+    def test_fastq_reports_iupac_ambiguity_and_unambiguous_gc(self):
+        with tempfile.TemporaryDirectory(prefix="medai-fastq-ambiguity-") as temp:
+            source = Path(temp) / "reads.fastq"
+            source.write_text("@read1\nACGNRY\n+\n!!!!!!\n", encoding="ascii")
+            report = inspect_fastq(source, 10)
+            self.assertEqual(report["sequence_symbol_counts"], {"A": 1, "C": 1, "G": 1, "N": 1, "R": 1, "Y": 1})
+            self.assertEqual(report["ambiguous_symbol_count"], 3)
+            self.assertEqual(report["ambiguous_symbol_fraction"], 0.5)
+            self.assertEqual(report["gc_fraction"], 0.333333)
+            self.assertEqual(report["gc_fraction_unambiguous"], 0.666667)
+
+    def test_protein_symbol_aggregation_remains_compatible(self):
+        with tempfile.TemporaryDirectory(prefix="medai-protein-symbols-") as temp:
+            source = Path(temp) / "protein.fa"
+            source.write_text(">protein\nABZXUO*\n", encoding="ascii")
+            report = inspect_fasta(source, "protein", 10)
+            self.assertEqual(report["sequence_symbol_counts"], {"A": 1, "ambiguous_or_other": 6})
+            self.assertNotIn("gc_fraction_unambiguous", report)
+
+    def test_fastq_rejects_empty_quality_lines(self):
+        with tempfile.TemporaryDirectory(prefix="medai-fastq-invalid-") as temp:
+            source = Path(temp) / "reads.fastq"
+            source.write_text("@read1\nAC\n+\n\nII\n", encoding="ascii")
+            with self.assertRaisesRegex(ValueError, "empty quality line"):
+                inspect_fastq(source, 10)
+
+    def test_fastq_enforces_record_limit_before_parsing_next_record(self):
+        with tempfile.TemporaryDirectory(prefix="medai-fastq-limit-") as temp:
+            source = Path(temp) / "reads.fastq"
+            source.write_text("@read1\nA\n+\n!\n@read2\n", encoding="ascii")
+            with self.assertRaisesRegex(ValueError, "maximum of 1 records"):
+                inspect_fastq(source, 1)
+
     def test_compressed_fasta_bundle_replays_exact_parser_report_privately(self):
         with tempfile.TemporaryDirectory(prefix="medai-sequence-bundle-") as temp:
             root = Path(temp)

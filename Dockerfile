@@ -1,7 +1,8 @@
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.89-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml ./
 COPY crates ./crates
+COPY science/wasm-fixture ./science/wasm-fixture
 RUN cargo build --release -p medai-api -p medai
 
 FROM debian:bookworm-slim AS api

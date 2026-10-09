@@ -1,6 +1,7 @@
 """Request-scoped specialist authentication for the Streamable HTTP MCP server."""
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from contextvars import ContextVar
@@ -11,6 +12,7 @@ import httpx
 API = os.getenv("MEDAI_API_URL", "http://127.0.0.1:8090").rstrip("/")
 _API_TOKEN = os.getenv("MEDAI_API_BEARER_TOKEN", "")
 _API_HEADERS = {"Authorization": f"Bearer {_API_TOKEN}"} if _API_TOKEN else {}
+MCP_TRANSPORT_HEADER = b"x-medai-mcp-token"
 _REQUEST_API_HEADERS: ContextVar[dict[str, str] | None] = ContextVar("medai_request_api_headers", default=None)
 
 
@@ -121,3 +123,52 @@ class SpecialistCredentialASGIMiddleware:
             return await receive()
 
         await self.app(scope, replay_receive, send)
+
+
+class AuthenticatedMCPTransportASGIMiddleware:
+    """Require the distinct MCP transport bearer on HTTP ingress."""
+
+    def __init__(self, app: Any, token: str | None = None):
+        self.app = app
+        configured = token if token is not None else os.getenv("MEDAI_MCP_BEARER_TOKEN", "")
+        self.token = _validated_transport_token(configured)
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        scope_type = scope.get("type")
+        if scope_type == "lifespan":
+            await self.app(scope, receive, send)
+            return
+        if scope_type not in {"http", "websocket"}:
+            return
+        supplied = None
+        credential_headers = 0
+        for name, value in scope.get("headers", []):
+            if name.lower() == MCP_TRANSPORT_HEADER:
+                credential_headers += 1
+                try:
+                    supplied = value.decode("ascii", errors="strict")
+                except UnicodeDecodeError:
+                    supplied = ""
+        candidate = supplied or ""
+        matches = hmac.compare_digest(candidate.encode("utf-8"), self.token.encode("utf-8"))
+        if credential_headers != 1 or not matches:
+            if scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 4401})
+            else:
+                await SpecialistCredentialASGIMiddleware._respond(send, 401, b"MCP transport authentication required")
+            return
+        safe_scope = dict(scope)
+        safe_scope["headers"] = [
+            (name, value)
+            for name, value in scope.get("headers", [])
+            if name.lower() not in {MCP_TRANSPORT_HEADER, b"authorization", b"cookie"}
+        ]
+        await self.app(safe_scope, receive, send)
+
+
+def _validated_transport_token(token: str) -> str:
+    if len(token) < 32 or len(token) > 4096 or any(char.isspace() for char in token):
+        raise ValueError("MEDAI_MCP_BEARER_TOKEN must contain 32..4096 non-whitespace characters")
+    if token == _API_TOKEN:
+        raise ValueError("MCP transport credential must be distinct from the API service credential")
+    return token

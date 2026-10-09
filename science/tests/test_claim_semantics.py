@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from medai_science.claim_semantics import ALIGNMENT_SCHEMA, claim_context_receipt, compare_claim_pair
-from medai_science.llm import ModelCompletion
+from medai_science.llm import ModelCompletion, ModelProviderError
 
 
 class FakeProvider:
@@ -22,7 +22,7 @@ def response(candidate_a="candidate-a", candidate_b="candidate-b"):
         "relation": "same_question_opposing",
         "population_comparability": "unclear",
         "method_comparability": "not_reported",
-        "reason_codes": ["same_entity", "opposite_direction", "insufficient_context"],
+        "reason_codes": ["same_entity", "same_outcome", "opposite_direction", "insufficient_context"],
     }
 
 
@@ -64,6 +64,7 @@ class ClaimSemanticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.value["assessment_type"], "local_model_semantic_screening")
         self.assertEqual(result.value["review_status"], "requires_human_scientific_review")
         self.assertEqual(result.value["relation"], "same_question_opposing")
+        self.assertEqual(len(result.value["source_context_receipts"][0]["metadata_sha256"]), 64)
         self.assertEqual(provider.kwargs["schema"], ALIGNMENT_SCHEMA)
         self.assertNotIn("Gene X was associated", str(result.value))
 
@@ -91,7 +92,7 @@ class ClaimSemanticsTests(unittest.IsolatedAsyncioTestCase):
             )
         invalid = response()
         invalid["relation"] = "confirmed_contradiction"
-        with self.assertRaisesRegex(ValueError, "outside the allowed enum"):
+        with self.assertRaisesRegex(ModelProviderError, "outside the allowed enum"):
             await compare_claim_pair(
                 FakeProvider(invalid), candidate_a="candidate-a", text_a="A sufficiently long source result sentence.",
                 candidate_b="candidate-b", text_b="Another sufficiently long source result sentence.",
@@ -104,6 +105,21 @@ class ClaimSemanticsTests(unittest.IsolatedAsyncioTestCase):
             await compare_claim_pair(provider, candidate_a="same", text_a="Sentence one long enough to be passed.", candidate_b="same", text_b="Sentence two long enough to be passed.", metadata_a=METADATA_A, metadata_b=METADATA_B)
         with self.assertRaisesRegex(ValueError, "characters"):
             await compare_claim_pair(provider, candidate_a="a", text_a="x" * 1201, candidate_b="b", text_b="Sentence two long enough to be passed.", metadata_a=METADATA_A, metadata_b=METADATA_B)
+        for candidate in ("", " " * 3, "c" * 65):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(ValueError, "distinct source candidate"):
+                await compare_claim_pair(provider, candidate_a=candidate, text_a="Sentence one long enough to be passed.", candidate_b="other", text_b="Sentence two long enough to be passed.", metadata_a=METADATA_A, metadata_b=METADATA_B)
+
+    async def test_pair_comparison_applies_context_bounds_and_strict_json_validation(self):
+        args = {
+            "candidate_a": "candidate-a", "text_a": "A sufficiently long source result sentence.",
+            "candidate_b": "candidate-b", "text_b": "Another sufficiently long source result sentence.",
+            "metadata_a": {**METADATA_A, "title": "x" * 501}, "metadata_b": METADATA_B,
+        }
+        with self.assertRaisesRegex(ValueError, "exceeds 500"):
+            await compare_claim_pair(FakeProvider(response()), **args)
+        args["metadata_a"] = {**METADATA_A, "unused": float("nan")}
+        with self.assertRaisesRegex(ValueError, "strict JSON"):
+            await compare_claim_pair(FakeProvider(response()), **args)
 
     async def test_rejects_model_relations_that_conflict_with_source_directions(self):
         conflicting = response()
@@ -125,6 +141,37 @@ class ClaimSemanticsTests(unittest.IsolatedAsyncioTestCase):
                 text_a="Gene X increases outcome Y.", text_b="Gene X increases outcome Y.",
                 candidate_b="candidate-b", metadata_a=METADATA_A,
                 metadata_b={**METADATA_A},
+            )
+
+    async def test_rejects_internally_inconsistent_relation_reason_codes(self):
+        missing_outcome = response()
+        missing_outcome["reason_codes"] = ["same_entity", "opposite_direction"]
+        with self.assertRaisesRegex(ValueError, "same-outcome and opposite-direction"):
+            await compare_claim_pair(
+                FakeProvider(missing_outcome), candidate_a="candidate-a",
+                text_a="Gene X was associated with increased outcome Y.",
+                candidate_b="candidate-b", text_b="Gene X was associated with decreased outcome Y.",
+                metadata_a={"source": "source-a"}, metadata_b={"source": "source-b"},
+            )
+
+        duplicate_reasons = response()
+        duplicate_reasons["reason_codes"] = ["same_entity", "same_outcome", "same_outcome", "opposite_direction"]
+        with self.assertRaisesRegex(ValueError, "duplicate reason codes"):
+            await compare_claim_pair(
+                FakeProvider(duplicate_reasons), candidate_a="candidate-a",
+                text_a="Gene X was associated with increased outcome Y.",
+                candidate_b="candidate-b", text_b="Gene X was associated with decreased outcome Y.",
+                metadata_a={"source": "source-a"}, metadata_b={"source": "source-b"},
+            )
+
+        conflicting_reasons = response()
+        conflicting_reasons["reason_codes"] = ["same_entity", "same_outcome", "different_outcome", "opposite_direction"]
+        with self.assertRaisesRegex(ValueError, "conflicting outcome reason codes"):
+            await compare_claim_pair(
+                FakeProvider(conflicting_reasons), candidate_a="candidate-a",
+                text_a="Gene X was associated with increased outcome Y.",
+                candidate_b="candidate-b", text_b="Gene X was associated with decreased outcome Y.",
+                metadata_a={"source": "source-a"}, metadata_b={"source": "source-b"},
             )
 
     async def test_opposing_screen_requires_explicit_opposite_source_directions(self):

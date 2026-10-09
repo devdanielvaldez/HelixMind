@@ -82,6 +82,18 @@ class PreprintClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "at most 93 days"):
             await client.search("biorxiv", "TREM2", "2026-01-01", "2026-06-01")
 
+    async def test_provider_json_and_collection_rows_fail_closed(self):
+        for payload, message in (
+            (b'{"collection":[],"collection":[]}', "duplicate JSON object key"),
+            (b'{"collection":[],"score":NaN}', "non-standard JSON number"),
+            (b'{"collection":[null]}', "malformed collection record"),
+        ):
+            client = PreprintClient(lambda **kwargs: httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _, body=payload: httpx.Response(200, content=body)), **kwargs,
+            ))
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                await client.get_by_doi("biorxiv", "10.1101/example.1")
+
 
 if __name__ == "__main__":
     unittest.main()

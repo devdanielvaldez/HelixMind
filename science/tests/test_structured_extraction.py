@@ -12,7 +12,7 @@ BIOC = b'''<collection><document><id>PMC12345</id>
 <passage><infon key="section_type">ABSTRACT</infon><text>We studied patients in a case-control cohort.</text></passage>
 <passage><infon key="section_type">METHODS</infon><text>Case-control methods compared matched patients and controls.</text></passage>
 <passage><infon key="section_type">RESULTS</infon><offset>0</offset><text>Protein X increased in the treated cell model. The sample size was small and should be interpreted carefully.</text>
-<annotation id="1"><infon key="type">Protein</infon><infon key="identifier">P00001</infon><infon key="database">UniProt</infon><text>Protein X</text><location offset="0" length="9"/></annotation></passage>
+<annotation id="1"><infon key="type">Protein</infon><infon key="identifier">P04156</infon><infon key="database">UniProt</infon><text>Protein X</text><location offset="0" length="9"/></annotation></passage>
 </document></collection>'''
 
 
@@ -46,7 +46,7 @@ def valid_output(record):
     return {
         "document_id": record["document_id"],
         "paper_context": {"study_design": "observational", "population": "patients", "method_family": "cohort_or_case_control"},
-        "annotations": [{"candidate_id": row["candidate_id"], "result_kind": "cell_model", "direction": "increase", "study_system": "cell", "entity_ids": ["P00001"]} for row in record["result_sentence_candidates"]],
+        "annotations": [{"candidate_id": row["candidate_id"], "result_kind": "cell_model", "direction": "increase", "study_system": "cell", "entity_ids": ["UniProtKB:P04156"]} for row in record["result_sentence_candidates"]],
     }
 
 
@@ -134,17 +134,31 @@ class StructuredExtractionTests(unittest.IsolatedAsyncioTestCase):
             '<collection><document><id>PMC998878</id><passage>'
             '<infon key="section_type">RESULTS</infon><offset>100</offset>'
             f'<sentence><offset>100</offset><text>{first}</text><annotation id="1">'
-            '<infon key="type">Protein</infon><infon key="identifier">P00001</infon>'
+            '<infon key="type">Protein</infon><infon key="identifier">P04156</infon>'
             '<infon key="database">UniProt</infon><text>Protein A</text>'
             '<location offset="100" length="9"/></annotation></sentence>'
             f'<sentence><offset>{second_offset}</offset><text>{second}</text><annotation id="2">'
-            '<infon key="type">Protein</infon><infon key="identifier">P00002</infon>'
+            '<infon key="type">Protein</infon><infon key="identifier">Q9Y6K9</infon>'
             '<infon key="database">UniProt</infon><text>Protein B</text>'
             f'<location offset="{second_offset}" length="9"/></annotation></sentence>'
             '</passage></document></collection>'
         ).encode()
         candidates, _ = _candidate_records(parse_bioc_xml(payload))
-        self.assertEqual([row["entity_ids"] for row in candidates], [["P00001"], ["P00002"]])
+        self.assertEqual([row["entity_ids"] for row in candidates], [["UniProtKB:P04156"], ["UniProtKB:Q9Y6K9"]])
+
+    def test_candidate_ids_are_source_namespace_qualified(self):
+        payload = (
+            b"<collection><document><id>PMC998879</id><passage>"
+            b"<infon key=\"section_type\">RESULTS</infon><offset>0</offset>"
+            b"<text>Protein protein were both seen in samples.</text>"
+            b"<annotation><infon key=\"type\">Protein</infon><infon key=\"identifier\">P04156</infon>"
+            b"<infon key=\"database\">UniProt</infon><text>Protein</text><location offset=\"0\" length=\"7\"/></annotation>"
+            b"<annotation><infon key=\"type\">Protein</infon><infon key=\"identifier\">P04156</infon>"
+            b"<infon key=\"database\">Local Registry</infon><text>protein</text><location offset=\"8\" length=\"7\"/></annotation>"
+            b"</passage></document></collection>"
+        )
+        candidates, _ = _candidate_records(parse_bioc_xml(payload))
+        self.assertEqual(candidates[0]["entity_ids"], ["Local_Registry:P04156", "UniProtKB:P04156"])
 
 
 if __name__ == "__main__":

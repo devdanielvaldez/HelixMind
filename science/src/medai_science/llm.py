@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from medai_science.scientific_agents import AGENTS
+from medai_science.model_usage import meter_model_usage
 
 MAX_PROMPT_BYTES = 32_768
 MAX_SCHEMA_BYTES = 65_536
@@ -128,6 +129,63 @@ def _validate_schema(value: Any, schema: dict[str, Any], path: str = "$") -> Non
             raise ValueError(f"model JSON number must be finite at {path}")
         if value < schema.get("minimum", float("-inf")) or value > schema.get("maximum", float("inf")):
             raise ValueError(f"model JSON number is outside bounds at {path}")
+
+
+async def complete_structured_json(
+    provider: JSONModelProvider,
+    *,
+    system: str,
+    prompt: str,
+    schema_name: str,
+    schema: dict[str, Any],
+) -> ModelCompletion:
+    """Run a provider-neutral task and enforce one common response contract.
+
+    Provider adapters enforce these bounds before transport; this boundary also
+    protects scientific operations that receive an injected/local provider.
+    """
+    if not isinstance(system, str) or not isinstance(prompt, str):
+        raise ValueError("structured model system and prompt must be strings")
+    if len(system.encode("utf-8")) + len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise ValueError(f"model prompt exceeds {MAX_PROMPT_BYTES} bytes")
+    if not isinstance(schema_name, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", schema_name):
+        raise ValueError("schema_name must be a short identifier")
+    if not isinstance(schema, dict):
+        raise ValueError("model JSON schema must be an object")
+    try:
+        schema_bytes = json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError("model JSON schema must contain finite JSON values") from error
+    if len(schema_bytes) > MAX_SCHEMA_BYTES:
+        raise ValueError(f"model JSON schema exceeds {MAX_SCHEMA_BYTES} bytes")
+
+    completion = await provider.complete_json(system=system, prompt=prompt, schema_name=schema_name, schema=schema)
+    if not isinstance(completion, ModelCompletion) or not isinstance(completion.value, dict):
+        raise ModelProviderError("model provider did not return a structured completion object")
+    try:
+        output_bytes = json.dumps(completion.value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ModelProviderError("model provider returned a non-JSON or non-finite structured value") from error
+    if len(output_bytes) > MAX_RESPONSE_BYTES:
+        raise ModelProviderError(f"model structured output exceeds {MAX_RESPONSE_BYTES} bytes")
+    try:
+        _validate_schema(completion.value, schema)
+        meter_model_usage(completion.usage)
+    except (TypeError, ValueError) as error:
+        raise ModelProviderError(f"model completion failed the common schema or usage contract: {error}") from error
+    for label, digest in (("prompt", completion.prompt_sha256), ("response", completion.response_sha256)):
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ModelProviderError(f"model completion has an invalid {label} digest")
+    if not isinstance(completion.provider, str) or not completion.provider.strip() or len(completion.provider) > 128:
+        raise ModelProviderError("model completion has an invalid provider identity")
+    if not isinstance(completion.model, str) or not completion.model.strip() or len(completion.model) > 256:
+        raise ModelProviderError("model completion has an invalid model identity")
+    try:
+        _validate_output_token_limit(completion.max_output_tokens)
+        _validate_completion_token_usage(completion.usage, completion.max_output_tokens)
+    except ValueError as error:
+        raise ModelProviderError(str(error)) from error
+    return completion
 
 
 def _validate_endpoint(base_url: str) -> str:

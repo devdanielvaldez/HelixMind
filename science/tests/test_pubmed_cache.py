@@ -48,6 +48,39 @@ class PubMedSearchCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "TTL"):
             PubMedSearchCache(self.path, ttl_seconds=3601)
 
+    def test_corrupt_cache_timestamps_cannot_extend_retention(self):
+        query = "APOE"
+        key = search_key(query, 1)
+        self.cache.put(query, 1, ["1"], {"total_hits": 1}, now=100)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("UPDATE pubmed_search_cache SET expires_at=10000 WHERE cache_key=?", (key,))
+        self.assertIsNone(self.cache.get(query, 1, now=101))
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM pubmed_search_cache").fetchone()[0], 0)
+        self.cache.put(query, 1, ["1"], {"total_hits": 1}, now=100)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("UPDATE pubmed_search_cache SET stored_at=102 WHERE cache_key=?", (key,))
+        self.assertIsNone(self.cache.get(query, 1, now=101))
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM pubmed_search_cache").fetchone()[0], 0)
+
+    def test_cache_timestamps_require_nonnegative_integers(self):
+        for now in (True, 1.5, -1):
+            with self.subTest(now=now), self.assertRaisesRegex(ValueError, "timestamp"):
+                self.cache.put("timestamp", 1, ["1"], {"total_hits": 1}, now=now)
+            with self.subTest(read_now=now), self.assertRaisesRegex(ValueError, "timestamp"):
+                self.cache.get("timestamp", 1, now=now)
+
+    def test_any_cache_operation_prunes_corrupt_timestamps_for_other_queries(self):
+        self.cache.put("valid", 1, ["1"], {"total_hits": 1}, now=100)
+        self.cache.put("corrupt", 1, ["2"], {"total_hits": 1}, now=100)
+        corrupt_key = search_key("corrupt", 1)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("UPDATE pubmed_search_cache SET expires_at=10000 WHERE cache_key=?", (corrupt_key,))
+        self.assertEqual(self.cache.get("valid", 1, now=101)[0], ["1"])
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(connection.execute("SELECT cache_key FROM pubmed_search_cache").fetchall(), [(search_key("valid", 1),)])
+
     def test_read_prunes_expired_entries_for_other_queries(self):
         self.cache.put("expired query", 1, ["1"], {"total_hits": 1}, now=100)
         self.cache.put("current query", 1, ["2"], {"total_hits": 1}, now=150)

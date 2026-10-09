@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+import hashlib
 import json
 from typing import Any
 import unittest
@@ -119,6 +120,32 @@ class ClinicalTrialsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "valid NCT identifier"):
             normalize_study({"protocolSection": {"identificationModule": {"nctId": "not-an-id"}}})
 
+    def test_search_rejects_missing_or_malformed_studies_collection(self) -> None:
+        for body in (b'{"totalCount":0}', b'{"studies":[null]}'):
+            client = ClinicalTrialsClient(transport=httpx.MockTransport(lambda _, value=body: httpx.Response(200, content=value)))
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, "studies response|object collection"):
+                asyncio.run(client.search("example disease"))
+
+    def test_responses_reject_duplicate_json_keys_and_nonstandard_numbers(self) -> None:
+        for body, expected in (
+            (b'{"studies":[],"studies":[]}', "duplicate JSON key"),
+            (b'{"studies":[],"score":NaN}', "non-standard JSON numeric constant"),
+        ):
+            client = ClinicalTrialsClient(transport=httpx.MockTransport(lambda _, value=body: httpx.Response(200, content=value)))
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, expected):
+                asyncio.run(client.search("example disease"))
+
+    def test_get_study_rejects_a_valid_record_for_another_nct_identifier(self) -> None:
+        client = ClinicalTrialsClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=_study())))
+        with self.assertRaisesRegex(ValueError, "does not match the requested study"):
+            asyncio.run(client.get_study("NCT99999999"))
+
+    def test_normalization_rejects_malformed_present_module_shapes(self) -> None:
+        raw = _study()
+        raw["protocolSection"]["statusModule"] = []
+        with self.assertRaisesRegex(ValueError, "malformed object field"):
+            normalize_study(raw)
+
     def test_compares_registry_snapshots_without_interpreting_changes(self) -> None:
         earlier = _study()
         later = deepcopy(earlier)
@@ -133,18 +160,52 @@ class ClinicalTrialsTests(unittest.TestCase):
         self.assertIn("protocolSection.eligibilityModule.maximumAge", change["changed_field_paths"])
         self.assertEqual(change["scientific_or_safety_interpretation"], "not_performed")
 
+    def test_comparison_rejects_a_tampered_normalized_snapshot(self) -> None:
+        original = normalize_study(_study())
+        changed = deepcopy(original)
+        changed["lifecycle"]["overall_status"] = "TERMINATED"
+        with self.assertRaisesRegex(ValueError, "do not match its retained source record"):
+            compare_study_snapshots(original, changed)
+
     def test_selects_latest_same_session_artifact_and_ignores_other_trials(self) -> None:
         earlier = normalize_study(_study())
         later_raw = deepcopy(_study())
         later_raw["protocolSection"]["statusModule"]["overallStatus"] = "TERMINATED"
         later = normalize_study(later_raw)
+        def artifact(kind: str, nct_id: str, recorded_at: int, snapshot: dict[str, Any]) -> dict[str, Any]:
+            payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            return {
+                "id": f"artifact-{recorded_at}", "kind": kind, "source": "ClinicalTrials.gov",
+                "source_id": nct_id, "recorded_at": recorded_at, "payload": payload,
+                "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            }
+
         selected = latest_retained_study_snapshot([
-            {"kind": "clinical_trial_snapshot", "source_id": "NCT99999999", "recorded_at": 99, "payload": earlier},
-            {"kind": "clinical_trial_snapshot", "source_id": "NCT01234567", "recorded_at": 1, "payload": json.dumps(earlier)},
-            {"kind": "clinical_trial", "source_id": "NCT01234567", "recorded_at": 2, "payload": json.dumps(later)},
+            artifact("clinical_trial_snapshot", "NCT99999999", 99, earlier),
+            artifact("clinical_trial_snapshot", "NCT01234567", 1, earlier),
+            artifact("clinical_trial", "NCT01234567", 2, later),
         ], "NCT01234567")
         self.assertEqual(selected["lifecycle"]["overall_status"], "TERMINATED")
         self.assertIsNone(latest_retained_study_snapshot([], "NCT01234567"))
+
+    def test_latest_snapshot_rejects_corrupt_artifact_payload_or_source_record_digest(self) -> None:
+        snapshot = normalize_study(_study())
+        payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        row = {
+            "id": "artifact-1", "kind": "clinical_trial_snapshot", "source": "ClinicalTrials.gov",
+            "source_id": "NCT01234567", "recorded_at": 1, "payload": payload,
+            "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        }
+        row["payload"] = payload + " "
+        with self.assertRaisesRegex(ValueError, "payload digest"):
+            latest_retained_study_snapshot([row], "NCT01234567")
+        row["payload"] = payload
+        tampered = deepcopy(snapshot)
+        tampered["lifecycle"]["overall_status"] = "TERMINATED"
+        row["payload"] = json.dumps(tampered, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        row["sha256"] = hashlib.sha256(row["payload"].encode("utf-8")).hexdigest()
+        with self.assertRaisesRegex(ValueError, "do not match its retained source record"):
+            latest_retained_study_snapshot([row], "NCT01234567")
 
 
 if __name__ == "__main__":

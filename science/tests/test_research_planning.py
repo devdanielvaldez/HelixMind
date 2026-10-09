@@ -8,7 +8,7 @@ from pathlib import Path
 
 from medai_science.llm import ModelCompletion
 from medai_science.research_planning import OBJECTIVE_PLAN_SCHEMA, MANDATORY_RESEARCH_TASK_IDS, RESEARCH_TASK_IDS, objective_plan_from_artifacts, paper_limit_for_depth, plan_research_objective, validate_task_scope
-from medai_science.orchestrator import DEFAULT_PLAN
+from medai_science.orchestrator import DEFAULT_PLAN, plan_research
 from medai_science.scientific_agents import AGENT_BY_TASK, ResearchDirector, agent_may_call
 
 
@@ -51,14 +51,14 @@ class ResearchPlanningTests(unittest.IsolatedAsyncioTestCase):
         async def unsafe(**kwargs):
             plan = valid_plan()
             plan["pubmed_queries"][0] = "patient john@example.com"
-            return ModelCompletion(plan, "test", "fixture", "a" * 64, "b" * 64, {})
+            return ModelCompletion(plan, "test", "fixture", "a" * 64, "b" * 64, {"total_tokens": 12})
         provider.complete_json = unsafe
         with self.assertRaises(ValueError):
             await plan_research_objective(provider, "Alzheimer disease")
         async def unsafe_scope_notes(**kwargs):
             plan = valid_plan()
             plan["task_scope_notes"] = ["Patient john@example.com records are out of scope"]
-            return ModelCompletion(plan, "test", "fixture", "a" * 64, "b" * 64, {})
+            return ModelCompletion(plan, "test", "fixture", "a" * 64, "b" * 64, {"total_tokens": 12})
         provider.complete_json = unsafe_scope_notes
         with self.assertRaises(ValueError):
             await plan_research_objective(provider, "Alzheimer disease")
@@ -149,6 +149,24 @@ class ResearchPlanningTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "dependencies differ"):
             ResearchDirector().coordinate(session_id="RES-1", objective="Alzheimer disease", depth="standard", budget=100, tasks=tasks)
 
+    def test_research_budgets_must_be_positive_integers_at_both_planning_boundaries(self):
+        for invalid_budget in (True, False, 1.5, "100", 0, 100_001):
+            with self.subTest(invalid_budget=invalid_budget):
+                with self.assertRaises(ValueError):
+                    plan_research("Alzheimer disease", budget=invalid_budget)
+
+        tasks = [
+            {"id": step.id, "domain": step.domain, "depends_on": list(step.depends_on)}
+            for step in DEFAULT_PLAN
+        ]
+        for invalid_budget in (True, False, 1.5, "100", 0, 100_001):
+            with self.subTest(director_budget=invalid_budget):
+                with self.assertRaises(ValueError):
+                    ResearchDirector().coordinate(
+                        session_id="RES-1", objective="Alzheimer disease", depth="standard",
+                        budget=invalid_budget, tasks=tasks,
+                    )
+
     def test_specialist_mcp_authority_is_domain_scoped(self):
         self.assertTrue(agent_may_call("research_director", "medai_research_apply_task_scope"))
         self.assertFalse(agent_may_call("literature_librarian", "medai_research_apply_task_scope"))
@@ -156,6 +174,10 @@ class ResearchPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(agent_may_call("gene_disease_curator", "medai_graph_link_evidence"))
         self.assertTrue(agent_may_call("gene_disease_curator", "medai_ontology_search"))
         self.assertTrue(agent_may_call("gene_disease_curator", "medai_ontology_cross_mapping_review"))
+        self.assertTrue(agent_may_call("chemistry_analyst", "medai_compounds_lookup_pubchem"))
+        self.assertFalse(agent_may_call("chemistry_analyst", "medai_drug_profile_chembl"))
+        self.assertFalse(agent_may_call("pharmacology_analyst", "medai_compounds_lookup_pubchem"))
+        self.assertTrue(agent_may_call("pharmacology_analyst", "medai_drug_profile_chembl"))
         self.assertFalse(agent_may_call("gene_disease_curator", "medai_drug_profile_chembl"))
         self.assertTrue(agent_may_call("protein_analyst", "medai_proteins_get_uniprot_record"))
         self.assertTrue(agent_may_call("protein_analyst", "medai_research_save_checkpoint"))
@@ -169,6 +191,23 @@ class ResearchPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(agent_may_call("capability_learner", "medai_capabilities_validate_python_proposal"))
         self.assertTrue(agent_may_call("capability_learner", "medai_capabilities_validate_r_proposal"))
         self.assertFalse(agent_may_call("capability_learner", "medai_capabilities_execute_generated"))
+        self.assertTrue(agent_may_call("benchmark_analyst", "medai_biomedical_domain_benchmark_evaluate"))
+        self.assertFalse(agent_may_call("benchmark_analyst", "medai_papers_search_pubmed"))
+
+    def test_domain_benchmark_task_has_a_dedicated_specialist(self):
+        self.assertEqual(AGENT_BY_TASK["benchmark.evaluate"], "benchmark_analyst")
+        step = next(step for step in DEFAULT_PLAN if step.id == "benchmark.evaluate")
+        self.assertEqual(step.domain, "scientific_evaluation")
+        self.assertEqual(step.depends_on, ("objective.normalize",))
+
+    def test_compound_identity_resolution_has_a_distinct_chemistry_specialist(self):
+        self.assertEqual(AGENT_BY_TASK["compounds.analyze"], "chemistry_analyst")
+        self.assertEqual(AGENT_BY_TASK["drugs.investigate"], "pharmacology_analyst")
+        tasks = [{"id": step.id, "domain": step.domain, "depends_on": list(step.depends_on)} for step in DEFAULT_PLAN]
+        coordination = ResearchDirector().coordinate(session_id="RES-1", objective="Alzheimer disease", depth="standard", budget=50, tasks=tasks)
+        assignments = {row["task_id"]: row for row in coordination["task_assignments"]}
+        self.assertEqual(assignments["compounds.analyze"]["agent_id"], "chemistry_analyst")
+        self.assertIn("compounds.analyze", assignments["drugs.investigate"]["depends_on"])
 
     def test_worker_task_tool_calls_are_allowed_for_the_assigned_specialist(self):
         worker_path = Path(__file__).parents[1] / "src/medai_science/worker.py"

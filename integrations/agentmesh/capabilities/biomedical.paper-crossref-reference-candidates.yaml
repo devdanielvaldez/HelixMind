@@ -1,0 +1,43 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.paper-crossref-reference-candidates
+  version: 0.1.0
+  intent: Search for candidate Crossref records matching one retained DOI-less citation without assigning a DOI or creating a citation edge.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, source_artifact_id, citing_doi, reference_index]
+    properties:
+      session_id: { type: string, minLength: 1, maxLength: 128 }
+      task_id: { type: string, const: literature.discover }
+      source_artifact_id: { type: string, minLength: 1, maxLength: 128 }
+      citing_doi: { type: string, minLength: 1, maxLength: 255 }
+      reference_index: { type: integer, minimum: 0, maximum: 199 }
+      limit: { type: integer, minimum: 1, maximum: 5, default: 5 }
+  outputs:
+    type: object
+    required: [status, candidate_artifact_id, candidate_count, candidate_records, citing_doi, reference_index, source_artifact_id, reference_sha256, query_sha256, interpretation]
+    properties:
+      status: { type: string, enum: [unverified_candidates] }
+      candidate_artifact_id: { type: string, minLength: 1 }
+      candidate_count: { type: integer, minimum: 0, maximum: 5 }
+      candidate_records: { type: array, maxItems: 5, items: { type: object } }
+      citing_doi: { type: string }
+      reference_index: { type: integer, minimum: 0, maximum: 199 }
+      source_artifact_id: { type: string, minLength: 1 }
+      reference_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+      query_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+      interpretation: { type: string }
+  successEvidence:
+    - id: doi-less-reference-candidate-search
+      assertion: candidates_bind_to_exact_session_crossref_artifact_reference_and_query_hash_without_automatic_edge
+      acceptedTypes: [provider_receipt, state_assertion]
+effects: [external_communication, network_egress, data_write]
+idempotency: not_guaranteed
+recovery: reconcile
+authority:
+  permissions: [biomedical.literature.resolve, biomedical.artifacts.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-crossref-reference-candidates
+    kind: mcp
+    reference: mcp://medai/medai_papers_resolve_crossref_reference

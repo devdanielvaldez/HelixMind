@@ -26,14 +26,26 @@ class SessionBudgetedJSONProvider:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
 
-    async def _settle(self, reservation_id: str, actual_credits: int | None) -> dict[str, Any]:
+    async def _settle(self, reservation_id: str, actual_credits: int | None, reserved_credits: int) -> dict[str, Any]:
         async with httpx.AsyncClient(base_url=API, headers=api_headers(), timeout=15, transport=self._transport) as client:
             response = await client.post(
                 f"/v1/research/{self._session_id}/budget/reservations/{reservation_id}/settle",
                 json={"actual_credits": actual_credits},
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+        expected_state = "uncertain" if actual_credits is None else "settled"
+        if not isinstance(result, dict) or result.get("state") != expected_state:
+            raise ModelUsageBudgetError("model budget API did not confirm the expected reservation settlement state")
+        if result.get("reservation_id") != reservation_id:
+            raise ModelUsageBudgetError("model budget API settlement refers to a different reservation")
+        charged = result.get("charged_credits")
+        if isinstance(charged, bool) or not isinstance(charged, int) or charged < 0:
+            raise ModelUsageBudgetError("model budget API returned an invalid settled credit amount")
+        expected_charge = reserved_credits if actual_credits is None else actual_credits
+        if charged != expected_charge:
+            raise ModelUsageBudgetError("model budget API settled a different amount than the expected reservation outcome")
+        return result
 
     async def complete_json(self, *, system: str, prompt: str, schema_name: str, schema: dict[str, Any]) -> Any:
         max_output = getattr(self._provider, "max_output_tokens", 4096)
@@ -61,7 +73,7 @@ class SessionBudgetedJSONProvider:
         except BaseException:
             # A disconnected provider can have accepted the request; retain the full reservation when cost is unknown.
             try:
-                await asyncio.shield(self._settle(reservation_id, None))
+                await asyncio.shield(self._settle(reservation_id, None, estimate["credits"]))
             except Exception as settle_error:
                 raise ModelUsageBudgetError("model call failed and its conservative budget reservation could not be settled") from settle_error
             raise
@@ -70,10 +82,10 @@ class SessionBudgetedJSONProvider:
             actual = metering["credits"]
             if not isinstance(actual, int) or actual > estimate["credits"]:
                 raise ModelUsageBudgetError("provider-reported model usage exceeds the pre-call reservation")
-            await self._settle(reservation_id, actual)
+            await self._settle(reservation_id, actual, estimate["credits"])
         except Exception as error:
             try:
-                await asyncio.shield(self._settle(reservation_id, None))
+                await asyncio.shield(self._settle(reservation_id, None, estimate["credits"]))
             except Exception:
                 pass
             if isinstance(error, ModelUsageBudgetError):

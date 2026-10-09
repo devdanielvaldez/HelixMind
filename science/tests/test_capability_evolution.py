@@ -30,11 +30,38 @@ class CapabilityEvolutionTests(unittest.TestCase):
         self.assertEqual(report["n"], 10)
         self.assertEqual(report["paired"]["candidate_only_passes"], 1)
         self.assertEqual(report["paired"]["baseline_only_passes"], 0)
-        self.assertEqual(report["recommendation"], "candidate_improves_pass_rate_review_before_promotion")
+        self.assertEqual(report["recommendation"], "candidate_is_faster_without_observed_pass_loss_review_before_promotion")
         self.assertFalse(report["lifecycle_mutation"])
         self.assertEqual(len(report["comparison_sha256"]), 64)
         self.assertEqual(report["paired_outcome_exact_sign_test"]["two_sided_p_value"], 1.0)
         self.assertEqual(report["paired_outcome_exact_sign_test"]["discordant_pairs"], 1)
+        self.assertEqual(report["paired_latency_exact_sign_test"]["candidate_faster_cases"], 10)
+        self.assertEqual(report["paired_latency_exact_sign_test"]["one_sided_p_value_candidate_faster"], 1 / 1024)
+
+    def test_only_recommends_paired_improvement_with_exact_significance(self):
+        rows = comparison()["cases"]
+        for row in rows:
+            row["baseline_passed"] = False
+            row["candidate_passed"] = True
+        report = compare_capability_versions(comparison(rows))
+        self.assertEqual(report["recommendation"], "candidate_improves_pass_rate_review_before_promotion")
+        self.assertEqual(report["paired_outcome_exact_sign_test"]["two_sided_p_value"], 2 / 1024)
+
+        rows = comparison()["cases"]
+        for row in rows:
+            row["baseline_latency_ms"] = 100
+            row["candidate_latency_ms"] = 90
+        report = compare_capability_versions(comparison(rows))
+        self.assertEqual(report["recommendation"], "candidate_is_faster_without_observed_pass_loss_review_before_promotion")
+
+        rows = comparison()["cases"]
+        for row in rows:
+            row["candidate_passed"] = row["baseline_passed"]
+            row["baseline_latency_ms"] = 90
+            row["candidate_latency_ms"] = 100
+        report = compare_capability_versions(comparison(rows))
+        self.assertEqual(report["recommendation"], "retain_baseline_pending_latency_review")
+        self.assertEqual(report["paired_latency_exact_sign_test"]["one_sided_p_value_baseline_faster"], 1 / 1024)
 
     def test_exact_paired_outcome_test_reports_strength_and_no_information(self):
         cases = comparison()["cases"]
@@ -94,11 +121,18 @@ class CapabilityEvolutionTests(unittest.TestCase):
         )
         self.assertEqual(report["benchmark_sha256"], __import__("hashlib").sha256(__import__("json").dumps(benchmark, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest())
         self.assertTrue(report["repeat_consistency"]["candidate_all_repeats_passed"])
+        self.assertTrue(report["repeat_stability"]["all_outcomes_stable"])
         self.assertEqual(report["execution"]["repeats"], 3)
         self.assertEqual(report["execution"]["execution_order"], ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"])
         self.assertEqual(report["execution"]["candidate_cpu_microseconds"], [900, 900, 900])
         self.assertEqual(len(report["execution"]["baseline_source_sha256"]), 64)
         self.assertEqual(len(report["execution_receipt_sha256"]), 64)
+        self.assertEqual(report["evolution_review"]["action"], "candidate_ready_for_human_promotion_review")
+        self.assertTrue(report["evolution_review"]["eligible_for_promotion_review"])
+        self.assertTrue(report["evolution_review"]["requires_platform_admin_decision"])
+        self.assertFalse(report["evolution_review"]["lifecycle_mutation"])
+        self.assertEqual(report["evolution_review"]["comparison_sha256"], report["comparison_sha256"])
+        self.assertEqual(report["evolution_review"]["benchmark_sha256"], report["benchmark_sha256"])
 
     def test_paired_runner_requires_measured_case_timings(self):
         class TiminglessSandbox:
@@ -139,6 +173,36 @@ class CapabilityEvolutionTests(unittest.TestCase):
         source = "run <- function(input) list()\n"
         report = run_paired_capability_benchmark(FakeRSandbox(), source, source + "# candidate\n", benchmark, repeats=3)
         self.assertEqual(report["execution"]["language"], "r")
+
+    def test_unstable_repeated_pass_fail_outcomes_make_evolution_recommendation_inconclusive(self):
+        class UnstableSandbox:
+            image = "python@sha256:" + "b" * 64
+
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, source, input_data, test_cases):
+                self.calls += 1
+                candidate = "candidate" in source
+                passed = not candidate or self.calls % 2 == 0
+                return {
+                    "validation": {"cases": [{"index": index, "passed": passed, "wall_time_microseconds": 10} for index, _ in enumerate(test_cases)]},
+                    "cpu_time_microseconds": 20,
+                }
+
+        benchmark = {
+            "schema_version": "1", "capability_id": "genomics.variant_filter",
+            "baseline_version": "1.0.0", "candidate_version": "1.1.0", "benchmark_id": "unstable-corpus",
+            "cases": [{"case_id": f"case-{index}", "input": {}, "expected": {}} for index in range(10)],
+        }
+        source = "def run(input):\n    return {}\n"
+        report = run_paired_capability_benchmark(UnstableSandbox(), source, "# candidate\n" + source, benchmark, repeats=3)
+        self.assertFalse(report["repeat_stability"]["all_outcomes_stable"])
+        self.assertTrue(report["repeat_stability"]["candidate_unstable_case_ids"])
+        self.assertEqual(report["recommendation"], "inconclusive_due_to_repeat_instability")
+        self.assertIn("paired_recommendation", report)
+        self.assertEqual(report["evolution_review"]["action"], "repeat_or_stabilize_benchmark")
+        self.assertFalse(report["evolution_review"]["eligible_for_promotion_review"])
 
 
 if __name__ == "__main__":

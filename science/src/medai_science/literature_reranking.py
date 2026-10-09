@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from medai_science.llm import JSONModelProvider, ModelCompletion, _validate_schema
+from medai_science.llm import JSONModelProvider, ModelCompletion, _validate_schema, complete_structured_json
 from medai_science.sources.safety import ensure_public_research_query
 
 
@@ -53,7 +53,7 @@ async def rerank_pubmed_titles(provider: JSONModelProvider, query: str, papers: 
         by_pmid[pmid] = paper
         candidates.append({"pmid": pmid, "title": title[:1000]})
     prompt = "Research query: " + query + "\nPubMed title candidates (title relevance only):\n" + json.dumps(candidates, ensure_ascii=False, separators=(",", ":"))
-    completion = await provider.complete_json(system=_SYSTEM, prompt=prompt, schema_name="pubmed_title_ranking", schema=RERANK_SCHEMA)
+    completion = await complete_structured_json(provider, system=_SYSTEM, prompt=prompt, schema_name="pubmed_title_ranking", schema=RERANK_SCHEMA)
     result = completion.value
     _validate_schema(result, RERANK_SCHEMA)
     expected, ranked = set(by_pmid), result["ranked_pmids"]

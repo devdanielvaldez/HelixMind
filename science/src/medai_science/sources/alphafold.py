@@ -13,6 +13,7 @@ from medai_science.sources.bounded_http import read_bounded_response
 
 _ACCESSION = re.compile(r"^[A-Z0-9]{6,10}(?:-[1-9][0-9]*)?$", re.IGNORECASE)
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_COORDINATE_BYTES = 32 * 1024 * 1024
 
 
 def _first(record: dict[str, Any], *keys: str) -> Any:
@@ -112,7 +113,7 @@ class AlphaFoldClient:
     async def predictions(self, uniprot_accession: str) -> list[dict[str, Any]]:
         uniprot_accession = self.validate_accession(uniprot_accession)
         endpoint = f"{self.endpoint}/{quote(uniprot_accession, safe='-')}"
-        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout) as client:
+        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout, follow_redirects=False) as client:
             async with client.stream("GET", endpoint, headers={"Accept": "application/json"}) as response:
                 if response.status_code == 404:
                     return []
@@ -125,3 +126,32 @@ class AlphaFoldClient:
             raise ValueError("AlphaFold returned an unexpected prediction response")
         retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         return [_normalize_prediction(uniprot_accession, item, retrieved_at) for item in payload]
+
+    @staticmethod
+    def coordinate_url(model_id: str, format: str = "pdb") -> str:
+        """Build the provider's canonical coordinate URL from a validated model ID."""
+        if not isinstance(model_id, str) or not re.fullmatch(r"AF-[A-Za-z0-9-]+-F[0-9]+-v[0-9]+", model_id):
+            raise ValueError("model_id is not a valid AlphaFold model entity identifier")
+        if format not in {"pdb", "cif"}:
+            raise ValueError("coordinate format must be pdb or cif")
+        return f"https://alphafold.ebi.ac.uk/files/{model_id}.{format}"
+
+    async def coordinate_file(self, model_id: str, format: str = "pdb") -> dict[str, Any]:
+        """Fetch bounded coordinates from the fixed AlphaFold host without redirects."""
+        url = self.coordinate_url(model_id, format)
+        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout, follow_redirects=False) as client:
+            async with client.stream("GET", url, headers={"Accept": "chemical/x-pdb" if format == "pdb" else "chemical/x-mmcif"}) as response:
+                body = await read_bounded_response(response, _MAX_COORDINATE_BYTES, "AlphaFold coordinate file")
+        if not body.strip():
+            raise ValueError("AlphaFold returned an empty coordinate file")
+        return {
+            "model_id": model_id,
+            "format": format,
+            "url": url,
+            "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "byte_length": len(body),
+            "license": "CC-BY-4.0",
+            "attribution": "AlphaFold Protein Structure Database; cite Jumper et al., Nature (2021) and the current AlphaFold DB release paper.",
+            "content": body,
+        }

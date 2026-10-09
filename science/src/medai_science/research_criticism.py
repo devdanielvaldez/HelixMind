@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from medai_science.llm import JSONModelProvider, ModelCompletion, _validate_schema
+from medai_science.llm import JSONModelProvider, ModelCompletion, _validate_schema, complete_structured_json
 from medai_science.sources.safety import ensure_public_research_query
 
 
@@ -80,7 +80,7 @@ async def generate_critic_leads(
         "an empty evidence_refs list is appropriate when none directly informs a lead. Do not invent sources. Input JSON:\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
-    completion = await provider.complete_json(system=_SYSTEM, prompt=prompt, schema_name="biomedical_hypothesis_criticism", schema=CRITICISM_SCHEMA)
+    completion = await complete_structured_json(provider, system=_SYSTEM, prompt=prompt, schema_name="biomedical_hypothesis_criticism", schema=CRITICISM_SCHEMA)
     review = completion.value
     _validate_schema(review, CRITICISM_SCHEMA)
     if review["hypothesis_id"] != candidate_id:

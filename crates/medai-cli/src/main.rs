@@ -8,7 +8,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::PathBuf,
     process::Command as ProcessCommand,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
@@ -134,7 +134,9 @@ const SCIENCE_COMMANDS: &[&str] = &[
     "gene",
     "gene-disease",
     "variant",
+    "dbsnp",
     "variant-reconcile",
+    "variant-reconcile-dbsnp",
     "variant-annotate-vep",
     "gene-panel",
     "gencc-gene",
@@ -147,6 +149,7 @@ const SCIENCE_COMMANDS: &[&str] = &[
     "protein",
     "protein-record",
     "protein-mapping",
+    "protein-structure-analyze",
     "structure",
     "interactions",
     "paper-fulltext",
@@ -379,6 +382,23 @@ enum DatabaseCommand {
     Backup { destination: PathBuf },
     /// Verify a SQLite backup read-only and print its digest and integrity result.
     Verify { path: PathBuf },
+    /// Plan retention for integrity-verified snapshots in one dedicated directory.
+    PruneBackups {
+        directory: PathBuf,
+        #[arg(long, default_value_t = 7)]
+        keep_newest: usize,
+        #[arg(long, default_value_t = 90)]
+        max_age_days: u64,
+        /// Apply the deletion plan; requires the exact digest printed by a prior dry run.
+        #[arg(long)]
+        apply: bool,
+        /// Apply the configured age/count policy immediately (for an operator-reviewed scheduled job).
+        #[arg(long, conflicts_with_all = ["apply", "confirm_plan_sha256"])]
+        apply_policy: bool,
+        /// Confirm the exact previously reviewed plan digest.
+        #[arg(long, requires = "apply")]
+        confirm_plan_sha256: Option<String>,
+    },
     /// Restore a verified snapshot; stop the API and every worker before confirming.
     Restore {
         source: PathBuf,
@@ -789,6 +809,35 @@ fn main() -> Result<()> {
                 let receipt = Store::verify_backup(path)?;
                 println!("{}", serde_json::to_string_pretty(&receipt)?);
             }
+            DatabaseCommand::PruneBackups {
+                directory,
+                keep_newest,
+                max_age_days,
+                apply,
+                apply_policy,
+                confirm_plan_sha256,
+            } => {
+                let now_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                let plan =
+                    Store::plan_backup_retention(directory, keep_newest, max_age_days, now_unix)?;
+                if apply || apply_policy {
+                    let expected = if apply_policy {
+                        plan.plan_sha256.clone()
+                    } else {
+                        confirm_plan_sha256.context(
+                            "--apply requires --confirm-plan-sha256 from a reviewed dry-run plan",
+                        )?
+                    };
+                    let receipt = Store::apply_backup_retention(&plan, &expected, now_unix)?;
+                    println!("{}", serde_json::to_string_pretty(&receipt)?);
+                } else {
+                    anyhow::ensure!(
+                        confirm_plan_sha256.is_none(),
+                        "--confirm-plan-sha256 is only valid with --apply"
+                    );
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                }
+            }
             DatabaseCommand::Restore { .. } => {
                 anyhow::bail!("database restore requires --confirm-no-writers")
             }
@@ -948,6 +997,17 @@ mod tests {
             OsString::from("APOE"),
             OsString::from("--species"),
             OsString::from("human"),
+        ];
+        assert_eq!(normalized_science_args(&args).unwrap(), args);
+    }
+
+    #[test]
+    fn local_protein_structure_analysis_is_exposed_by_the_medai_cli() {
+        let args = vec![
+            OsString::from("protein-structure-analyze"),
+            OsString::from("model.pdb"),
+            OsString::from("--label"),
+            OsString::from("AF-P12345-F1"),
         ];
         assert_eq!(normalized_science_args(&args).unwrap(), args);
     }

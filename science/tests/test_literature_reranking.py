@@ -46,7 +46,7 @@ class LiteratureRerankingTests(unittest.IsolatedAsyncioTestCase):
 
 
 async def async_bad_ids(**kwargs):
-    return ModelCompletion({"ranked_pmids": ["101", "999"], "relevance": [{"pmid": "101", "tier": "higher"}, {"pmid": "999", "tier": "lower"}]}, "test", "fixture", "a" * 64, "b" * 64, {})
+    return ModelCompletion({"ranked_pmids": ["101", "999"], "relevance": [{"pmid": "101", "tier": "higher"}, {"pmid": "999", "tier": "lower"}]}, "test", "fixture", "a" * 64, "b" * 64, {"total_tokens": 6})
 
 
 if __name__ == "__main__":

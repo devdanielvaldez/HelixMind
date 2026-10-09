@@ -101,5 +101,77 @@ class SpecialistCredentialMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mismatched[0]["status"], 403)
 
 
+class AuthenticatedTransportMiddlewareTests(unittest.IsolatedAsyncioTestCase):
+    async def invoke(self, headers, expected_token="m" * 48, scope_type="http"):
+        called = []
+        messages = []
+        forwarded_headers = []
+
+        async def app(scope, receive, send):
+            called.append(True)
+            forwarded_headers.extend(scope["headers"])
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.accept"})
+            else:
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"ok"})
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        middleware = mcp_auth.AuthenticatedMCPTransportASGIMiddleware(app, expected_token)
+        scope = {"type": scope_type, "method": "POST", "path": "/mcp", "headers": headers}
+        await middleware(scope, receive, send)
+        return called, messages, forwarded_headers
+
+    async def test_rejects_anonymous_and_caller_authorization_without_gateway_credential(self):
+        for headers in ([], [(b"authorization", b"Bearer caller-token")]):
+            called, messages, _ = await self.invoke(headers)
+            self.assertEqual(called, [])
+            self.assertEqual(messages[0]["status"], 401)
+
+    async def test_websocket_transport_cannot_bypass_authentication(self):
+        called, rejected, _ = await self.invoke([], scope_type="websocket")
+        self.assertEqual(called, [])
+        self.assertEqual(rejected[0], {"type": "websocket.close", "code": 4401})
+
+        token = "m" * 48
+        called, accepted, forwarded = await self.invoke(
+            [(b"x-medai-mcp-token", token.encode())], token, "websocket"
+        )
+        self.assertEqual(called, [True])
+        self.assertEqual(accepted[0]["type"], "websocket.accept")
+        self.assertEqual(forwarded, [])
+
+    async def test_accepts_only_the_distinct_gateway_injected_transport_credential(self):
+        token = "m" * 48
+        called, messages, forwarded = await self.invoke([
+            (b"x-medai-mcp-token", token.encode()),
+            (b"authorization", b"Bearer untrusted-caller-credential"),
+            (b"cookie", b"session=private"),
+        ], token)
+        self.assertEqual(called, [True])
+        self.assertEqual(messages[0]["status"], 200)
+        self.assertEqual(forwarded, [])
+
+        called, duplicate, _ = await self.invoke([
+            (b"x-medai-mcp-token", token.encode()),
+            (b"x-medai-mcp-token", token.encode()),
+        ], token)
+        self.assertEqual(called, [])
+        self.assertEqual(duplicate[0]["status"], 401)
+
+    async def test_rejects_invalid_or_reused_api_credentials_at_startup(self):
+        for token in ("short", "a" * 5000):
+            with self.assertRaises(ValueError):
+                mcp_auth.AuthenticatedMCPTransportASGIMiddleware(lambda *_: None, token)
+        with patch.object(mcp_auth, "_API_TOKEN", "a" * 48):
+            with self.assertRaisesRegex(ValueError, "distinct"):
+                mcp_auth.AuthenticatedMCPTransportASGIMiddleware(lambda *_: None, "a" * 48)
+
+
 if __name__ == "__main__":
     unittest.main()

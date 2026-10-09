@@ -14,7 +14,7 @@ services:
       MEDAI_AGENT_CREDIT_LIMITS: ${MEDAI_AGENT_CREDIT_LIMITS:-}
       MEDAI_SERVICE_TENANT_ID: ${MEDAI_SERVICE_TENANT_ID:-local}
       MEDAI_CORS_ORIGINS: ${MEDAI_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-    networks: [default, metrics]
+    networks: [api-backend, metrics]
     ports:
       - "127.0.0.1:8090:8090"
     init: true
@@ -42,9 +42,11 @@ services:
     environment:
       MEDAI_API_URL: http://api:8090
       MEDAI_API_BEARER_TOKEN: "${MEDAI_API_BEARER_TOKEN:?Set MEDAI_API_BEARER_TOKEN to a secret of at least 32 bytes}"
+      MEDAI_MCP_BEARER_TOKEN: "${MEDAI_MCP_BEARER_TOKEN:?Set MEDAI_MCP_BEARER_TOKEN to a distinct secret of at least 32 bytes}"
       MEDAI_GENCC_CACHE_DIR: /data/gencc
       MEDAI_CLINGEN_CACHE_DIR: /data/clingen
       MEDAI_PUBMED_SEARCH_CACHE: /data/pubmed-search-cache.sqlite
+      MEDAI_CROSSREF_METADATA_CACHE: /data/crossref-metadata-cache.sqlite
       MEDAI_PROVENANCE_KEY_FILE: /data/keys/provenance-hmac.key
       MEDAI_SKILLS_DIR: /data/skills
       MEDAI_EMBEDDING_MODEL: ${MEDAI_EMBEDDING_MODEL:-/data/embedding-model}
@@ -87,6 +89,8 @@ services:
       MEDAI_MODEL_PHARMACOLOGY_ANALYST_API_KEY: ${MEDAI_MODEL_PHARMACOLOGY_ANALYST_API_KEY:-}
     ports:
       - "127.0.0.1:8091:8091"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     init: true
     read_only: true
     cap_drop: [ALL]
@@ -101,6 +105,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    networks: [api-backend, provider-egress]
     restart: unless-stopped
   science-worker:
     build:
@@ -129,7 +134,10 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      science-mcp:
+        condition: service_started
     profiles: ["agentmesh-worker"]
+    networks: [api-backend, provider-egress]
     restart: unless-stopped
   science-specialist-worker:
     build:
@@ -158,7 +166,61 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      science-mcp:
+        condition: service_started
     profiles: ["agentmesh-specialist"]
+    networks: [api-backend, provider-egress]
+    restart: unless-stopped
+  science-direct-worker:
+    build:
+      context: .
+      dockerfile: science/Dockerfile
+    entrypoint: ["medai-science"]
+    command: ["work", "--watch", "--poll-seconds", "300"]
+    environment:
+      MEDAI_DIRECT_MCP_URL: ${MEDAI_DIRECT_MCP_URL:-http://science-mcp:8091/mcp}
+      MEDAI_MCP_BEARER_TOKEN: "${MEDAI_MCP_BEARER_TOKEN:?Set MEDAI_MCP_BEARER_TOKEN to a distinct secret of at least 32 bytes}"
+      MEDAI_TRIAL_WATCH_WORKER_ID: medai-compose-direct-worker
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1g
+    pids_limit: ${MEDAI_WORKER_PIDS:-1024}
+    cpus: ${MEDAI_WORKER_CPUS:-4.0}
+    mem_limit: ${MEDAI_WORKER_MEMORY:-8g}
+    depends_on:
+      science-mcp:
+        condition: service_started
+    profiles: ["direct-worker"]
+    networks: [api-backend]
+    restart: unless-stopped
+  science-direct-specialist-worker:
+    build:
+      context: .
+      dockerfile: science/Dockerfile
+    entrypoint: ["medai-science"]
+    command: ["work", "--watch", "--poll-seconds", "300"]
+    environment:
+      MEDAI_DIRECT_MCP_URL: ${MEDAI_DIRECT_MCP_URL:-http://science-mcp:8091/mcp}
+      MEDAI_MCP_BEARER_TOKEN: "${MEDAI_MCP_BEARER_TOKEN:?Set MEDAI_MCP_BEARER_TOKEN to a distinct secret of at least 32 bytes}"
+      MEDAI_SCIENTIFIC_AGENT_ID: ${MEDAI_SCIENTIFIC_AGENT_ID:-literature_librarian}
+      MEDAI_SPECIALIST_API_TOKEN: ${MEDAI_SPECIALIST_API_TOKEN:-}
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1g
+    pids_limit: ${MEDAI_WORKER_PIDS:-1024}
+    cpus: ${MEDAI_WORKER_CPUS:-4.0}
+    mem_limit: ${MEDAI_WORKER_MEMORY:-8g}
+    depends_on:
+      science-mcp:
+        condition: service_started
+    profiles: ["direct-specialist"]
+    networks: [api-backend]
     restart: unless-stopped
   web:
     build: ./web
@@ -181,6 +243,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    networks: [api-backend]
     restart: unless-stopped
   prometheus:
     image: ${MEDAI_PROMETHEUS_IMAGE:-prom/prometheus:v3.15.0}
@@ -234,7 +297,7 @@ services:
       - medai-alertmanager:/alertmanager
     secrets:
       - medai_alert_webhook_url
-    networks: [default, metrics]
+    networks: [metrics, provider-egress]
     profiles: [monitoring]
     restart: unless-stopped
 volumes:
@@ -247,5 +310,9 @@ secrets:
   medai_alert_webhook_url:
     file: ${MEDAI_ALERT_WEBHOOK_URL_FILE:-./deploy/alert-webhook-url.example}
 networks:
+  api-backend:
+    internal: true
+  provider-egress:
+    driver: bridge
   metrics:
     internal: true

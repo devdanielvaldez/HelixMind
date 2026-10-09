@@ -5,13 +5,16 @@ import gzip
 import hashlib
 import math
 import re
+import zlib
 from pathlib import Path
 from typing import Any, TextIO
 
 _SEQUENCE_ALLELE = re.compile(r"^[ACGTN]+$", re.IGNORECASE)
 _NUCLEOTIDE = re.compile(r"^[ACGTRYSWKMBDHVNU]+$", re.IGNORECASE)
 _PROTEIN = re.compile(r"^[ABCDEFGHIKLMNPQRSTVWXYZJUO*-]+$", re.IGNORECASE)
+_AMBIGUOUS_NUCLEOTIDES = frozenset("RYSWKMBDHVN")
 _MAX_VARIANTS = 2_000_000
+_MAX_GENOTYPE_CALLS = 5_000_000
 _MAX_LINE_BYTES = 2_000_000
 _MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
 
@@ -184,6 +187,10 @@ def _normalize_alleles(reference_fasta: IndexedFasta, contig: str, position: int
         return position, reference, alternate
     while position > 1 and reference[-1] == alternate[-1]:
         previous = reference_fasta.fetch(contig, position - 2, 1)
+        # Unknown reference symbols are not evidence that an indel can be
+        # shifted through that base. Keep normalization within verified DNA.
+        if not re.fullmatch(r"[ACGT]", previous):
+            break
         reference = previous + reference
         alternate = previous + alternate
         position -= 1
@@ -216,7 +223,7 @@ def _genotype_counts(format_value: str, sample_values: list[str], alternate_inde
         if not alleles or any(value == "." for value in alleles):
             counts["missing"] += 1
             continue
-        if any(not value.isdigit() or int(value) > alternate_count for value in alleles):
+        if any(not value.isascii() or not value.isdecimal() or int(value) > alternate_count for value in alleles):
             raise ValueError(f"invalid genotype allele index: {gt}")
         dosage = sum(int(value) == alternate_index for value in alleles)
         if len(alleles) == 1:
@@ -255,6 +262,8 @@ def analyze_vcf(
     file_format: str | None = None
     declared_reference: str | None = None
     total_records = 0
+    total_alternate_alleles = 0
+    total_genotype_calls = 0
     total_bytes = 0
     unsupported_records = 0
     samples_count = 0
@@ -310,13 +319,15 @@ def analyze_vcf(
                     continue
                 if header_columns is None:
                     raise ValueError("VCF data appeared before the #CHROM header")
+                if total_records >= max_variants:
+                    raise ValueError(f"VCF exceeds the configured maximum of {max_variants} records")
                 columns = line.split("\t")
                 if len(columns) != len(header_columns):
                     raise ValueError(f"VCF line {line_number} has {len(columns)} columns; expected {len(header_columns)}")
                 chrom, pos_text, _identifier, ref, alt_text, qual_text, filter_value, info_text = columns[:8]
                 if not chrom or len(chrom) > 128 or any(char.isspace() for char in chrom):
                     raise ValueError(f"invalid contig at line {line_number}")
-                if not pos_text.isdigit():
+                if not pos_text.isascii() or not pos_text.isdecimal():
                     raise ValueError(f"invalid VCF position at line {line_number}")
                 try:
                     position = int(pos_text)
@@ -332,6 +343,9 @@ def analyze_vcf(
                         raise ValueError(
                             f"VCF REF {ref.upper()} does not match reference {observed_reference} at {chrom}:{position}"
                         )
+                alternate_count = alt_text.count(",") + 1
+                if total_alternate_alleles + alternate_count > max_variants:
+                    raise ValueError(f"VCF exceeds the configured maximum of {max_variants} alternate alleles")
                 alternates = alt_text.split(",")
                 if not alternates or any(not alt for alt in alternates):
                     raise ValueError(f"empty alternate allele at line {line_number}")
@@ -342,9 +356,13 @@ def analyze_vcf(
                 info_fields = sorted({item.split("=", 1)[0] for item in info_text.split(";") if item and item != "."})
                 format_value = columns[8] if len(columns) > 8 else ""
                 sample_values = columns[9:] if len(columns) > 9 else []
+                if sample_values and "GT" in format_value.split(":"):
+                    record_genotype_calls = len(sample_values) * alternate_count
+                    if total_genotype_calls + record_genotype_calls > _MAX_GENOTYPE_CALLS:
+                        raise ValueError(f"VCF genotype calls exceed the {_MAX_GENOTYPE_CALLS} safety limit")
+                    total_genotype_calls += record_genotype_calls
                 total_records += 1
-                if total_records > max_variants:
-                    raise ValueError(f"VCF exceeds the configured maximum of {max_variants} records")
+                total_alternate_alleles += len(alternates)
                 for alternate_index, alternate in enumerate(alternates, 1):
                     is_sequence_variant = bool(_SEQUENCE_ALLELE.fullmatch(alternate))
                     if not is_sequence_variant:
@@ -392,7 +410,7 @@ def analyze_vcf(
                     if sample_values:
                         variant["genotype_call_counts"] = _genotype_counts(format_value, sample_values, alternate_index, len(alternates))
                     variants.append(variant)
-    except (OSError, UnicodeError, EOFError, gzip.BadGzipFile) as error:
+    except (OSError, UnicodeError, EOFError, gzip.BadGzipFile, zlib.error) as error:
         raise ValueError(f"could not read VCF input: {error}") from error
 
     if header_columns is None:
@@ -441,6 +459,7 @@ def analyze_vcf(
         ),
         "records_parsed": total_records,
         "alternate_alleles_emitted": len(variants),
+        "genotype_calls_examined": total_genotype_calls,
         "unsupported_symbolic_or_breakend_alleles": unsupported_records,
         "remote_services_contacted": False,
         "clinical_interpretation": "not_performed",
@@ -486,6 +505,23 @@ def _sequence_summary(input_sha256: str, format_name: str, records: int, lengths
     return result
 
 
+def _nucleotide_composition(bases: dict[str, int], total_symbols: int) -> dict[str, Any]:
+    """Report IUPAC ambiguity separately from GC measured over all sequence symbols."""
+    ambiguous = {symbol: bases[symbol] for symbol in sorted(_AMBIGUOUS_NUCLEOTIDES) if bases.get(symbol, 0)}
+    ambiguous_count = sum(ambiguous.values())
+    canonical_count = sum(bases.get(symbol, 0) for symbol in "ACGTU")
+    gc_count = bases.get("G", 0) + bases.get("C", 0)
+    return {
+        "gc_fraction": round(gc_count / total_symbols, 6) if total_symbols else None,
+        "gc_fraction_unambiguous": round(gc_count / canonical_count, 6) if canonical_count else None,
+        "gc_fraction_denominator": "all_sequence_symbols_including_IUPAC_ambiguity",
+        "gc_fraction_unambiguous_denominator": "A_C_G_T_U_symbols_only",
+        "ambiguous_symbol_counts": ambiguous,
+        "ambiguous_symbol_count": ambiguous_count,
+        "ambiguous_symbol_fraction": round(ambiguous_count / total_symbols, 6) if total_symbols else None,
+    }
+
+
 def inspect_fasta(path: str | Path, molecule_type: str = "nucleotide", max_records: int = _MAX_VARIANTS) -> dict[str, Any]:
     """Validate FASTA records and compute local aggregate sequence statistics."""
     source = Path(path).expanduser()
@@ -496,7 +532,7 @@ def inspect_fasta(path: str | Path, molecule_type: str = "nucleotide", max_recor
     if not 1 <= max_records <= _MAX_VARIANTS:
         raise ValueError(f"max_records must be 1..{_MAX_VARIANTS}")
     alphabet = _NUCLEOTIDE if molecule_type == "nucleotide" else _PROTEIN
-    valid_chars = set("ACGTUN" if molecule_type == "nucleotide" else "ACDEFGHIKLMNPQRSTVWY")
+    canonical_protein_symbols = set("ACDEFGHIKLMNPQRSTVWY")
     records = 0
     total_bytes = 0
     current_length = 0
@@ -539,12 +575,9 @@ def inspect_fasta(path: str | Path, molecule_type: str = "nucleotide", max_recor
                     raise ValueError(f"invalid {molecule_type} sequence symbols at line {line_number}")
                 current_length += len(sequence)
                 for char in sequence:
-                    if char in valid_chars:
-                        bases[char] = bases.get(char, 0) + 1
-                    else:
-                        key = "ambiguous_or_other"
-                        bases[key] = bases.get(key, 0) + 1
-    except (OSError, UnicodeError, EOFError, gzip.BadGzipFile) as error:
+                    key = char if molecule_type == "nucleotide" or char in canonical_protein_symbols else "ambiguous_or_other"
+                    bases[key] = bases.get(key, 0) + 1
+    except (OSError, UnicodeError, EOFError, gzip.BadGzipFile, zlib.error) as error:
         raise ValueError(f"could not read FASTA input: {error}") from error
     if not header_seen:
         raise ValueError("FASTA contains no records")
@@ -556,8 +589,7 @@ def inspect_fasta(path: str | Path, molecule_type: str = "nucleotide", max_recor
         raise ValueError("FASTA input changed while it was being analyzed")
     extra: dict[str, Any] = {"molecule_type": molecule_type}
     if molecule_type == "nucleotide":
-        gc = bases.get("G", 0) + bases.get("C", 0)
-        extra["gc_fraction"] = round(gc / sum(lengths), 6) if sum(lengths) else 0
+        extra.update(_nucleotide_composition(bases, sum(lengths)))
     return _sequence_summary(initial_digest, "FASTA", records, lengths, bases, extra)
 
 
@@ -599,6 +631,8 @@ def inspect_fastq(path: str | Path, max_records: int = _MAX_VARIANTS) -> dict[st
                     break
                 if not header.startswith("@") or not header[1:].strip():
                     raise ValueError(f"expected a FASTQ @header at line {line_number}")
+                if records >= max_records:
+                    raise ValueError(f"FASTQ exceeds the configured maximum of {max_records} records")
                 identifier = header[1:].split(maxsplit=1)[0]
                 sequence_length = 0
                 sequence_counts: dict[str, int] = {}
@@ -624,6 +658,8 @@ def inspect_fastq(path: str | Path, max_records: int = _MAX_VARIANTS) -> dict[st
                     quality_line, line_number = read_line(handle, line_number)
                     if quality_line is None:
                         raise ValueError(f"FASTQ record {records + 1} has truncated quality values")
+                    if not quality_line:
+                        raise ValueError(f"FASTQ record {records + 1} has an empty quality line")
                     if any(not 33 <= ord(char) <= 126 for char in quality_line):
                         raise ValueError(f"FASTQ quality at line {line_number} is outside printable Phred+33 range")
                     remaining = sequence_length - observed_quality
@@ -638,19 +674,17 @@ def inspect_fastq(path: str | Path, max_records: int = _MAX_VARIANTS) -> dict[st
                         quality_min = low if quality_min is None else min(quality_min, low)
                         quality_max = high if quality_max is None else max(quality_max, high)
                 records += 1
-                if records > max_records:
-                    raise ValueError(f"FASTQ exceeds the configured maximum of {max_records} records")
                 lengths.append(sequence_length)
                 for char, count in sequence_counts.items():
                     bases[char] = bases.get(char, 0) + count
-    except (OSError, UnicodeError, EOFError, gzip.BadGzipFile) as error:
+    except (OSError, UnicodeError, EOFError, gzip.BadGzipFile, zlib.error) as error:
         raise ValueError(f"could not read FASTQ input: {error}") from error
     if records == 0:
         raise ValueError("FASTQ contains no records")
     final_digest = _digest(source)
     if final_digest != initial_digest:
         raise ValueError("FASTQ input changed while it was being analyzed")
-    gc = bases.get("G", 0) + bases.get("C", 0)
+    nucleotide_metrics = _nucleotide_composition(bases, sum(lengths))
     return _sequence_summary(
         initial_digest,
         "FASTQ",
@@ -659,7 +693,7 @@ def inspect_fastq(path: str | Path, max_records: int = _MAX_VARIANTS) -> dict[st
         bases,
         {
             "molecule_type": "nucleotide",
-            "gc_fraction": round(gc / sum(lengths), 6),
+            **nucleotide_metrics,
             "quality_encoding": "Phred+33 (required) — not inferred",
             "quality_scores_counted": quality_count,
             "mean_phred_score": round(quality_sum / quality_count, 4) if quality_count else None,

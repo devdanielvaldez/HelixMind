@@ -3,11 +3,50 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from medai_science.genomics import analyze_vcf
 
 
 class VCFGenotypePloidyTests(unittest.TestCase):
+    def test_multiallelic_records_count_toward_expanded_variant_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "many-alternates.vcf"
+            path.write_text(
+                "##fileformat=VCFv4.3\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+                "1\t10\t.\tA\tC,G,T\t.\tPASS\t.\n",
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(ValueError, "maximum of 2 alternate alleles"):
+                analyze_vcf(path, "GRCh38", max_variants=2)
+
+    def test_genotype_work_is_bounded_after_multiallelic_expansion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "genotype-work.vcf"
+            path.write_text(
+                "##fileformat=VCFv4.3\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n"
+                "1\t10\t.\tA\tC,G,T\t.\tPASS\t.\tGT\t0/1\n",
+                encoding="ascii",
+            )
+            with patch("medai_science.genomics._MAX_GENOTYPE_CALLS", 2):
+                with self.assertRaisesRegex(ValueError, "genotype calls exceed"):
+                    analyze_vcf(path, "GRCh38")
+
+    def test_vcf_enforces_record_limit_before_parsing_next_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "limited.vcf"
+            path.write_text(
+                "##fileformat=VCFv4.3\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+                "1\t10\t.\tA\tC\t.\tPASS\t.\n"
+                "this second record is deliberately malformed\n",
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(ValueError, "maximum of 1 records"):
+                analyze_vcf(path, "GRCh38", max_variants=1)
+
     def test_counts_haploid_and_diploid_dosage_separately_and_keeps_polyploid_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "calls.vcf"
@@ -68,6 +107,24 @@ class VCFGenotypePloidyTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "cannot mix phased and unphased separators"):
                 analyze_vcf(path, "GRCh38")
+
+    def test_rejects_non_ascii_decimal_digits_in_positions_and_genotypes(self):
+        records = (
+            ("١٠", "0/1", "invalid VCF position"),
+            ("10", "٠/١", "invalid genotype allele index"),
+        )
+        for position, genotype, expected in records:
+            with self.subTest(position=position, genotype=genotype), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "non-ascii-digit.vcf"
+                path.write_text(
+                    "##fileformat=VCFv4.3\n"
+                    "##reference=GRCh38\n"
+                    "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n"
+                    f"1\t{position}\t.\tA\tC\t.\tPASS\t.\tGT\t{genotype}\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, expected):
+                    analyze_vcf(path, "GRCh38")
 
 
 if __name__ == "__main__":

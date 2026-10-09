@@ -16,6 +16,21 @@ _MAX_CACHE_ENTRIES = 1000
 _PMID = re.compile(r"^[0-9]{1,20}$")
 
 
+def _cache_instant(now: int | None) -> int:
+    if now is None:
+        return int(time.time())
+    if isinstance(now, bool) or not isinstance(now, int) or now < 0:
+        raise ValueError("cache timestamp must be a non-negative integer Unix time")
+    return now
+
+
+def _prune_invalid_timestamps(connection: sqlite3.Connection, instant: int, ttl_seconds: int) -> None:
+    connection.execute(
+        "DELETE FROM pubmed_search_cache WHERE expires_at<=? OR typeof(stored_at)!='integer' OR stored_at<0 OR stored_at>? OR typeof(expires_at)!='integer' OR expires_at<=stored_at OR expires_at-stored_at>?",
+        (instant, instant, ttl_seconds),
+    )
+
+
 def search_key(query: str, limit: int) -> str:
     """Hash exact normalized query inputs so the cache never stores search text."""
     if not isinstance(query, str) or not query.strip() or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
@@ -50,13 +65,22 @@ class PubMedSearchCache:
 
     def get(self, query: str, limit: int, *, now: int | None = None) -> tuple[list[str], dict[str, Any]] | None:
         key = search_key(query, limit)
-        instant = int(time.time()) if now is None else now
+        instant = _cache_instant(now)
         with self._connect() as connection:
-            connection.execute("DELETE FROM pubmed_search_cache WHERE expires_at<=?", (instant,))
-            row = connection.execute("SELECT pmids_json,total_hits,requested_limit,expires_at FROM pubmed_search_cache WHERE cache_key=?", (key,)).fetchone()
+            _prune_invalid_timestamps(connection, instant, self.ttl_seconds)
+            row = connection.execute("SELECT pmids_json,total_hits,requested_limit,stored_at,expires_at FROM pubmed_search_cache WHERE cache_key=?", (key,)).fetchone()
             if row is None:
                 return None
-            pmids_raw, total_hits, stored_limit, expires_at = row
+            pmids_raw, total_hits, stored_limit, stored_at, expires_at = row
+            if (
+                isinstance(stored_at, bool) or not isinstance(stored_at, int)
+                or isinstance(expires_at, bool) or not isinstance(expires_at, int)
+                or stored_at < 0 or stored_at > instant
+                or expires_at <= instant or expires_at <= stored_at
+                or expires_at - stored_at > self.ttl_seconds
+            ):
+                connection.execute("DELETE FROM pubmed_search_cache WHERE cache_key=?", (key,))
+                return None
         try:
             pmids = json.loads(pmids_raw)
         except (TypeError, json.JSONDecodeError):
@@ -85,9 +109,9 @@ class PubMedSearchCache:
                 or len(pmids) != len(set(pmids)) or isinstance(total_hits, bool)
                 or not isinstance(total_hits, int) or total_hits < len(pmids)):
             raise ValueError("PubMed search cache accepts only a validated bounded PMID page and total count")
-        instant = int(time.time()) if now is None else now
+        instant = _cache_instant(now)
         with self._connect() as connection:
-            connection.execute("DELETE FROM pubmed_search_cache WHERE expires_at<=?", (instant,))
+            _prune_invalid_timestamps(connection, instant, self.ttl_seconds)
             connection.execute(
                 "INSERT INTO pubmed_search_cache(cache_key,pmids_json,total_hits,requested_limit,stored_at,expires_at) VALUES(?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET pmids_json=excluded.pmids_json,total_hits=excluded.total_hits,requested_limit=excluded.requested_limit,stored_at=excluded.stored_at,expires_at=excluded.expires_at",
                 (key, json.dumps(pmids, separators=(",", ":")), total_hits, limit, instant, instant + self.ttl_seconds),

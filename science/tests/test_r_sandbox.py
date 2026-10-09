@@ -1,9 +1,12 @@
 import tempfile
 import unittest
+import os
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 from medai_science.r_sandbox import DockerRSandbox, validate_r_source
+from medai_science.sandbox import SandboxError
 
 
 class RSandboxTests(unittest.TestCase):
@@ -23,9 +26,10 @@ class RSandboxTests(unittest.TestCase):
                 validate_r_source(source)
 
     def test_requires_digest_pinned_image_and_cases(self):
-        with self.assertRaisesRegex(ValueError, "pinned by immutable sha256"):
+        with self.assertRaisesRegex(ValueError, "immutable sha256"):
             DockerRSandbox("r-base:4.4")
         sandbox = DockerRSandbox("r-base:4.4@sha256:" + "a" * 64)
+        self.assertEqual(DockerRSandbox("sha256:" + "b" * 64).image, "sha256:" + "b" * 64)
         with self.assertRaisesRegex(ValueError, "1..100"):
             sandbox.execute("run <- function(input) list()", {}, [])
 
@@ -34,7 +38,7 @@ class RSandboxTests(unittest.TestCase):
             docker = Path(folder) / "docker"
             docker.write_text(
                 "#!" + sys.executable + "\n"
-                "import json, sys\n"
+                "import json, os, sys\n"
                 "args=sys.argv[1:]\n"
                 "if args[:2] == ['image','inspect']:\n"
                 "    print('sha256:local')\n"
@@ -44,6 +48,9 @@ class RSandboxTests(unittest.TestCase):
                 "    assert args[-5] == '--vanilla', args\n"
                 "    volume=args[args.index('--volume')+1]\n"
                 "    assert volume.endswith(':/capability:ro,noexec,nosuid,nodev'), volume\n"
+                "    host=volume.split(':/capability:',1)[0]\n"
+                "    cidfile=next(x.split('=',1)[1] for x in args if x.startswith('--cidfile='))\n"
+                "    assert not cidfile.startswith(host+os.sep), 'host container ID file must stay outside guest mount'\n"
                 "    print('MEDAI_SANDBOX_RESULT:'+args[-1]+':'+json.dumps({'ok':True,'result':{'value':3},'test_results':[{'result':{'value':5},'wall_time_microseconds':17}],'cpu_time_microseconds':2345}))\n",
                 encoding="utf-8",
             )
@@ -82,6 +89,49 @@ class RSandboxTests(unittest.TestCase):
             )
         self.assertFalse(result["case_tests_passed"])
         self.assertEqual(result["validation"]["failed"], 1)
+
+    def test_rejects_ambiguous_or_nonstandard_container_receipts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            docker = Path(folder) / "docker"
+            docker.write_text(
+                "#!" + sys.executable + "\n"
+                "import os, sys\n"
+                "args=sys.argv[1:]\n"
+                "if args[:2] == ['image','inspect']:\n    print('sha256:local')\n"
+                "else:\n    print('MEDAI_SANDBOX_RESULT:'+args[-1]+':'+os.environ['MOCK_RECEIPT'])\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            sandbox = DockerRSandbox("r-base:4.4@sha256:" + "d" * 64, docker_binary=str(docker))
+            for receipt in (
+                '{"ok":true,"ok":false,"result":{},"cpu_time_microseconds":1}',
+                '{"ok":true,"result":{"value":Infinity},"cpu_time_microseconds":1}',
+            ):
+                with self.subTest(receipt=receipt), patch.dict(os.environ, {"MOCK_RECEIPT": receipt}):
+                    with self.assertRaisesRegex(SandboxError, "no valid result receipt"):
+                        sandbox.execute("run <- function(input) list()", {}, [], require_test_cases=False)
+
+    def test_successful_null_result_cannot_bypass_output_schema_without_cases(self):
+        with tempfile.TemporaryDirectory() as folder:
+            docker = Path(folder) / "docker"
+            docker.write_text(
+                "#!" + sys.executable + "\n"
+                "import json, sys\n"
+                "args=sys.argv[1:]\n"
+                "if args[:2] == ['image','inspect']:\n    print('sha256:local')\n"
+                "else:\n    print('MEDAI_SANDBOX_RESULT:'+args[-1]+':'+json.dumps({'ok':True,'result':None,'test_results':[],'cpu_time_microseconds':1}))\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            sandbox = DockerRSandbox("r-base:4.4@sha256:" + "e" * 64, docker_binary=str(docker))
+            with self.assertRaisesRegex(SandboxError, "violates its output contract"):
+                sandbox.execute(
+                    "run <- function(input) list(value = 1L)",
+                    {},
+                    [],
+                    contract={"input": {"type": "object"}, "output": {"type": "object"}},
+                    require_test_cases=False,
+                )
 
 
 if __name__ == "__main__":

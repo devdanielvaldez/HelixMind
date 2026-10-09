@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import json
 import re
 from urllib.parse import quote
 
@@ -12,6 +13,83 @@ from medai_science.sources.bounded_http import read_bounded_response
 
 _ACCESSION = re.compile(r"^[A-Z0-9]{6,10}(?:-[1-9][0-9]*)?$", re.IGNORECASE)
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_RETAINED_RECORD_FIELDS = (
+    "interactor_a", "interactor_b", "detection_method", "pubmed_ids",
+    "organism_a", "organism_b", "interaction_type", "source_database",
+    "interaction_ids", "confidence", "complex_expansion",
+    "biological_role_a", "biological_role_b", "experimental_role_a",
+    "experimental_role_b",
+)
+
+
+def build_retention_payload(result: dict) -> dict:
+    """Keep attributable, bounded interaction metadata without persisting MITAB rows verbatim."""
+    if not isinstance(result, dict) or result.get("source") != "IntAct":
+        raise ValueError("IntAct retention requires a normalized IntAct result")
+    accession = IntActClient.validate_accession(result.get("query_accession"))
+    expected_url = f"{IntActClient.endpoint}/{quote(f'id:{accession}', safe=':')}/"
+    response_digest = result.get("response_sha256")
+    if result.get("source_url") != expected_url or not isinstance(response_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", response_digest):
+        raise ValueError("IntAct retention source URL or response digest is invalid")
+    retrieved_at = result.get("retrieved_at")
+    try:
+        timestamp = datetime.fromisoformat(retrieved_at.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("IntAct retention timestamp is invalid") from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("IntAct retention timestamp must include a timezone")
+    records = result.get("records")
+    if not isinstance(records, list) or len(records) > 500:
+        raise ValueError("IntAct retention requires a bounded record list")
+    retained = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("IntAct retention contains a malformed record")
+        raw = record.get("raw_mitab")
+        if isinstance(raw, str):
+            if len(raw.encode("utf-8")) > 32_768:
+                raise ValueError("IntAct source row exceeds the per-record retention bound")
+            row_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        else:
+            row_digest = record.get("source_record_sha256")
+        if not isinstance(row_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", row_digest):
+            raise ValueError("IntAct record is missing a bounded source-row digest")
+        retained.append({key: record[key] for key in _RETAINED_RECORD_FIELDS if key in record} | {"source_record_sha256": row_digest})
+    if result.get("reconciliation") != reconcile_interactions(records):
+        raise ValueError("IntAct reconciliation does not match the retained source rows")
+    coverage = result.get("retrieval_coverage")
+    coverage_counts = ("source_rows_seen", "retained_rows", "rows_filtered_by_organism", "rows_missing_taxonomy", "requested_limit")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("retained_rows") != len(records)
+        or any(isinstance(coverage.get(field), bool) or not isinstance(coverage.get(field), int) for field in coverage_counts)
+        or any(coverage[field] < 0 for field in coverage_counts[:-1])
+        or coverage["source_rows_seen"] < len(records)
+        or coverage["requested_limit"] not in range(1, 501)
+        or coverage["rows_filtered_by_organism"] > coverage["source_rows_seen"]
+        or coverage["rows_missing_taxonomy"] > coverage["source_rows_seen"]
+        or not isinstance(coverage.get("may_be_truncated_at_requested_limit"), bool)
+        or coverage["may_be_truncated_at_requested_limit"] != (coverage["source_rows_seen"] >= coverage["requested_limit"])
+    ):
+        raise ValueError("IntAct retrieval coverage does not match the retained source rows")
+    payload = {
+        "schema_version": "1",
+        "source": "IntAct",
+        "source_url": result.get("source_url") or IntActClient.endpoint,
+        "query_accession": accession,
+        "organism_filter": result.get("organism_filter"),
+        "retrieved_at": result.get("retrieved_at"),
+        "response_sha256": response_digest,
+        "retrieval_coverage": result.get("retrieval_coverage"),
+        "records": retained,
+        "reconciliation": result.get("reconciliation"),
+        "retention_policy": "MITAB source rows, aliases, and other unstructured row text are excluded from persistent artifacts. Retained identifiers, source terms, per-row hashes, and reconciliation metadata preserve traceability; record-level reuse terms have not been independently adjudicated.",
+        "interpretation_limits": result.get("interpretation_limits", []),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(encoded) > 4 * 1024 * 1024:
+        raise ValueError("IntAct retained artifact exceeds the 4 MiB limit")
+    return payload
 
 
 class IntActClient:
@@ -80,7 +158,7 @@ class IntActClient:
                 "raw_mitab": line,
             })
         return {
-            "source": "IntAct", "query_accession": accession, "organism_filter": organism_id,
+            "source": "IntAct", "source_url": url, "query_accession": accession, "organism_filter": organism_id,
             "retrieved_at": retrieved_at, "response_sha256": hashlib.sha256(lines).hexdigest(),
             "retrieval_coverage": {
                 "requested_limit": limit,

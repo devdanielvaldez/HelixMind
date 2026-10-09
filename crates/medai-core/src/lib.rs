@@ -12,11 +12,22 @@ use std::{
 };
 
 pub const ARTIFACT_STORAGE_BYTES_PER_CREDIT: i64 = 1024 * 1024;
+/// Maximum serialized JSON payload retained for one research artifact.
+/// This matches the bounded researcher-supplied benchmark corpus contract.
+pub const MAX_ARTIFACT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GRAPH_SESSION_ID_BYTES: usize = 128;
+const MAX_GRAPH_IDENTIFIER_BYTES: usize = 512;
+const MAX_GRAPH_KIND_BYTES: usize = 128;
+const MAX_GRAPH_LABEL_BYTES: usize = 4096;
+const MAX_GRAPH_METADATA_BYTES: usize = 256 * 1024;
+const MAX_GRAPH_PROVENANCE_ITEMS: usize = 2_000;
+const MAX_GRAPH_PROVENANCE_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_TENANT_MAX_ACTIVE_SESSIONS: i64 = 25;
 pub const DEFAULT_TENANT_MAX_SESSION_BUDGET: i64 = 100_000;
 pub const DEFAULT_TENANT_MAX_ALLOCATED_CREDITS: i64 = 1_000_000;
 const MAX_AUDIT_ARCHIVE_EVENTS: i64 = 20_000;
-const SQLITE_SCHEMA_VERSION: i64 = 2;
+const MAX_LITERATURE_WATCH_PENDING_METADATA: i64 = 10_000;
+const SQLITE_SCHEMA_VERSION: i64 = 4;
 
 fn api_audit_digest(event: &ApiAuditEvent) -> Result<String> {
     let mut value = serde_json::json!({
@@ -43,6 +54,48 @@ pub struct DatabaseBackupReceipt {
     pub sha256: String,
     pub bytes: u64,
     pub integrity_check: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseBackupRetentionEntry {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub modified_at_unix: i64,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseBackupRetentionPlan {
+    pub directory: String,
+    pub keep_newest: usize,
+    pub max_age_days: u64,
+    pub entries: Vec<DatabaseBackupRetentionEntry>,
+    pub plan_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseBackupRetentionReceipt {
+    pub plan_sha256: String,
+    pub deleted: Vec<DatabaseBackupRetentionEntry>,
+    pub retained: usize,
+}
+
+fn backup_retention_plan_digest(plan: &DatabaseBackupRetentionPlan) -> Result<String> {
+    #[derive(Serialize)]
+    struct DigestInput<'a> {
+        directory: &'a str,
+        keep_newest: usize,
+        max_age_days: u64,
+        entries: &'a [DatabaseBackupRetentionEntry],
+    }
+    let input = DigestInput {
+        directory: &plan.directory,
+        keep_newest: plan.keep_newest,
+        max_age_days: plan.max_age_days,
+        entries: &plan.entries,
+    };
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&input)?)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +322,8 @@ pub struct LiteratureWatch {
     pub last_checked_at: Option<i64>,
     pub last_error: Option<String>,
     pub last_pmids: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_metadata_pmids: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiteratureWatchEvent {
@@ -281,6 +336,8 @@ pub struct LiteratureWatchEvent {
     pub retrieved_count: i64,
     pub incomplete: bool,
     pub new_pmids: String,
+    pub metadata_pending_count: Option<i64>,
+    pub metadata_overflow_count: Option<i64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiteratureWatchPaper {
@@ -435,10 +492,16 @@ const RESEARCH_TASKS: &[(&str, &str, &str, &str)] = &[
         "[\"entities.resolve\"]",
     ),
     (
+        "compounds.analyze",
+        "chemistry",
+        "Resolve source-identified compounds to exact chemical identities",
+        "[\"literature.extract\"]",
+    ),
+    (
         "drugs.investigate",
         "pharmacology",
-        "Connect compounds and targets to sourced evidence",
-        "[\"entities.resolve\",\"trials.discover\"]",
+        "Connect exact compound identities and targets to sourced pharmacology evidence",
+        "[\"compounds.analyze\",\"entities.resolve\",\"trials.discover\"]",
     ),
     (
         "contradictions.search",
@@ -450,7 +513,7 @@ const RESEARCH_TASKS: &[(&str, &str, &str, &str)] = &[
         "graph.build",
         "knowledge_graph",
         "Snapshot registered stable entities and evidence-linked relationships",
-        "[\"evidence.grade\",\"entities.resolve\",\"genomics.analyze\",\"proteins.analyze\",\"pathways.map\",\"genes.curate\",\"drugs.investigate\"]",
+        "[\"evidence.grade\",\"entities.resolve\",\"genomics.analyze\",\"proteins.analyze\",\"pathways.map\",\"genes.curate\",\"compounds.analyze\",\"drugs.investigate\"]",
     ),
     (
         "hypotheses.propose",
@@ -475,6 +538,12 @@ const RESEARCH_TASKS: &[(&str, &str, &str, &str)] = &[
         "reproducibility",
         "Create a hash-linked provenance report and reproducibility bundle",
         "[\"hypotheses.criticize\",\"skills.learn\",\"trials.discover\"]",
+    ),
+    (
+        "benchmark.evaluate",
+        "scientific_evaluation",
+        "Evaluate independently adjudicated domain benchmark cases supplied to this research session",
+        "[\"objective.normalize\"]",
     ),
 ];
 
@@ -516,12 +585,14 @@ pub fn scientific_agent_for_task(task_id: &str) -> Option<&'static str> {
         "proteins.analyze" => "protein_analyst",
         "pathways.map" => "pathway_analyst",
         "trials.discover" => "trial_librarian",
+        "compounds.analyze" => "chemistry_analyst",
         "drugs.investigate" => "pharmacology_analyst",
         "contradictions.search" | "hypotheses.criticize" => "scientific_critic",
         "graph.build" => "knowledge_graph_curator",
         "hypotheses.propose" => "hypothesis_generator",
         "skills.learn" => "capability_learner",
         "report.reproduce" => "reproducibility_agent",
+        "benchmark.evaluate" => "benchmark_analyst",
         _ => return None,
     })
 }
@@ -544,6 +615,7 @@ pub fn is_scientific_agent(agent_id: &str) -> bool {
         "hypothesis_generator",
         "capability_learner",
         "reproducibility_agent",
+        "benchmark_analyst",
     ]
     .contains(&agent_id)
 }
@@ -608,6 +680,7 @@ fn literature_watch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Litera
         last_checked_at: row.get(8)?,
         last_error: row.get(9)?,
         last_pmids: row.get(10)?,
+        pending_metadata_pmids: None,
     })
 }
 
@@ -624,6 +697,8 @@ fn literature_watch_event_from_row(
         retrieved_count: row.get(6)?,
         incomplete: row.get::<_, i64>(7)? != 0,
         new_pmids: row.get(8)?,
+        metadata_pending_count: row.get(9)?,
+        metadata_overflow_count: row.get(10)?,
     })
 }
 
@@ -643,6 +718,10 @@ fn valid_doi(value: &str) -> bool {
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-._;()/:".contains(&byte))
+}
+
+fn canonical_json_sha256(value: &serde_json::Value) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
 
 fn validation_report_hash(
@@ -896,8 +975,30 @@ fn validate_paired_benchmark_artifact(
             && benchmark
                 .get("n")
                 .and_then(serde_json::Value::as_u64)
-                .is_some_and(|count| count >= 10),
-        "paired benchmark is missing source signatures, content digests, execution provenance, or ten measured cases"
+                .is_some_and(|count| {
+                    count >= 10
+                        && benchmark
+                            .pointer("/candidate/passed")
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(count)
+                        && benchmark
+                            .pointer("/candidate/pass_rate")
+                            .and_then(serde_json::Value::as_f64)
+                            == Some(1.0)
+                })
+            && benchmark
+                .pointer("/repeat_consistency/candidate_all_repeats_passed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && benchmark
+                .pointer("/repeat_stability/all_outcomes_stable")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && benchmark
+                .pointer("/repeat_stability/candidate_unstable_case_ids")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty),
+        "paired benchmark lacks verified signatures, content and execution digests, ten measured cases, complete candidate passes, or stable repeated outcomes"
     );
     Ok(())
 }
@@ -914,9 +1015,11 @@ pub struct Store {
 }
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        if let Some(parent) = path.as_ref().parent() {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        prepare_private_database_file(path)?;
         let db = Connection::open(path).context("open MedAI database")?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.pragma_update(None, "foreign_keys", "ON")
@@ -957,20 +1060,44 @@ impl Store {
         CREATE TABLE IF NOT EXISTS trial_watches(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, nct_id TEXT NOT NULL, interval_seconds INTEGER NOT NULL, next_due INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, lease_owner TEXT, lease_until INTEGER, last_checked_at INTEGER, last_error TEXT, last_snapshot TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(session_id,nct_id));
         CREATE TABLE IF NOT EXISTS trial_watch_events(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, nct_id TEXT NOT NULL, captured_at INTEGER NOT NULL, snapshot_sha256 TEXT NOT NULL, changed INTEGER, snapshot TEXT NOT NULL, comparison TEXT, FOREIGN KEY(session_id,nct_id) REFERENCES trial_watches(session_id,nct_id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS literature_watches(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, watch_id TEXT NOT NULL, query TEXT NOT NULL, interval_seconds INTEGER NOT NULL, next_due INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, lease_owner TEXT, lease_until INTEGER, last_checked_at INTEGER, last_error TEXT, last_pmids TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(session_id,watch_id));
-        CREATE TABLE IF NOT EXISTS literature_watch_events(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, watch_id TEXT NOT NULL, captured_at INTEGER NOT NULL, snapshot_sha256 TEXT NOT NULL, result_count INTEGER NOT NULL, retrieved_count INTEGER NOT NULL, incomplete INTEGER NOT NULL, new_pmids TEXT NOT NULL, FOREIGN KEY(session_id,watch_id) REFERENCES literature_watches(session_id,watch_id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS literature_watch_events(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, watch_id TEXT NOT NULL, captured_at INTEGER NOT NULL, snapshot_sha256 TEXT NOT NULL, result_count INTEGER NOT NULL, retrieved_count INTEGER NOT NULL, incomplete INTEGER NOT NULL, new_pmids TEXT NOT NULL, metadata_pending_count INTEGER CHECK(metadata_pending_count>=0), metadata_overflow_count INTEGER CHECK(metadata_overflow_count>=0), FOREIGN KEY(session_id,watch_id) REFERENCES literature_watches(session_id,watch_id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS literature_watch_papers(session_id TEXT NOT NULL, watch_id TEXT NOT NULL, event_id TEXT NOT NULL REFERENCES literature_watch_events(id) ON DELETE CASCADE, pmid TEXT NOT NULL, title TEXT NOT NULL, publication_date TEXT, journal TEXT, doi TEXT, pmcid TEXT, captured_at INTEGER NOT NULL, metadata_sha256 TEXT NOT NULL, PRIMARY KEY(session_id,watch_id,pmid), FOREIGN KEY(session_id,watch_id) REFERENCES literature_watches(session_id,watch_id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS literature_watch_pending(session_id TEXT NOT NULL, watch_id TEXT NOT NULL, pmid TEXT NOT NULL, first_seen_at INTEGER NOT NULL, PRIMARY KEY(session_id,watch_id,pmid), FOREIGN KEY(session_id,watch_id) REFERENCES literature_watches(session_id,watch_id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS research_tasks_session_status_idx ON research_tasks(session_id,status);
         CREATE INDEX IF NOT EXISTS research_artifacts_session_idx ON research_artifacts(session_id,recorded_at);
         CREATE INDEX IF NOT EXISTS trial_watches_due_idx ON trial_watches(enabled,next_due,lease_until);
         CREATE INDEX IF NOT EXISTS trial_watch_events_session_idx ON trial_watch_events(session_id,nct_id,captured_at);
         CREATE INDEX IF NOT EXISTS literature_watches_due_idx ON literature_watches(enabled,next_due,lease_until);
         CREATE INDEX IF NOT EXISTS literature_watch_events_session_idx ON literature_watch_events(session_id,watch_id,captured_at);
+        CREATE INDEX IF NOT EXISTS literature_watch_pending_order_idx ON literature_watch_pending(session_id,watch_id,first_seen_at,pmid);
         CREATE INDEX IF NOT EXISTS evidence_session_idx ON evidence(session_id);")
             .context("initialize MedAI SQLite schema")?;
         // Serialize the table-shape checks and legacy backfills across API and
         // worker processes. Without this lock, two first-time openers can both
         // observe a missing column and race to apply the same ALTER TABLE.
         db.execute_batch("BEGIN IMMEDIATE")?;
+        let has_literature_watch_pending_count: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('literature_watch_events') WHERE name='metadata_pending_count')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_literature_watch_pending_count {
+            db.execute(
+                "ALTER TABLE literature_watch_events ADD COLUMN metadata_pending_count INTEGER CHECK(metadata_pending_count>=0)",
+                [],
+            )?;
+        }
+        let has_literature_watch_overflow_count: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('literature_watch_events') WHERE name='metadata_overflow_count')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_literature_watch_overflow_count {
+            db.execute(
+                "ALTER TABLE literature_watch_events ADD COLUMN metadata_overflow_count INTEGER CHECK(metadata_overflow_count>=0)",
+                [],
+            )?;
+        }
         let has_audit_tenant: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('api_audit_events') WHERE name='tenant_id')",
             [],
@@ -1210,6 +1337,57 @@ impl Store {
                 }
             }
         }
+        if existing_schema_version < 4 {
+            let legacy_watches: Vec<(String, String, Option<String>)> = {
+                let mut statement =
+                    db.prepare("SELECT session_id,watch_id,last_pmids FROM literature_watches")?;
+                statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for (session_id, watch_id, encoded_pmids) in legacy_watches {
+                let Some(encoded_pmids) = encoded_pmids else {
+                    continue;
+                };
+                let parsed: Result<Vec<String>, _> = serde_json::from_str(&encoded_pmids);
+                let Ok(pmids) = parsed else {
+                    db.execute(
+                        "UPDATE literature_watches SET enabled=0,lease_owner=NULL,lease_until=NULL,last_error='paused: invalid legacy PubMed identifier snapshot requires operator review' WHERE session_id=?1 AND watch_id=?2",
+                        params![session_id, watch_id],
+                    )?;
+                    continue;
+                };
+                let mut unique = std::collections::HashSet::new();
+                let valid = pmids.len() <= 200
+                    && pmids.iter().all(|pmid| {
+                        !pmid.is_empty()
+                            && pmid.len() <= 20
+                            && pmid.is_ascii()
+                            && pmid.bytes().all(|byte| byte.is_ascii_digit())
+                            && unique.insert(pmid)
+                    });
+                if !valid {
+                    db.execute(
+                        "UPDATE literature_watches SET enabled=0,lease_owner=NULL,lease_until=NULL,last_error='paused: invalid legacy PubMed identifier snapshot requires operator review' WHERE session_id=?1 AND watch_id=?2",
+                        params![session_id, watch_id],
+                    )?;
+                    continue;
+                }
+                for pmid in pmids {
+                    let retained: bool = db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM literature_watch_papers WHERE session_id=?1 AND watch_id=?2 AND pmid=?3)",
+                        params![session_id, watch_id, pmid],
+                        |row| row.get(0),
+                    )?;
+                    if !retained {
+                        db.execute(
+                            "INSERT OR IGNORE INTO literature_watch_pending(session_id,watch_id,pmid,first_seen_at) VALUES(?1,?2,?3,?4)",
+                            params![session_id, watch_id, pmid, now()?],
+                        )?;
+                    }
+                }
+            }
+        }
         db.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
         db.execute_batch("COMMIT")?;
         Ok(Self { db })
@@ -1327,6 +1505,166 @@ impl Store {
         })
     }
 
+    fn verify_medai_backup(path: &Path) -> Result<DatabaseBackupReceipt> {
+        let receipt = Self::verify_backup(path)?;
+        let snapshot = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("open backup candidate to verify MedAI schema")?;
+        validate_restore_schema(&snapshot)
+            .context("backup candidate is not a compatible MedAI database")?;
+        Ok(receipt)
+    }
+
+    /// Build a non-destructive plan for a directory containing only standalone MedAI SQLite backups.
+    pub fn plan_backup_retention(
+        directory: impl AsRef<Path>,
+        keep_newest: usize,
+        max_age_days: u64,
+        now_unix: i64,
+    ) -> Result<DatabaseBackupRetentionPlan> {
+        let input_dir = directory.as_ref();
+        anyhow::ensure!(
+            (1..=1000).contains(&keep_newest),
+            "keep_newest must be 1..1000"
+        );
+        anyhow::ensure!(
+            (1..=36500).contains(&max_age_days),
+            "max_age_days must be 1..36500"
+        );
+        let metadata =
+            fs::symlink_metadata(input_dir).context("inspect backup retention directory")?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "backup retention path must be a real directory, not a symlink"
+        );
+        let directory = input_dir
+            .canonicalize()
+            .context("resolve backup retention directory")?;
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(&directory).context("list backup retention directory")? {
+            let entry = entry.context("read backup retention directory entry")?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("sqlite") {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).context("inspect backup candidate")?;
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "SQLite backup candidates must be regular non-symlink files"
+            );
+            let verified = Self::verify_medai_backup(&path).with_context(|| {
+                format!(
+                    "refuse retention planning for invalid backup {}",
+                    path.display()
+                )
+            })?;
+            let modified = metadata
+                .modified()
+                .context("read backup modification time")?;
+            let modified_at_unix = modified
+                .duration_since(UNIX_EPOCH)
+                .context("backup modification time predates the Unix epoch")?
+                .as_secs();
+            let modified_at_unix = i64::try_from(modified_at_unix)
+                .context("backup modification timestamp exceeds supported range")?;
+            candidates.push(DatabaseBackupRetentionEntry {
+                path: path.to_string_lossy().into_owned(),
+                sha256: verified.sha256,
+                bytes: verified.bytes,
+                modified_at_unix,
+                action: String::new(),
+            });
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .modified_at_unix
+                .cmp(&left.modified_at_unix)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let max_age_seconds =
+            i64::try_from(max_age_days.saturating_mul(86_400)).unwrap_or(i64::MAX);
+        for (index, entry) in candidates.iter_mut().enumerate() {
+            let age_seconds = now_unix.saturating_sub(entry.modified_at_unix).max(0);
+            let age_eligible = age_seconds > max_age_seconds;
+            entry.action = if index < keep_newest || !age_eligible {
+                "retain"
+            } else {
+                "delete"
+            }
+            .to_owned();
+        }
+        let mut plan = DatabaseBackupRetentionPlan {
+            directory: directory.to_string_lossy().into_owned(),
+            keep_newest,
+            max_age_days,
+            entries: candidates,
+            plan_sha256: String::new(),
+        };
+        plan.plan_sha256 = backup_retention_plan_digest(&plan)?;
+        Ok(plan)
+    }
+
+    /// Apply exactly the currently computed plan after the caller has reviewed its digest.
+    pub fn apply_backup_retention(
+        plan: &DatabaseBackupRetentionPlan,
+        expected_plan_sha256: &str,
+        now_unix: i64,
+    ) -> Result<DatabaseBackupRetentionReceipt> {
+        anyhow::ensure!(
+            plan.plan_sha256 == expected_plan_sha256,
+            "backup retention confirmation digest does not match the reviewed plan"
+        );
+        let current = Self::plan_backup_retention(
+            &plan.directory,
+            plan.keep_newest,
+            plan.max_age_days,
+            now_unix,
+        )?;
+        anyhow::ensure!(
+            current.plan_sha256 == expected_plan_sha256,
+            "backup retention directory changed after plan review"
+        );
+        let deletion_candidates = current
+            .entries
+            .iter()
+            .filter(|entry| entry.action == "delete")
+            .collect::<Vec<_>>();
+        // Validate every candidate before deleting any, so a changed or corrupt file cannot cause a partial prune.
+        for entry in &deletion_candidates {
+            let path = Path::new(&entry.path);
+            let metadata =
+                fs::symlink_metadata(path).context("recheck backup before retention deletion")?;
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "refuse to delete a non-regular or symlink backup candidate"
+            );
+            let verified = Self::verify_medai_backup(path)
+                .context("reverify backup immediately before retention deletion")?;
+            anyhow::ensure!(
+                verified.sha256 == entry.sha256 && verified.bytes == entry.bytes,
+                "backup changed after retention plan verification"
+            );
+        }
+        let mut deleted = Vec::new();
+        for entry in deletion_candidates {
+            fs::remove_file(&entry.path)
+                .with_context(|| format!("delete expired backup {}", entry.path))?;
+            deleted.push(entry.clone());
+        }
+        sync_directory(Path::new(&current.directory)).context("sync backup retention directory")?;
+        Ok(DatabaseBackupRetentionReceipt {
+            plan_sha256: current.plan_sha256,
+            deleted,
+            retained: current
+                .entries
+                .iter()
+                .filter(|entry| entry.action == "retain")
+                .count(),
+        })
+    }
+
     /// Restore a verified backup into this connection, retaining a verified pre-restore snapshot.
     /// If the source copy fails, the pre-restore snapshot is copied back before returning.
     pub fn restore_backup(
@@ -1438,6 +1776,7 @@ impl Store {
             "protein_analyst",
             "pathway_analyst",
             "trial_librarian",
+            "chemistry_analyst",
             "pharmacology_analyst",
             "scientific_critic",
             "knowledge_graph_curator",
@@ -2876,6 +3215,7 @@ impl Store {
                     | "hypothesis_literature_relevance_review"
                     | "paper_claim_alignment_adjudication"
                     | "ontology_cross_mapping_adjudication"
+                    | "crossref_reference_resolution_adjudication"
             ),
             "human review artifact kind is not permitted"
         );
@@ -2931,8 +3271,8 @@ impl Store {
             "artifact kind, source, and source_id are required"
         );
         anyhow::ensure!(
-            artifact.payload.len() <= 262_144,
-            "artifact payload exceeds 256 KiB"
+            artifact.payload.len() <= MAX_ARTIFACT_PAYLOAD_BYTES,
+            "artifact payload exceeds 4 MiB"
         );
         let parsed: serde_json::Value = serde_json::from_str(artifact.payload)
             .context("artifact payload must be valid JSON")?;
@@ -3602,10 +3942,22 @@ impl Store {
         for (session_id, watch_id) in &keys {
             anyhow::ensure!(tx.execute("UPDATE literature_watches SET lease_owner=?3,lease_until=?4,updated_at=?1 WHERE session_id=?2 AND watch_id=?5 AND enabled=1 AND (lease_until IS NULL OR lease_until<?1)", params![timestamp,session_id,worker_id,timestamp+lease_seconds,watch_id])? == 1, "literature watch was claimed concurrently");
         }
-        let watches = keys.into_iter().map(|(session_id,watch_id)| tx.query_row(
+        let mut watches = keys.into_iter().map(|(session_id,watch_id)| tx.query_row(
             "SELECT session_id,watch_id,query,interval_seconds,next_due,enabled,lease_owner,lease_until,last_checked_at,last_error,last_pmids FROM literature_watches WHERE session_id=?1 AND watch_id=?2",
             params![session_id,watch_id], literature_watch_from_row,
         )).collect::<rusqlite::Result<Vec<_>>>()?;
+        {
+            let mut pending_query = tx.prepare(
+                "SELECT pmid FROM literature_watch_pending WHERE session_id=?1 AND watch_id=?2 ORDER BY first_seen_at,pmid LIMIT 20",
+            )?;
+            for watch in &mut watches {
+                watch.pending_metadata_pmids = Some(
+                    pending_query
+                        .query_map(params![watch.session_id, watch.watch_id], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<String>>>()?,
+                );
+            }
+        }
         tx.commit()?;
         Ok(watches)
     }
@@ -3675,7 +4027,6 @@ impl Store {
                 .cloned()
                 .collect()
         };
-        let pmids_json = serde_json::to_string(&unique)?;
         let timestamp = now()?;
         let tx = self.db.unchecked_transaction()?;
         let watch: (i64, i64, Option<String>) = tx.query_row(
@@ -3683,17 +4034,59 @@ impl Store {
             params![session_id,watch_id,worker_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
         )?;
         anyhow::ensure!(watch.1 >= timestamp, "literature watch lease expired");
-        let previous: std::collections::HashSet<String> = watch
+        let previous_values: Vec<String> = watch
             .2
             .as_deref()
             .map(serde_json::from_str)
             .transpose()?
             .unwrap_or_default();
+        anyhow::ensure!(
+            previous_values.len() <= 200
+                && previous_values.iter().all(|pmid| {
+                    !pmid.is_empty()
+                        && pmid.len() <= 12
+                        && pmid.is_ascii()
+                        && pmid.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                && previous_values
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == previous_values.len(),
+            "stored PubMed watch identifier snapshot is malformed"
+        );
+        let previous: std::collections::HashSet<String> = previous_values.into_iter().collect();
         let new_pmids: Vec<&String> = unique
             .iter()
             .filter(|pmid| !previous.contains(*pmid))
             .collect();
         let new_pmids_json = serde_json::to_string(&new_pmids)?;
+        let pending_before: std::collections::HashSet<String> = {
+            let mut statement = tx.prepare(
+                "SELECT pmid FROM literature_watch_pending WHERE session_id=?1 AND watch_id=?2",
+            )?;
+            statement
+                .query_map(params![session_id, watch_id], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let pending_before_count = pending_before.len();
+        anyhow::ensure!(
+            pending_before_count <= MAX_LITERATURE_WATCH_PENDING_METADATA as usize,
+            "PubMed metadata backlog exceeds its storage limit"
+        );
+        let mut missing_metadata = Vec::new();
+        {
+            let mut exists = tx.prepare(
+                "SELECT EXISTS(SELECT 1 FROM literature_watch_papers WHERE session_id=?1 AND watch_id=?2 AND pmid=?3)",
+            )?;
+            for pmid in &previous {
+                let retained: bool =
+                    exists.query_row(params![session_id, watch_id, pmid], |row| row.get(0))?;
+                if !retained && !pending_before.contains(pmid) {
+                    missing_metadata.push(pmid.clone());
+                }
+            }
+        }
         anyhow::ensure!(
             papers.len() <= 20,
             "PubMed watch retains at most 20 bibliographic records per refresh"
@@ -3707,12 +4100,15 @@ impl Store {
                 == papers.len(),
             "PubMed bibliographic records must have unique PMIDs"
         );
-        let new_set: std::collections::HashSet<&str> =
-            new_pmids.iter().map(|value| value.as_str()).collect();
+        let allowed_papers: std::collections::HashSet<&str> = new_pmids
+            .iter()
+            .map(|value| value.as_str())
+            .chain(pending_before.iter().map(String::as_str))
+            .collect();
         for paper in papers {
             anyhow::ensure!(
-                new_set.contains(paper.pmid.as_str()),
-                "bibliographic metadata must belong to a newly discovered PMID"
+                allowed_papers.contains(paper.pmid.as_str()),
+                "bibliographic metadata must belong to a newly discovered or pending PMID"
             );
             anyhow::ensure!(
                 !paper.title.trim().is_empty() && paper.title.len() <= 2000,
@@ -3739,16 +4135,65 @@ impl Store {
         }).collect::<Result<Vec<_>>>()?;
         let mut canonical_paper_hashes = paper_hashes.clone();
         canonical_paper_hashes.sort();
-        let incomplete = result_count > unique.len() as i64;
-        let canonical = serde_json::json!({"watch_id":watch_id,"result_count":result_count,"pmids":unique,"bibliographic_metadata_sha256":canonical_paper_hashes});
+        let incoming_papers: std::collections::HashSet<&str> =
+            papers.iter().map(|paper| paper.pmid.as_str()).collect();
+        for paper in papers {
+            tx.execute(
+                "DELETE FROM literature_watch_pending WHERE session_id=?1 AND watch_id=?2 AND pmid=?3",
+                params![session_id, watch_id, paper.pmid],
+            )?;
+        }
+        let mut pending_candidates: Vec<String> = unique.to_vec();
+        pending_candidates.extend(missing_metadata);
+        pending_candidates.sort();
+        pending_candidates.dedup();
+        let mut metadata_overflow_count = 0_i64;
+        let mut pending_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM literature_watch_pending WHERE session_id=?1 AND watch_id=?2",
+            params![session_id, watch_id],
+            |row| row.get(0),
+        )?;
+        {
+            let mut exists = tx.prepare(
+                "SELECT EXISTS(SELECT 1 FROM literature_watch_papers WHERE session_id=?1 AND watch_id=?2 AND pmid=?3)",
+            )?;
+            let mut queued = tx.prepare(
+                "SELECT EXISTS(SELECT 1 FROM literature_watch_pending WHERE session_id=?1 AND watch_id=?2 AND pmid=?3)",
+            )?;
+            for pmid in pending_candidates {
+                if incoming_papers.contains(pmid.as_str())
+                    || exists.query_row(params![session_id, watch_id, pmid], |row| row.get(0))?
+                {
+                    continue;
+                }
+                if queued.query_row(params![session_id, watch_id, pmid], |row| row.get(0))? {
+                    continue;
+                }
+                if pending_count >= MAX_LITERATURE_WATCH_PENDING_METADATA {
+                    metadata_overflow_count += 1;
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO literature_watch_pending(session_id,watch_id,pmid,first_seen_at) VALUES(?1,?2,?3,?4)",
+                    params![session_id, watch_id, pmid, timestamp],
+                )?;
+                pending_count += 1;
+            }
+        }
+        let next_pmids_json = serde_json::to_string(&unique)?;
+        let metadata_pending_count = pending_count;
+        let incomplete = result_count > unique.len() as i64
+            || metadata_pending_count > 0
+            || metadata_overflow_count > 0;
+        let canonical = serde_json::json!({"watch_id":watch_id,"result_count":result_count,"pmids":unique,"metadata_pending_count":metadata_pending_count,"metadata_overflow_count":metadata_overflow_count,"bibliographic_metadata_sha256":canonical_paper_hashes});
         let canonical_bytes = serde_json::to_vec(&canonical)?;
         let snapshot_sha256 = format!("{:x}", Sha256::digest(&canonical_bytes));
         let event_id = format!("LW-{}", uuid::Uuid::new_v4().simple());
-        tx.execute("INSERT INTO literature_watch_events(id,session_id,watch_id,captured_at,snapshot_sha256,result_count,retrieved_count,incomplete,new_pmids) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![event_id,session_id,watch_id,timestamp,snapshot_sha256,result_count,unique.len() as i64,incomplete,new_pmids_json])?;
+        tx.execute("INSERT INTO literature_watch_events(id,session_id,watch_id,captured_at,snapshot_sha256,result_count,retrieved_count,incomplete,new_pmids,metadata_pending_count,metadata_overflow_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![event_id,session_id,watch_id,timestamp,snapshot_sha256,result_count,unique.len() as i64,incomplete,new_pmids_json,metadata_pending_count,metadata_overflow_count])?;
         for (paper, hash) in papers.iter().zip(paper_hashes.iter()) {
             tx.execute("INSERT OR IGNORE INTO literature_watch_papers(session_id,watch_id,event_id,pmid,title,publication_date,journal,doi,pmcid,captured_at,metadata_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![session_id,watch_id,event_id,paper.pmid,paper.title,paper.publication_date,paper.journal,paper.doi,paper.pmcid,timestamp,hash])?;
         }
-        tx.execute("UPDATE literature_watches SET next_due=?4,lease_owner=NULL,lease_until=NULL,last_checked_at=?5,last_error=CASE WHEN ?6 THEN 'review required: PubMed result window exceeded the 200-record collection limit' ELSE NULL END,last_pmids=?7,updated_at=?5 WHERE session_id=?1 AND watch_id=?2 AND lease_owner=?3", params![session_id,watch_id,worker_id,timestamp+watch.0,timestamp,incomplete,pmids_json])?;
+        tx.execute("UPDATE literature_watches SET next_due=?4,lease_owner=NULL,lease_until=NULL,last_checked_at=?5,last_error=CASE WHEN ?8>0 THEN 'review required: PubMed metadata backlog capacity reached; identifiers were omitted this refresh' WHEN ?6 THEN 'review required: PubMed result or bibliographic metadata collection is incomplete' ELSE NULL END,last_pmids=?7,updated_at=?5 WHERE session_id=?1 AND watch_id=?2 AND lease_owner=?3", params![session_id,watch_id,worker_id,timestamp+watch.0,timestamp,incomplete,next_pmids_json,metadata_overflow_count])?;
         tx.commit()?;
         Ok(LiteratureWatchEvent {
             id: event_id,
@@ -3760,6 +4205,8 @@ impl Store {
             retrieved_count: unique.len() as i64,
             incomplete,
             new_pmids: new_pmids_json,
+            metadata_pending_count: Some(metadata_pending_count),
+            metadata_overflow_count: Some(metadata_overflow_count),
         })
     }
 
@@ -3812,7 +4259,7 @@ impl Store {
         session_id: &str,
         watch_id: &str,
     ) -> Result<Vec<LiteratureWatchEvent>> {
-        let mut statement = self.db.prepare("SELECT id,session_id,watch_id,captured_at,snapshot_sha256,result_count,retrieved_count,incomplete,new_pmids FROM literature_watch_events WHERE session_id=?1 AND watch_id=?2 ORDER BY captured_at DESC,id DESC LIMIT 100")?;
+        let mut statement = self.db.prepare("SELECT id,session_id,watch_id,captured_at,snapshot_sha256,result_count,retrieved_count,incomplete,new_pmids,metadata_pending_count,metadata_overflow_count FROM literature_watch_events WHERE session_id=?1 AND watch_id=?2 ORDER BY captured_at DESC,id DESC LIMIT 100")?;
         Ok(statement
             .query_map(
                 params![session_id, watch_id],
@@ -3852,6 +4299,22 @@ impl Store {
             .get("records")
             .and_then(|v| v.as_array())
             .context("Crossref artifact has no records array")?;
+        let retained_records_hash = payload
+            .get("retained_records_sha256")
+            .and_then(|v| v.as_str())
+            .context("Crossref artifact is missing its retained-record hash")?;
+        anyhow::ensure!(
+            retained_records_hash.len() == 64
+                && retained_records_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "Crossref artifact has an invalid retained-record hash"
+        );
+        let canonical_records = serde_json::to_vec(records)?;
+        anyhow::ensure!(
+            format!("{:x}", Sha256::digest(&canonical_records)) == retained_records_hash,
+            "Crossref retained records do not match their content hash"
+        );
         let tx = self.db.unchecked_transaction()?;
         let indexed_at = now()?;
         let mut inserted = 0;
@@ -3900,6 +4363,192 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?,
         )
+    }
+
+    /// Add a DOI citation edge only from an authenticated, source-bound human match decision.
+    pub fn index_reviewed_crossref_reference(
+        &self,
+        session_id: &str,
+        review_artifact_id: &str,
+    ) -> Result<bool> {
+        let (kind, source, payload, stored_sha256): (String, String, String, String) = self.db.query_row(
+            "SELECT kind,source,payload,sha256 FROM research_artifacts WHERE id=?1 AND session_id=?2",
+            params![review_artifact_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).context("citation review artifact was not found in this research session")?;
+        anyhow::ensure!(
+            kind == "crossref_reference_resolution_adjudication"
+                && source == "authenticated researcher citation resolution review",
+            "citation edge requires a researcher citation review artifact"
+        );
+        anyhow::ensure!(
+            format!("{:x}", Sha256::digest(payload.as_bytes())) == stored_sha256,
+            "citation review artifact digest does not match its payload"
+        );
+        let review: serde_json::Value = serde_json::from_str(&payload)?;
+        anyhow::ensure!(
+            review.get("review_type").and_then(|v| v.as_str())
+                == Some("human_crossref_reference_resolution_adjudication"),
+            "artifact is not a human citation resolution review"
+        );
+        anyhow::ensure!(
+            review.get("decision").and_then(|v| v.as_str()) == Some("match"),
+            "only a researcher-confirmed match can create a citation edge"
+        );
+        let citing_doi = review
+            .get("citing_doi")
+            .and_then(|v| v.as_str())
+            .context("citation review is missing its citing DOI")?;
+        let cited_doi = review
+            .get("selected_cited_doi")
+            .and_then(|v| v.as_str())
+            .context("citation review is missing its selected cited DOI")?;
+        anyhow::ensure!(
+            valid_doi(citing_doi) && valid_doi(cited_doi),
+            "citation review contains an invalid DOI"
+        );
+        let reference_index = review
+            .get("reference_index")
+            .and_then(|v| v.as_i64())
+            .context("citation review has an invalid reference index")?;
+        anyhow::ensure!(
+            (0..200).contains(&reference_index),
+            "citation review reference index is outside the supported range"
+        );
+        let source_artifact_id = review
+            .get("candidate_artifact_id")
+            .and_then(|v| v.as_str())
+            .context("citation review is missing its candidate artifact")?;
+        let candidate_artifact_sha256 = review
+            .get("candidate_artifact_sha256")
+            .and_then(|v| v.as_str())
+            .context("citation review is missing its candidate artifact digest")?;
+        let (candidate_kind, candidate_source, candidate_payload, candidate_sha256): (String, String, String, String) = self.db.query_row(
+            "SELECT kind,source,payload,sha256 FROM research_artifacts WHERE id=?1 AND session_id=?2",
+            params![source_artifact_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).context("citation candidate artifact was not found in this research session")?;
+        anyhow::ensure!(
+            candidate_kind == "crossref_reference_resolution_candidates"
+                && candidate_source == "Crossref REST API"
+                && candidate_sha256 == candidate_artifact_sha256,
+            "citation review is not bound to the exact Crossref candidate artifact"
+        );
+        anyhow::ensure!(
+            format!("{:x}", Sha256::digest(candidate_payload.as_bytes())) == candidate_sha256,
+            "citation candidate artifact digest does not match its payload"
+        );
+        let candidates: serde_json::Value = serde_json::from_str(&candidate_payload)?;
+        anyhow::ensure!(
+            candidates.get("status").and_then(|v| v.as_str()) == Some("unverified_candidates"),
+            "citation candidate artifact has an unsupported status"
+        );
+        anyhow::ensure!(
+            candidates
+                .get("citing_doi")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(citing_doi)),
+            "citation candidate artifact has a different citing DOI"
+        );
+        anyhow::ensure!(
+            candidates.get("reference_index").and_then(|v| v.as_i64()) == Some(reference_index),
+            "citation candidate artifact has a different reference index"
+        );
+        anyhow::ensure!(
+            review.get("reference_sha256") == candidates.get("reference_sha256"),
+            "citation review reference digest differs from its candidate artifact"
+        );
+        let candidate_rows = candidates
+            .get("candidate_records")
+            .and_then(|v| v.as_array())
+            .context("citation candidate artifact has no record list")?;
+        anyhow::ensure!(
+            canonical_json_sha256(&serde_json::Value::Array(candidate_rows.clone()))?
+                == candidates
+                    .get("candidate_records_sha256")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            "citation candidate records do not match their digest"
+        );
+        anyhow::ensure!(
+            candidate_rows.iter().any(|row| row
+                .get("doi")
+                .and_then(|v| v.as_str())
+                .is_some_and(|doi| doi.eq_ignore_ascii_case(cited_doi))),
+            "selected DOI is not one of the retained Crossref candidates"
+        );
+        let original_artifact_id = review
+            .get("source_artifact_id")
+            .and_then(|v| v.as_str())
+            .context("citation review is missing its source Crossref artifact")?;
+        let original_artifact_sha256 = review
+            .get("source_artifact_sha256")
+            .and_then(|v| v.as_str())
+            .context("citation review is missing its source Crossref digest")?;
+        let (original_kind, original_source, original_payload, original_sha256): (String, String, String, String) = self.db.query_row(
+            "SELECT kind,source,payload,sha256 FROM research_artifacts WHERE id=?1 AND session_id=?2",
+            params![original_artifact_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).context("source Crossref artifact was not found in this research session")?;
+        anyhow::ensure!(
+            original_kind == "crossref_citation_metadata"
+                && original_source == "Crossref REST API"
+                && original_sha256 == original_artifact_sha256,
+            "citation review is not bound to the exact source Crossref artifact"
+        );
+        anyhow::ensure!(
+            format!("{:x}", Sha256::digest(original_payload.as_bytes())) == original_sha256,
+            "source Crossref artifact digest does not match its payload"
+        );
+        let original: serde_json::Value = serde_json::from_str(&original_payload)?;
+        let original_records = original
+            .get("records")
+            .and_then(|v| v.as_array())
+            .context("source Crossref artifact has no record list")?;
+        anyhow::ensure!(
+            canonical_json_sha256(&serde_json::Value::Array(original_records.clone()))?
+                == original
+                    .get("retained_records_sha256")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            "source Crossref records do not match their digest"
+        );
+        let reference = original_records
+            .iter()
+            .find(|row| {
+                row.get("doi")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|doi| doi.eq_ignore_ascii_case(citing_doi))
+            })
+            .and_then(|row| row.get("references").and_then(|v| v.as_array()))
+            .and_then(|references| {
+                references.iter().find(|row| {
+                    row.get("reference_index").and_then(|v| v.as_i64()) == Some(reference_index)
+                })
+            })
+            .context("citation review reference does not exist in its exact source record")?;
+        anyhow::ensure!(
+            reference
+                .get("doi_validated_by_pattern")
+                .and_then(|v| v.as_bool())
+                != Some(true),
+            "source reference already has a DOI"
+        );
+        anyhow::ensure!(
+            canonical_json_sha256(reference)?
+                == review
+                    .get("reference_sha256")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            "source reference differs from the researcher-adjudicated reference"
+        );
+        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO citation_links(session_id,citing_doi,cited_doi,source_artifact_id,reference_index,indexed_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![session_id, citing_doi.to_ascii_lowercase(), cited_doi.to_ascii_lowercase(), review_artifact_id, reference_index, now()?],
+        )?;
+        transaction.commit()?;
+        Ok(inserted == 1)
     }
     /// Rank papers by connectivity within the session's retained Crossref citation graph.
     /// These scores describe only the captured graph and are not evidence or paper quality.
@@ -4591,9 +5240,14 @@ impl Store {
             )?;
         }
         tx.execute("UPDATE research_tasks SET status=?3,attempts=attempts+CASE WHEN ?3='running' THEN 1 ELSE 0 END,output=CASE WHEN ?3='running' THEN NULL ELSE COALESCE(?4,output) END,error=CASE WHEN ?3 IN ('ready','running') THEN NULL ELSE ?5 END,lease_owner=CASE WHEN ?3='running' THEN lease_owner ELSE NULL END,lease_until=CASE WHEN ?3='running' THEN lease_until ELSE NULL END,available_at=CASE WHEN ?3='ready' THEN 0 ELSE available_at END WHERE session_id=?1 AND id=?2", params![session_id,task_id,next,output,error])?;
-        let mut detail = output
-            .map(|value| format!("output_recorded_bytes={}", value.len()))
-            .or_else(|| error.map(str::to_owned));
+        let mut detail =
+            if current == "needs_review" && matches!(next, "ready" | "succeeded" | "failed") {
+                output.map(str::to_owned)
+            } else {
+                output
+                    .map(|value| format!("output_recorded_bytes={}", value.len()))
+                    .or_else(|| error.map(str::to_owned))
+            };
         if let Some(worker_id) = worker_id {
             let worker_detail = format!("worker={worker_id}");
             detail = Some(match detail {
@@ -4658,6 +5312,85 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// Requeue a bounded semantic-claim screening task after an authenticated
+    /// researcher review. The task receipt must show work was omitted, and the
+    /// review rationale is retained in the task event before the worker resumes
+    /// from its existing checkpoint.
+    pub fn resume_semantic_claim_task(
+        &self,
+        session_id: &str,
+        reviewer_subject: &str,
+        reviewer_role: &str,
+        rationale: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !reviewer_subject.trim().is_empty() && reviewer_subject.len() <= 128,
+            "reviewer subject is invalid"
+        );
+        anyhow::ensure!(
+            matches!(reviewer_role, "researcher" | "platform_admin"),
+            "human scientific review requires researcher or platform_admin role"
+        );
+        anyhow::ensure!(
+            !rationale.trim().is_empty() && rationale.len() <= 2000,
+            "review rationale must contain 1..2000 characters"
+        );
+        let review = serde_json::json!({
+            "review_type": "human_scientific_review",
+            "decision": "resume",
+            "reviewer_subject": reviewer_subject,
+            "reviewer_role": reviewer_role,
+            "rationale": rationale.trim(),
+        });
+        let output = serde_json::to_string(&review)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let tx = self.db.unchecked_transaction()?;
+        let (status, prior_output, attempts, cancelled, credits_used, budget): (String, Option<String>, i64, i64, i64, i64) = tx.query_row(
+            "SELECT t.status,t.output,t.attempts,s.cancellation_requested,s.credits_used,s.budget FROM research_tasks t JOIN sessions s ON s.id=t.session_id WHERE t.session_id=?1 AND t.id='contradictions.search'",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )?;
+        anyhow::ensure!(
+            status == "needs_review",
+            "contradictions.search is not awaiting review"
+        );
+        anyhow::ensure!(
+            cancelled == 0,
+            "cancelled research sessions cannot resume tasks"
+        );
+        anyhow::ensure!(
+            credits_used < budget,
+            "research session has no execution credits remaining"
+        );
+        anyhow::ensure!(
+            attempts < 5,
+            "task has reached the maximum of 5 execution attempts"
+        );
+        let pending_pairs = prior_output
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| value.get("semantic_alignment_omitted_count")?.as_u64())
+            .unwrap_or(0);
+        anyhow::ensure!(
+            pending_pairs > 0,
+            "contradictions.search has no pending semantic pairs to resume"
+        );
+        tx.execute(
+            "UPDATE research_tasks SET status='ready',output=?3,error=NULL,lease_owner=NULL,lease_until=NULL,available_at=0 WHERE session_id=?1 AND id='contradictions.search'",
+            params![session_id, "contradictions.search", output],
+        )?;
+        tx.execute(
+            "INSERT INTO task_events(session_id,task_id,from_status,to_status,occurred_at,details) VALUES(?1,'contradictions.search','needs_review','ready',?2,?3)",
+            params![session_id, now, output],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET status=CASE WHEN EXISTS(SELECT 1 FROM research_tasks WHERE session_id=?1 AND status='running') THEN 'running' WHEN EXISTS(SELECT 1 FROM research_tasks WHERE session_id=?1 AND status='needs_review') THEN 'needs_review' WHEN EXISTS(SELECT 1 FROM research_tasks WHERE session_id=?1 AND status='failed') THEN 'failed' ELSE 'planned' END WHERE id=?1",
+            [session_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn add_evidence(&self, e: &Evidence) -> Result<()> {
         anyhow::ensure!(!e.claim.trim().is_empty(), "claim cannot be empty");
         anyhow::ensure!(!e.source.trim().is_empty(), "source cannot be empty");
@@ -4700,29 +5433,143 @@ impl Store {
         })?
         .collect::<rusqlite::Result<_>>()?)
     }
+    /// Read a bounded evidence page in stable identifier order for API snapshots.
+    pub fn evidence_page(
+        &self,
+        session_id: &str,
+        after_id: Option<&str>,
+        snapshot_rowid: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Evidence>, bool, i64)> {
+        anyhow::ensure!(
+            (1..=500).contains(&limit),
+            "evidence page limit must be 1..500"
+        );
+        anyhow::ensure!(
+            after_id.is_some() == snapshot_rowid.is_some(),
+            "evidence cursor and snapshot rowid must be provided together"
+        );
+        if let Some(rowid) = snapshot_rowid {
+            anyhow::ensure!(rowid >= 0, "evidence snapshot rowid cannot be negative");
+        }
+        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
+        let snapshot_rowid = match snapshot_rowid {
+            Some(rowid) => rowid,
+            None => transaction.query_row(
+                "SELECT COALESCE(MAX(rowid),0) FROM evidence WHERE session_id=?1",
+                [session_id],
+                |row| row.get(0),
+            )?,
+        };
+        let current_max_rowid: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(rowid),0) FROM evidence WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            snapshot_rowid <= current_max_rowid,
+            "evidence snapshot rowid exceeds the current session history"
+        );
+        let has_cursor = after_id.is_some();
+        let mut statement = transaction.prepare(
+            "SELECT id,session_id,claim,source,source_id,polarity,quality,provenance FROM evidence WHERE session_id=?1 AND rowid<=?2 AND (?3=0 OR id>?4) ORDER BY id LIMIT ?5",
+        )?;
+        let mut rows = statement
+            .query_map(
+                params![
+                    session_id,
+                    snapshot_rowid,
+                    has_cursor,
+                    after_id.unwrap_or_default(),
+                    (limit + 1) as i64
+                ],
+                |row| {
+                    Ok(Evidence {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        claim: row.get(2)?,
+                        source: row.get(3)?,
+                        source_id: row.get(4)?,
+                        polarity: row.get(5)?,
+                        quality: row.get(6)?,
+                        provenance: row.get(7)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        drop(statement);
+        transaction.commit()?;
+        Ok((rows, has_more, snapshot_rowid))
+    }
     pub fn put_node(&self, n: &GraphNode) -> Result<()> {
         anyhow::ensure!(
-            !n.session_id.trim().is_empty(),
-            "graph node requires a research session"
+            !n.session_id.trim().is_empty() && n.session_id.len() <= MAX_GRAPH_SESSION_ID_BYTES,
+            "graph node requires a bounded research session identifier"
+        );
+        anyhow::ensure!(
+            !n.id.trim().is_empty() && n.id.len() <= MAX_GRAPH_IDENTIFIER_BYTES,
+            "graph node requires a bounded identifier"
+        );
+        anyhow::ensure!(
+            !n.kind.trim().is_empty() && n.kind.len() <= MAX_GRAPH_KIND_BYTES,
+            "graph node requires a bounded kind"
+        );
+        anyhow::ensure!(
+            !n.label.trim().is_empty() && n.label.len() <= MAX_GRAPH_LABEL_BYTES,
+            "graph node requires a bounded label"
+        );
+        anyhow::ensure!(
+            n.metadata.len() <= MAX_GRAPH_METADATA_BYTES,
+            "graph node metadata exceeds the size limit"
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(&n.metadata).context("graph node metadata must be JSON")?;
+        anyhow::ensure!(
+            metadata.is_object(),
+            "graph node metadata must be a JSON object"
         );
         self.db.execute("INSERT INTO graph_nodes VALUES(?1,?2,?3,?4,?5) ON CONFLICT(session_id,id) DO UPDATE SET kind=excluded.kind,label=excluded.label,metadata=excluded.metadata",params![n.session_id,n.id,n.kind,n.label,n.metadata])?;
         Ok(())
     }
     pub fn put_edge(&self, e: &GraphEdge) -> Result<()> {
         anyhow::ensure!(
-            !e.source.trim().is_empty()
+            !e.session_id.trim().is_empty()
+                && e.session_id.len() <= MAX_GRAPH_SESSION_ID_BYTES
+                && !e.source.trim().is_empty()
+                && e.source.len() <= MAX_GRAPH_IDENTIFIER_BYTES
                 && !e.target.trim().is_empty()
+                && e.target.len() <= MAX_GRAPH_IDENTIFIER_BYTES
                 && !e.relation.trim().is_empty(),
-            "edge source, relation, and target are required"
+            "edge session, source, relation, and target must be present and bounded"
+        );
+        anyhow::ensure!(
+            e.relation.len() <= MAX_GRAPH_IDENTIFIER_BYTES,
+            "graph edge relation exceeds the size limit"
         );
         anyhow::ensure!(
             (0.0..=1.0).contains(&e.confidence),
             "confidence must be 0..1"
         );
+        anyhow::ensure!(
+            e.evidence_ids.len() + e.artifact_ids.len() <= MAX_GRAPH_PROVENANCE_BYTES,
+            "graph edge provenance exceeds the serialized size limit"
+        );
         let evidence_ids: Vec<String> = serde_json::from_str(&e.evidence_ids)
             .context("evidence_ids must be a JSON array of evidence identifiers")?;
         let artifact_ids: Vec<String> = serde_json::from_str(&e.artifact_ids)
             .context("artifact_ids must be a JSON array of research artifact identifiers")?;
+        anyhow::ensure!(
+            evidence_ids.len() + artifact_ids.len() <= MAX_GRAPH_PROVENANCE_ITEMS,
+            "graph edge provenance exceeds the item limit"
+        );
+        for identifier in evidence_ids.iter().chain(artifact_ids.iter()) {
+            anyhow::ensure!(
+                !identifier.trim().is_empty() && identifier.len() <= MAX_GRAPH_IDENTIFIER_BYTES,
+                "graph edge provenance identifiers must be non-empty and bounded"
+            );
+        }
         anyhow::ensure!(
             !evidence_ids.is_empty() || !artifact_ids.is_empty(),
             "graph relationships require at least one evidence record or source artifact"
@@ -4771,6 +5618,11 @@ impl Store {
         {
             Some((existing_confidence, existing_evidence, existing_artifacts)) => {
                 anyhow::ensure!(
+                    existing_evidence.len() + existing_artifacts.len()
+                        <= MAX_GRAPH_PROVENANCE_BYTES,
+                    "stored graph edge provenance exceeds the serialized size limit"
+                );
+                anyhow::ensure!(
                     existing_confidence == e.confidence,
                     "graph edge confidence is immutable; represent source-specific confidence on separate assertion nodes"
                 );
@@ -4778,6 +5630,18 @@ impl Store {
                     .context("stored graph edge evidence identifiers are invalid JSON")?;
                 let existing_artifacts: Vec<String> = serde_json::from_str(&existing_artifacts)
                     .context("stored graph edge artifact identifiers are invalid JSON")?;
+                anyhow::ensure!(
+                    existing_evidence.len() + existing_artifacts.len()
+                        <= MAX_GRAPH_PROVENANCE_ITEMS,
+                    "stored graph edge provenance exceeds the item limit"
+                );
+                for identifier in existing_evidence.iter().chain(existing_artifacts.iter()) {
+                    anyhow::ensure!(
+                        !identifier.trim().is_empty()
+                            && identifier.len() <= MAX_GRAPH_IDENTIFIER_BYTES,
+                        "stored graph edge provenance identifiers are not bounded"
+                    );
+                }
                 let mut existing_unique = std::collections::HashSet::new();
                 anyhow::ensure!(
                     existing_evidence
@@ -4800,8 +5664,16 @@ impl Store {
         };
         evidence_set.extend(evidence_ids);
         artifact_set.extend(artifact_ids);
+        anyhow::ensure!(
+            evidence_set.len() + artifact_set.len() <= MAX_GRAPH_PROVENANCE_ITEMS,
+            "merged graph edge provenance exceeds the item limit"
+        );
         let evidence_json = serde_json::to_string(&evidence_set)?;
         let artifacts_json = serde_json::to_string(&artifact_set)?;
+        anyhow::ensure!(
+            evidence_json.len() + artifacts_json.len() <= MAX_GRAPH_PROVENANCE_BYTES,
+            "merged graph edge provenance exceeds the serialized size limit"
+        );
         transaction.execute("INSERT INTO graph_edges(session_id,source,relation,target,confidence,evidence_ids,artifact_ids) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(session_id,source,relation,target) DO UPDATE SET evidence_ids=excluded.evidence_ids,artifact_ids=excluded.artifact_ids",params![e.session_id,e.source,e.relation,e.target,confidence,evidence_json,artifacts_json])?;
         transaction.commit()?;
         Ok(())
@@ -4836,6 +5708,149 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok((nodes, edges))
+    }
+    /// Read independently ordered node and edge pages using stable keyset cursors.
+    /// `limit` is deliberately capped here so callers cannot accidentally request
+    /// an unbounded graph through the API.
+    pub fn graph_page(
+        &self,
+        session_id: &str,
+        after_node: Option<(&str, &str)>,
+        after_edge: Option<(&str, &str, &str)>,
+        include_nodes: bool,
+        include_edges: bool,
+        limit: usize,
+    ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>, bool, bool)> {
+        anyhow::ensure!(
+            (1..=500).contains(&limit),
+            "graph page limit must be 1..500"
+        );
+        let (node_label, node_id) = after_node.unwrap_or(("", ""));
+        let has_node_cursor = after_node.is_some();
+        let mut node_statement = self.db.prepare(
+            "SELECT session_id,id,kind,label,metadata FROM graph_nodes WHERE session_id=?1 AND (?2=0 OR (label,id)>(?3,?4)) ORDER BY label,id LIMIT ?5",
+        )?;
+        let mut nodes = if include_nodes {
+            node_statement
+                .query_map(
+                    params![
+                        session_id,
+                        has_node_cursor,
+                        node_label,
+                        node_id,
+                        (limit + 1) as i64
+                    ],
+                    |r| {
+                        Ok(GraphNode {
+                            session_id: r.get(0)?,
+                            id: r.get(1)?,
+                            kind: r.get(2)?,
+                            label: r.get(3)?,
+                            metadata: r.get(4)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let has_more_nodes = nodes.len() > limit;
+        nodes.truncate(limit);
+
+        let (edge_source, edge_relation, edge_target) = after_edge.unwrap_or(("", "", ""));
+        let has_edge_cursor = after_edge.is_some();
+        let mut edge_statement = self.db.prepare(
+            "SELECT session_id,source,relation,target,confidence,evidence_ids,artifact_ids FROM graph_edges WHERE session_id=?1 AND (?2=0 OR (source,relation,target)>(?3,?4,?5)) ORDER BY source,relation,target LIMIT ?6",
+        )?;
+        let mut edges = if include_edges {
+            edge_statement
+                .query_map(
+                    params![
+                        session_id,
+                        has_edge_cursor,
+                        edge_source,
+                        edge_relation,
+                        edge_target,
+                        (limit + 1) as i64
+                    ],
+                    |r| {
+                        Ok(GraphEdge {
+                            session_id: r.get(0)?,
+                            source: r.get(1)?,
+                            relation: r.get(2)?,
+                            target: r.get(3)?,
+                            confidence: r.get(4)?,
+                            evidence_ids: r.get(5)?,
+                            artifact_ids: r.get(6)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let has_more_edges = edges.len() > limit;
+        edges.truncate(limit);
+        Ok((nodes, edges, has_more_nodes, has_more_edges))
+    }
+    /// Search graph entities in SQLite and return their incident relationships.
+    /// Result ceilings are explicit to keep interactive discovery bounded.
+    pub fn graph_search(
+        &self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>, bool, bool)> {
+        anyhow::ensure!(
+            !query.trim().is_empty() && query.len() <= 256,
+            "graph query must contain 1..256 bytes"
+        );
+        anyhow::ensure!(
+            (1..=100).contains(&limit),
+            "graph search limit must be 1..100"
+        );
+        let node_sql = "SELECT session_id,id,kind,label,metadata FROM graph_nodes WHERE session_id=?1 AND (instr(lower(id),lower(?2))>0 OR instr(lower(label),lower(?2))>0 OR instr(lower(kind),lower(?2))>0) ORDER BY label,id LIMIT ?3";
+        let mut node_statement = self.db.prepare(node_sql)?;
+        let mut nodes = node_statement
+            .query_map(params![session_id, query.trim(), (limit + 1) as i64], |r| {
+                Ok(GraphNode {
+                    session_id: r.get(0)?,
+                    id: r.get(1)?,
+                    kind: r.get(2)?,
+                    label: r.get(3)?,
+                    metadata: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more_nodes = nodes.len() > limit;
+        nodes.truncate(limit);
+        let edge_sql = "SELECT session_id,source,relation,target,confidence,evidence_ids,artifact_ids FROM graph_edges WHERE session_id=?1 AND (source IN (SELECT id FROM graph_nodes WHERE session_id=?1 AND (instr(lower(id),lower(?2))>0 OR instr(lower(label),lower(?2))>0 OR instr(lower(kind),lower(?2))>0) ORDER BY label,id LIMIT ?3) OR target IN (SELECT id FROM graph_nodes WHERE session_id=?1 AND (instr(lower(id),lower(?2))>0 OR instr(lower(label),lower(?2))>0 OR instr(lower(kind),lower(?2))>0) ORDER BY label,id LIMIT ?3)) ORDER BY source,relation,target LIMIT ?4";
+        let edge_limit = (limit * 5).min(500);
+        let mut edge_statement = self.db.prepare(edge_sql)?;
+        let mut edges = edge_statement
+            .query_map(
+                params![
+                    session_id,
+                    query.trim(),
+                    limit as i64,
+                    (edge_limit + 1) as i64
+                ],
+                |r| {
+                    Ok(GraphEdge {
+                        session_id: r.get(0)?,
+                        source: r.get(1)?,
+                        relation: r.get(2)?,
+                        target: r.get(3)?,
+                        confidence: r.get(4)?,
+                        evidence_ids: r.get(5)?,
+                        artifact_ids: r.get(6)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more_edges = edges.len() > edge_limit;
+        edges.truncate(edge_limit);
+        Ok((nodes, edges, has_more_nodes, has_more_edges))
     }
     pub fn register_capability(&self, c: &Capability) -> Result<()> {
         self.db.execute("INSERT INTO capabilities VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id,version) DO UPDATE SET status=excluded.status,description=excluded.description,manifest=excluded.manifest",params![c.id,c.version,c.kind,c.status,c.description,c.manifest])?;
@@ -5187,6 +6202,30 @@ impl Store {
     }
 }
 
+fn prepare_private_database_file(path: &Path) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(file) => file
+            .sync_all()
+            .context("sync private MedAI database file")?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("create private MedAI database file"),
+    }
+    let metadata = fs::symlink_metadata(path).context("inspect MedAI database path")?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "MedAI database path must be a regular file, not a symlink or special file"
+    );
+    set_private_file(path).context("restrict MedAI database file permissions")?;
+    Ok(())
+}
+
 struct PrivateDirectory {
     path: PathBuf,
 }
@@ -5360,6 +6399,22 @@ fn validate_restore_schema(connection: &Connection) -> Result<()> {
             "versioned MedAI restore source is missing model reservation actor provenance"
         );
     }
+    if version >= 4 {
+        let pending_table: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='literature_watch_pending')",
+            [],
+            |row| row.get(0),
+        )?;
+        let event_columns: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('literature_watch_events') WHERE name='metadata_pending_count') AND EXISTS(SELECT 1 FROM pragma_table_info('literature_watch_events') WHERE name='metadata_overflow_count')",
+            [],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            pending_table && event_columns,
+            "versioned MedAI restore source is missing literature watch metadata schema"
+        );
+    }
     Ok(())
 }
 
@@ -5417,6 +6472,202 @@ fn sync_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    #[test]
+    fn graph_pages_use_independent_stable_cursors_and_enforce_limits() -> Result<()> {
+        let path = store_path();
+        let store = Store::open(&path)?;
+        let session = store.create_session("paged graph")?;
+        store.add_evidence(&Evidence {
+            id: "page-evidence".into(),
+            session_id: session.id.clone(),
+            claim: "supports a test graph edge".into(),
+            source: "test corpus".into(),
+            source_id: None,
+            polarity: "supports".into(),
+            quality: 0.8,
+            provenance: "{}".into(),
+        })?;
+        for (id, label) in [("n-2", "Beta"), ("n-1", "Alpha"), ("n-3", "Gamma")] {
+            store.put_node(&GraphNode {
+                session_id: session.id.clone(),
+                id: id.into(),
+                kind: "Gene".into(),
+                label: label.into(),
+                metadata: "{}".into(),
+            })?;
+        }
+        for (source, relation, target) in [
+            ("n-1", "A", "n-2"),
+            ("n-1", "B", "n-3"),
+            ("n-2", "A", "n-3"),
+        ] {
+            store.put_edge(&GraphEdge {
+                session_id: session.id.clone(),
+                source: source.into(),
+                relation: relation.into(),
+                target: target.into(),
+                confidence: 0.8,
+                evidence_ids: "[\"page-evidence\"]".into(),
+                artifact_ids: "[]".into(),
+            })?;
+        }
+        let (nodes_one, edges_one, more_nodes, more_edges) =
+            store.graph_page(&session.id, None, None, true, true, 2)?;
+        assert!(more_nodes && more_edges);
+        let last_node = nodes_one.last().unwrap();
+        let last_edge = edges_one.last().unwrap();
+        let (nodes_two, edges_two, more_nodes, more_edges) = store.graph_page(
+            &session.id,
+            Some((&last_node.label, &last_node.id)),
+            Some((&last_edge.source, &last_edge.relation, &last_edge.target)),
+            true,
+            true,
+            2,
+        )?;
+        assert!(!more_nodes && !more_edges);
+        assert_eq!(
+            nodes_one
+                .iter()
+                .chain(nodes_two.iter())
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["n-1", "n-2", "n-3"]
+        );
+        assert_eq!(
+            edges_one
+                .iter()
+                .chain(edges_two.iter())
+                .map(|e| (e.source.as_str(), e.relation.as_str(), e.target.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("n-1", "A", "n-2"),
+                ("n-1", "B", "n-3"),
+                ("n-2", "A", "n-3")
+            ]
+        );
+        let (exhausted_nodes, exhausted_edges, _, _) =
+            store.graph_page(&session.id, None, None, false, false, 500)?;
+        assert!(exhausted_nodes.is_empty());
+        assert!(exhausted_edges.is_empty());
+        assert!(
+            store
+                .graph_page(&session.id, None, None, true, true, 501)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pages_use_stable_session_scoped_cursors_and_limits() -> Result<()> {
+        let path = store_path();
+        let store = Store::open(&path)?;
+        let session = store.create_session("paged evidence")?;
+        let foreign = store.create_session("foreign evidence")?;
+        for (owner, id) in [
+            (&session, "EVD-003"),
+            (&session, "EVD-001"),
+            (&session, "EVD-002"),
+            (&foreign, "EVD-000"),
+        ] {
+            store.add_evidence(&Evidence {
+                id: id.into(),
+                session_id: owner.id.clone(),
+                claim: "bounded page test".into(),
+                source: "test".into(),
+                source_id: None,
+                polarity: "supports".into(),
+                quality: 0.5,
+                provenance: "{}".into(),
+            })?;
+        }
+        let (first, has_more, snapshot_rowid) = store.evidence_page(&session.id, None, None, 2)?;
+        assert!(has_more);
+        assert_eq!(
+            first.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["EVD-001", "EVD-002"]
+        );
+        store.add_evidence(&Evidence {
+            id: "EVD-0025".into(),
+            session_id: session.id.clone(),
+            claim: "inserted after snapshot capture".into(),
+            source: "test".into(),
+            source_id: None,
+            polarity: "supports".into(),
+            quality: 0.5,
+            provenance: "{}".into(),
+        })?;
+        let (last, has_more, next_snapshot_rowid) =
+            store.evidence_page(&session.id, Some(&first[1].id), Some(snapshot_rowid), 2)?;
+        assert!(!has_more);
+        assert_eq!(next_snapshot_rowid, snapshot_rowid);
+        assert_eq!(
+            last.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["EVD-003"]
+        );
+        assert!(store.evidence_page(&session.id, None, None, 0).is_err());
+        assert!(store.evidence_page(&session.id, None, None, 501).is_err());
+        assert!(
+            store
+                .evidence_page(&session.id, Some("EVD-001"), None, 1)
+                .is_err()
+        );
+        drop(store);
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_search_is_session_scoped_bounded_and_reports_truncation() -> Result<()> {
+        let path = store_path();
+        let store = Store::open(&path)?;
+        let session = store.create_session("graph search")?;
+        let foreign = store.create_session("foreign graph search")?;
+        for (owner, id, label) in [
+            (&session, "gene-a", "Alpha"),
+            (&session, "gene-b", "Alpha beta"),
+            (&foreign, "gene-c", "Alpha foreign"),
+        ] {
+            store.put_node(&GraphNode {
+                session_id: owner.id.clone(),
+                id: id.into(),
+                kind: "Gene".into(),
+                label: label.into(),
+                metadata: "{}".into(),
+            })?;
+        }
+        store.add_evidence(&Evidence {
+            id: "graph-search-evidence".into(),
+            session_id: session.id.clone(),
+            claim: "test relationship".into(),
+            source: "test corpus".into(),
+            source_id: None,
+            polarity: "supports".into(),
+            quality: 0.8,
+            provenance: "{}".into(),
+        })?;
+        for index in 0..6 {
+            store.put_edge(&GraphEdge {
+                session_id: session.id.clone(),
+                source: "gene-a".into(),
+                relation: format!("RELATED_TO_{index}"),
+                target: "gene-b".into(),
+                confidence: 0.8,
+                evidence_ids: "[\"graph-search-evidence\"]".into(),
+                artifact_ids: "[]".into(),
+            })?;
+        }
+        let (nodes, edges, more_nodes, more_edges) = store.graph_search(&session.id, "alpha", 1)?;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "gene-a");
+        assert_eq!(edges.len(), 5);
+        assert_eq!(edges[0].target, "gene-b");
+        assert!(more_nodes);
+        assert!(more_edges);
+        assert!(store.graph_search(&session.id, "", 1).is_err());
+        assert!(store.graph_search(&session.id, "alpha", 101).is_err());
+        Ok(())
+    }
 
     #[test]
     fn graph_edges_accept_only_same_session_source_artifacts_as_provenance() -> Result<()> {
@@ -5512,6 +6763,112 @@ mod scheduler_tests {
         assert!(store.put_edge(&foreign_edge).is_err());
         drop(store);
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_writes_enforce_bounded_fields_and_object_metadata() -> Result<()> {
+        let path = store_path();
+        let store = Store::open(&path)?;
+        let session = store.create_session("bounded graph")?;
+        let node = GraphNode {
+            session_id: session.id.clone(),
+            id: "gene-a".into(),
+            kind: "Gene".into(),
+            label: "Gene A".into(),
+            metadata: "{}".into(),
+        };
+        store.put_node(&node)?;
+        assert!(
+            store
+                .put_node(&GraphNode {
+                    metadata: "[]".into(),
+                    ..node.clone()
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .put_node(&GraphNode {
+                    metadata: "x".repeat(MAX_GRAPH_METADATA_BYTES + 1),
+                    ..node.clone()
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .put_node(&GraphNode {
+                    id: "x".repeat(MAX_GRAPH_IDENTIFIER_BYTES + 1),
+                    ..node.clone()
+                })
+                .is_err()
+        );
+
+        let evidence_id = "bounded-graph-evidence";
+        store.add_evidence(&Evidence {
+            id: evidence_id.into(),
+            session_id: session.id.clone(),
+            claim: "supports a bounded graph edge".into(),
+            source: "test".into(),
+            source_id: None,
+            polarity: "supports".into(),
+            quality: 0.8,
+            provenance: "{}".into(),
+        })?;
+        let edge = GraphEdge {
+            session_id: session.id.clone(),
+            source: "gene-a".into(),
+            relation: "ASSOCIATED_WITH".into(),
+            target: "gene-b".into(),
+            confidence: 0.8,
+            evidence_ids: serde_json::to_string(&vec![evidence_id])?,
+            artifact_ids: "[]".into(),
+        };
+        store.put_node(&GraphNode {
+            id: "gene-b".into(),
+            ..node
+        })?;
+        store.put_edge(&edge)?;
+        let excessive = GraphEdge {
+            evidence_ids: serde_json::to_string(&vec![
+                "evidence".to_owned();
+                MAX_GRAPH_PROVENANCE_ITEMS + 1
+            ])?,
+            ..edge.clone()
+        };
+        assert!(store.put_edge(&excessive).is_err());
+        let stored_provenance = serde_json::to_string(
+            &(0..MAX_GRAPH_PROVENANCE_ITEMS)
+                .map(|index| format!("historical-{index}"))
+                .collect::<Vec<_>>(),
+        )?;
+        store.db.execute(
+            "UPDATE graph_edges SET evidence_ids=?1 WHERE session_id=?2 AND source=?3 AND relation=?4 AND target=?5",
+            params![stored_provenance, session.id, "gene-a", "ASSOCIATED_WITH", "gene-b"],
+        )?;
+        let additional_evidence_id = "bounded-graph-evidence-2";
+        store.add_evidence(&Evidence {
+            id: additional_evidence_id.into(),
+            session_id: session.id.clone(),
+            claim: "adds provenance beyond the merged bound".into(),
+            source: "test".into(),
+            source_id: None,
+            polarity: "supports".into(),
+            quality: 0.8,
+            provenance: "{}".into(),
+        })?;
+        let cumulative_overflow = GraphEdge {
+            evidence_ids: serde_json::to_string(&vec![additional_evidence_id])?,
+            ..edge.clone()
+        };
+        assert!(store.put_edge(&cumulative_overflow).is_err());
+        let blank_provenance = GraphEdge {
+            evidence_ids: "[\" \"]".into(),
+            ..edge
+        };
+        assert!(store.put_edge(&blank_provenance).is_err());
+        drop(store);
+        let _ = fs::remove_file(path);
         Ok(())
     }
 
@@ -6310,7 +7667,10 @@ mod scheduler_tests {
             "candidate_proposal_artifact_sha256":proposal_sha256, "candidate_source_sha256":source_sha256,
             "candidate_proposal_signature":{"verified":true}, "baseline_proposal_signature":{"verified":true},
             "benchmark_sha256":"a".repeat(64), "comparison_sha256":"b".repeat(64),
-            "execution_receipt_sha256":"c".repeat(64), "n":10
+            "execution_receipt_sha256":"c".repeat(64), "n":10,
+            "candidate":{"passed":10,"pass_rate":1.0},
+            "repeat_consistency":{"candidate_all_repeats_passed":true},
+            "repeat_stability":{"all_outcomes_stable":true,"candidate_unstable_case_ids":[]}
         }).to_string();
         let benchmark_id = "ART-BENCHMARK";
         let benchmark_sha256 = format!("{:x}", Sha256::digest(benchmark_payload.as_bytes()));
@@ -6341,6 +7701,52 @@ mod scheduler_tests {
             "1.0.0",
             &manifest,
             &validation,
+        )?;
+
+        for (pointer, value) in [
+            ("/candidate/passed", serde_json::json!(9)),
+            (
+                "/repeat_consistency/candidate_all_repeats_passed",
+                serde_json::json!(false),
+            ),
+            (
+                "/repeat_stability/all_outcomes_stable",
+                serde_json::json!(false),
+            ),
+            (
+                "/repeat_stability/candidate_unstable_case_ids",
+                serde_json::json!(["case-1"]),
+            ),
+        ] {
+            let mut forged: serde_json::Value = serde_json::from_str(&benchmark_payload)?;
+            *forged
+                .pointer_mut(pointer)
+                .context("benchmark gate test path missing")? = value;
+            let forged_payload = forged.to_string();
+            let forged_sha256 = format!("{:x}", Sha256::digest(forged_payload.as_bytes()));
+            store.db.execute(
+                "UPDATE research_artifacts SET payload=?1,sha256=?2 WHERE id=?3",
+                params![forged_payload, forged_sha256, benchmark_id],
+            )?;
+            let forged_validation = serde_json::json!({"benchmark_receipt":{
+                "session_id":session.id, "artifact_id":benchmark_id, "artifact_sha256":forged_sha256
+            }})
+            .to_string();
+            assert!(
+                validate_paired_benchmark_artifact(
+                    &store.db,
+                    "biomedical.generated.example-1234567890abcdef",
+                    "1.0.0",
+                    &manifest,
+                    &forged_validation,
+                )
+                .is_err(),
+                "promotion gate accepted invalid benchmark field {pointer}"
+            );
+        }
+        store.db.execute(
+            "UPDATE research_artifacts SET payload=?1,sha256=?2 WHERE id=?3",
+            params![benchmark_payload, benchmark_sha256, benchmark_id],
         )?;
 
         let wrong_manifest = manifest.replace("ART-SOURCE", "ART-OTHER");
@@ -6454,6 +7860,115 @@ mod scheduler_tests {
         drop(store);
         let _ = fs::remove_file(database);
         let _ = fs::remove_file(backup);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_database_files_are_private_and_symlink_paths_are_rejected() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let path = store_path();
+        let store = Store::open(&path)?;
+        store.create_session("private database permissions")?;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        for sidecar in [
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            if Path::new(&sidecar).exists() {
+                assert_eq!(fs::metadata(&sidecar)?.permissions().mode() & 0o077, 0);
+            }
+        }
+        drop(store);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        let reopened = Store::open(&path)?;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        drop(reopened);
+
+        let alias = path.with_extension("sqlite-link");
+        symlink(&path, &alias)?;
+        let error = match Store::open(&alias) {
+            Ok(_) => anyhow::bail!("SQLite must not open a symlink database path"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("regular file"));
+
+        let _ = fs::remove_file(alias);
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn backup_retention_is_verified_dry_run_by_default_and_digest_bound_on_apply() -> Result<()> {
+        let database = store_path();
+        let directory = database.with_extension("retention");
+        fs::create_dir_all(&directory)?;
+        let store = Store::open(&database)?;
+        store.create_session("backup retention plan")?;
+        for name in ["a.sqlite", "b.sqlite", "c.sqlite"] {
+            store.backup(directory.join(name))?;
+        }
+        let now_unix = 9_000_000_000;
+        assert!(Store::plan_backup_retention(&directory, 0, 90, now_unix).is_err());
+        assert!(Store::plan_backup_retention(&directory, 1, 0, now_unix).is_err());
+        let plan = Store::plan_backup_retention(&directory, 1, 90, now_unix)?;
+        assert_eq!(
+            plan.entries
+                .iter()
+                .filter(|row| row.action == "retain")
+                .count(),
+            1
+        );
+        assert_eq!(
+            plan.entries
+                .iter()
+                .filter(|row| row.action == "delete")
+                .count(),
+            2
+        );
+        assert!(plan.entries.iter().all(|row| row.sha256.len() == 64));
+        assert!(Store::apply_backup_retention(&plan, &"0".repeat(64), now_unix).is_err());
+        assert_eq!(
+            fs::read_dir(&directory)?.count(),
+            3,
+            "a mismatched confirmation must not delete files"
+        );
+
+        let receipt = Store::apply_backup_retention(&plan, &plan.plan_sha256, now_unix)?;
+        assert_eq!(receipt.deleted.len(), 2);
+        assert_eq!(receipt.retained, 1);
+        assert_eq!(fs::read_dir(&directory)?.count(), 1);
+        let retained = fs::read_dir(&directory)?.next().unwrap()?.path();
+        assert_eq!(Store::verify_backup(retained)?.integrity_check, "ok");
+
+        drop(store);
+        let _ = fs::remove_file(database);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn backup_retention_fails_closed_on_corrupt_sqlite_candidate() -> Result<()> {
+        let database = store_path();
+        let directory = database.with_extension("retention-corrupt");
+        fs::create_dir_all(&directory)?;
+        let store = Store::open(&database)?;
+        let backup = directory.join("good.sqlite");
+        store.backup(&backup)?;
+        fs::write(directory.join("bad.sqlite"), b"not a database")?;
+        let unrelated = directory.join("unrelated.sqlite");
+        Connection::open(&unrelated)?.execute_batch("CREATE TABLE unrelated (value TEXT);")?;
+        assert!(Store::plan_backup_retention(&directory, 1, 30, 9_000_000_000).is_err());
+        assert_eq!(
+            fs::read_dir(&directory)?.count(),
+            3,
+            "planning must never remove a candidate"
+        );
+        drop(store);
+        let _ = fs::remove_file(database);
+        fs::remove_dir_all(directory)?;
         Ok(())
     }
 
@@ -6853,22 +8368,42 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn schema_v1_migrates_model_budget_reservations_atomically_to_v2() -> Result<()> {
+    fn schema_v1_migrates_model_budget_and_literature_watch_metadata_atomically_to_v4() -> Result<()>
+    {
         let path = store_path();
         let store = Store::open(&path)?;
-        store.db.execute_batch("DROP TABLE model_budget_reservations; DROP TABLE artifact_redactions; PRAGMA user_version=1;")?;
+        let session = store.create_session("legacy literature watch migration")?;
+        let watch = store.register_literature_watch(&session.id, "APOE", 86_400)?;
+        store.db.execute(
+            "UPDATE literature_watches SET last_pmids=?3 WHERE session_id=?1 AND watch_id=?2",
+            params![session.id, watch.watch_id, "[\"12345\"]"],
+        )?;
+        store.db.execute(
+            "INSERT INTO literature_watch_events(id,session_id,watch_id,captured_at,snapshot_sha256,result_count,retrieved_count,incomplete,new_pmids) VALUES('LW-LEGACY',?1,?2,1,?3,1,1,0,'[]')",
+            params![session.id, watch.watch_id, "a".repeat(64)],
+        )?;
+        store.db.execute_batch("ALTER TABLE literature_watch_events DROP COLUMN metadata_overflow_count; ALTER TABLE literature_watch_events DROP COLUMN metadata_pending_count; DROP TABLE literature_watch_pending; DROP TABLE model_budget_reservations; DROP TABLE artifact_redactions; PRAGMA user_version=1;")?;
         drop(store);
         let migrated = Store::open(&path)?;
         let version: i64 = migrated
             .db
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
         let table_exists: bool = migrated.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_budget_reservations') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_redactions') AND EXISTS(SELECT 1 FROM pragma_table_info('model_budget_reservations') WHERE name='actor')",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_budget_reservations') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_redactions') AND EXISTS(SELECT 1 FROM pragma_table_info('model_budget_reservations') WHERE name='actor') AND EXISTS(SELECT 1 FROM pragma_table_info('literature_watch_events') WHERE name='metadata_pending_count') AND EXISTS(SELECT 1 FROM pragma_table_info('literature_watch_events') WHERE name='metadata_overflow_count') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='literature_watch_pending')",
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
         assert!(table_exists);
+        let pending_pmid: String = migrated.db.query_row(
+            "SELECT pmid FROM literature_watch_pending WHERE session_id=?1 AND watch_id=?2",
+            params![session.id, watch.watch_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pending_pmid, "12345");
+        let legacy_event = migrated.literature_watch_events(&session.id, &watch.watch_id)?;
+        assert_eq!(legacy_event[0].metadata_pending_count, None);
+        assert_eq!(legacy_event[0].metadata_overflow_count, None);
         migrated
             .db
             .execute_batch("DROP TABLE artifact_redactions;")?;
@@ -7319,14 +8854,25 @@ mod scheduler_tests {
         let literature = store
             .claim_ready_tasks(&session.id, "worker", 1, 60)?
             .remove(0);
-        let payload = r#"{"source":"Crossref REST API","complete_result_sha256":"0000000000000000000000000000000000000000000000000000000000000000","records":[{"doi":"10.1234/citing","references":[{"DOI":"10.5678/cited","reference_index":0},{"DOI":"not-a-doi","reference_index":1},{"article-title":"No DOI","reference_index":2}]},{"doi":"10.2222/citing-other","references":[{"DOI":"10.5678/cited","reference_index":0}]}]}"#;
+        let records = serde_json::json!([
+            {"doi":"10.1234/citing","references":[{"DOI":"10.5678/cited","reference_index":0},{"DOI":"not-a-doi","reference_index":1},{"article-title":"No DOI","reference_index":2}]},
+            {"doi":"10.2222/citing-other","references":[{"DOI":"10.5678/cited","reference_index":0}]}
+        ]);
+        let retained_records_sha256 =
+            format!("{:x}", Sha256::digest(serde_json::to_vec(&records)?));
+        let payload = serde_json::json!({
+            "source":"Crossref REST API",
+            "complete_result_sha256":"0000000000000000000000000000000000000000000000000000000000000000",
+            "retained_records_sha256":retained_records_sha256,
+            "records":records
+        }).to_string();
         let artifact = store.add_artifact(
             &session.id,
             &literature.id,
             "crossref_citation_metadata",
             "Crossref REST API",
             "10.1234/citing",
-            payload,
+            &payload,
         )?;
         assert_eq!(
             store.index_crossref_citations(&session.id, &artifact.id)?,
@@ -7345,6 +8891,30 @@ mod scheduler_tests {
         assert_eq!(metrics[0].doi, "10.5678/cited");
         assert_eq!(metrics[0].citations_received, 2);
         assert!(metrics[0].pagerank > metrics[1].pagerank);
+
+        let mut altered_records = records.clone();
+        altered_records[0]["references"][0]["DOI"] =
+            serde_json::Value::String("10.9999/altered".into());
+        let tampered_payload = serde_json::json!({
+            "source":"Crossref REST API",
+            "complete_result_sha256":"0000000000000000000000000000000000000000000000000000000000000000",
+            "retained_records_sha256":retained_records_sha256,
+            "records":altered_records
+        }).to_string();
+        let tampered = store.add_artifact(
+            &session.id,
+            &literature.id,
+            "crossref_citation_metadata",
+            "Crossref REST API",
+            "10.1234/citing",
+            &tampered_payload,
+        )?;
+        assert!(
+            store
+                .index_crossref_citations(&session.id, &tampered.id)
+                .is_err()
+        );
+        assert_eq!(store.citation_links(&session.id, None)?.len(), 2);
         assert!(
             store
                 .index_crossref_citations("unknown-session", &artifact.id)
@@ -7487,6 +9057,58 @@ mod scheduler_tests {
                 .map(|event| event.credits)
                 .sum::<i64>(),
             1
+        );
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn research_artifacts_accept_the_full_bounded_benchmark_payload() -> Result<()> {
+        let path = store_path();
+        let store = Store::open(&path)?;
+        let session = store.create_session_with_options("large benchmark", "standard", 20)?;
+        let task = store
+            .claim_ready_tasks(&session.id, "worker", 1, 60)?
+            .remove(0);
+        let payload = format!(
+            r#"{{"records":"{}"}}"#,
+            "x".repeat(MAX_ARTIFACT_PAYLOAD_BYTES - r#"{"records":""}"#.len())
+        );
+        assert_eq!(payload.len(), MAX_ARTIFACT_PAYLOAD_BYTES);
+        let artifact = store.add_artifact(
+            &session.id,
+            &task.id,
+            "biomedical_domain_benchmark_input",
+            "researcher-supplied adjudicated biomedical benchmark",
+            "benchmark-large",
+            &payload,
+        )?;
+        assert_eq!(artifact.payload.len(), MAX_ARTIFACT_PAYLOAD_BYTES);
+        assert_eq!(
+            artifact.sha256,
+            format!("{:x}", Sha256::digest(payload.as_bytes()))
+        );
+        let too_large = format!(
+            r#"{{"records":"{}x"}}"#,
+            "x".repeat(MAX_ARTIFACT_PAYLOAD_BYTES - r#"{"records":""}"#.len())
+        );
+        assert!(
+            store
+                .add_artifact(
+                    &session.id,
+                    &task.id,
+                    "biomedical_domain_benchmark_input",
+                    "researcher-supplied adjudicated biomedical benchmark",
+                    "benchmark-oversized",
+                    &too_large,
+                )
+                .is_err()
+        );
+        let summary = store.budget_summary(&session.id)?;
+        assert_eq!(
+            summary["storage"]["artifact_payload_bytes"],
+            MAX_ARTIFACT_PAYLOAD_BYTES
         );
         drop(store);
         std::fs::remove_file(path)?;
@@ -7815,6 +9437,79 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn semantic_claim_resume_fails_closed_on_missing_work_cancel_budget_and_attempt_ceiling()
+    -> Result<()> {
+        let path = store_path();
+        let store = Store::open(&path)?;
+        let cases = [
+            (
+                "no pending pairs",
+                r#"{"semantic_alignment_omitted_count":0}"#,
+                1,
+                0,
+                0,
+                "no pending semantic pairs",
+            ),
+            (
+                "cancelled session",
+                r#"{"semantic_alignment_omitted_count":2}"#,
+                1,
+                1,
+                0,
+                "cancelled research sessions",
+            ),
+            (
+                "exhausted budget",
+                r#"{"semantic_alignment_omitted_count":2}"#,
+                1,
+                0,
+                5,
+                "no execution credits",
+            ),
+            (
+                "attempt ceiling",
+                r#"{"semantic_alignment_omitted_count":2}"#,
+                5,
+                0,
+                0,
+                "maximum of 5 execution attempts",
+            ),
+        ];
+        for (label, output, attempts, cancelled, credits_used, expected_error) in cases {
+            let session = store.create_session_with_options(label, "standard", 5)?;
+            store.db.execute(
+                "UPDATE research_tasks SET status='needs_review',output=?2,attempts=?3 WHERE session_id=?1 AND id='contradictions.search'",
+                params![session.id, output, attempts],
+            )?;
+            store.db.execute(
+                "UPDATE sessions SET cancellation_requested=?2,credits_used=?3 WHERE id=?1",
+                params![session.id, cancelled, credits_used],
+            )?;
+            let error = store
+                .resume_semantic_claim_task(
+                    &session.id,
+                    "reviewer-1",
+                    "researcher",
+                    "Resume only the remaining source-linked comparisons.",
+                )
+                .expect_err(label);
+            assert!(
+                error.to_string().contains(expected_error),
+                "{label}: {error}"
+            );
+            let task = store
+                .research_tasks(&session.id)?
+                .into_iter()
+                .find(|task| task.id == "contradictions.search")
+                .unwrap();
+            assert_eq!(task.status, "needs_review", "{label}");
+        }
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
     fn expired_lease_is_skipped_after_cancellation_instead_of_requeued() -> Result<()> {
         let path = store_path();
         let store = Store::open(&path)?;
@@ -7964,6 +9659,10 @@ mod scheduler_tests {
         assert_eq!(updated.watch_id, watch.watch_id);
         let claimed_again = store.claim_due_literature_watches("worker.literature", 5, 120)?;
         assert_eq!(claimed_again.len(), 1);
+        assert_eq!(
+            claimed_again[0].pending_metadata_pmids.as_deref(),
+            Some(["101".to_owned(), "102".to_owned()].as_slice())
+        );
         store.consume_literature_watch_credits(
             &session.id,
             &watch.watch_id,
@@ -7972,25 +9671,29 @@ mod scheduler_tests {
             "PubMed scheduled query",
         )?;
         let second_ids = vec!["101".to_owned(), "102".to_owned(), "103".to_owned()];
+        let second_papers: Vec<LiteratureWatchPaper> = second_ids
+            .iter()
+            .map(|pmid| LiteratureWatchPaper {
+                session_id: String::new(),
+                watch_id: String::new(),
+                event_id: String::new(),
+                pmid: pmid.clone(),
+                title: format!("Bounded PubMed metadata for {pmid}"),
+                publication_date: Some("2026".into()),
+                journal: Some("Research Journal".into()),
+                doi: None,
+                pmcid: None,
+                captured_at: 0,
+                metadata_sha256: String::new(),
+            })
+            .collect();
         let second = store.complete_literature_watch(
             &session.id,
             &watch.watch_id,
             "worker.literature",
             &second_ids,
             3,
-            &[LiteratureWatchPaper {
-                session_id: String::new(),
-                watch_id: String::new(),
-                event_id: String::new(),
-                pmid: "103".into(),
-                title: "A bounded PubMed metadata record".into(),
-                publication_date: Some("2026".into()),
-                journal: Some("Research Journal".into()),
-                doi: Some("10.1000/example".into()),
-                pmcid: None,
-                captured_at: 0,
-                metadata_sha256: String::new(),
-            }],
+            &second_papers,
         )?;
         assert!(!second.incomplete);
         assert_eq!(
@@ -8004,8 +9707,14 @@ mod scheduler_tests {
             2
         );
         let retained = store.literature_watch_papers(&session.id, Some(&watch.watch_id), 10)?;
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].pmid, "103");
+        assert_eq!(retained.len(), 3);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|paper| paper.pmid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["101", "102", "103"]
+        );
         assert_eq!(retained[0].event_id, second.id);
         assert!(!retained[0].metadata_sha256.is_empty());
         assert!(
@@ -8017,6 +9726,157 @@ mod scheduler_tests {
             !store
                 .literature_watch(&session.id, &watch.watch_id)?
                 .enabled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn literature_watch_retries_capped_bibliographic_metadata_without_losing_identifiers()
+    -> Result<()> {
+        let mut store = Store::open(store_path())?;
+        let session = store.create_session_with_options(
+            "Retain every discovered literature record",
+            "standard",
+            20,
+        )?;
+        let watch = store.register_literature_watch(&session.id, "APOE microglia", 86_400)?;
+        let first_claim = store.claim_due_literature_watches("worker.metadata", 1, 120)?;
+        assert_eq!(first_claim.len(), 1);
+        assert_eq!(
+            first_claim[0].pending_metadata_pmids.as_deref(),
+            Some([].as_slice())
+        );
+        store.consume_literature_watch_credits(
+            &session.id,
+            &watch.watch_id,
+            "worker.metadata",
+            1,
+            "scheduled PubMed search",
+        )?;
+        let ids: Vec<String> = (100..121).map(|id| id.to_string()).collect();
+        let initial_batch: Vec<LiteratureWatchPaper> = ids[..20]
+            .iter()
+            .map(|pmid| LiteratureWatchPaper {
+                session_id: session.id.clone(),
+                watch_id: watch.watch_id.clone(),
+                event_id: String::new(),
+                pmid: pmid.clone(),
+                title: format!("Bibliographic record {pmid}"),
+                publication_date: None,
+                journal: None,
+                doi: None,
+                pmcid: None,
+                captured_at: 0,
+                metadata_sha256: String::new(),
+            })
+            .collect();
+        let first_event = store.complete_literature_watch(
+            &session.id,
+            &watch.watch_id,
+            "worker.metadata",
+            &ids,
+            21,
+            &initial_batch,
+        )?;
+        assert!(first_event.incomplete);
+        assert_eq!(first_event.metadata_pending_count, Some(1));
+        assert_eq!(first_event.retrieved_count, 21);
+
+        store.db.execute(
+            "UPDATE literature_watches SET next_due=0 WHERE session_id=?1 AND watch_id=?2",
+            params![session.id, watch.watch_id],
+        )?;
+        let retry_claim = store.claim_due_literature_watches("worker.metadata", 1, 120)?;
+        assert_eq!(retry_claim.len(), 1);
+        assert_eq!(
+            retry_claim[0].pending_metadata_pmids.as_deref(),
+            Some([ids[20].clone()].as_slice())
+        );
+        store.consume_literature_watch_credits(
+            &session.id,
+            &watch.watch_id,
+            "worker.metadata",
+            1,
+            "scheduled PubMed metadata retry",
+        )?;
+        let final_paper = LiteratureWatchPaper {
+            session_id: session.id.clone(),
+            watch_id: watch.watch_id.clone(),
+            event_id: String::new(),
+            pmid: ids[20].clone(),
+            title: "Previously omitted bibliographic record".into(),
+            publication_date: None,
+            journal: None,
+            doi: None,
+            pmcid: None,
+            captured_at: 0,
+            metadata_sha256: String::new(),
+        };
+        let second_event = store.complete_literature_watch(
+            &session.id,
+            &watch.watch_id,
+            "worker.metadata",
+            &ids,
+            21,
+            &[final_paper],
+        )?;
+        assert_eq!(second_event.metadata_pending_count, Some(0));
+        assert_eq!(second_event.metadata_overflow_count, Some(0));
+        assert!(!second_event.incomplete);
+        assert_eq!(
+            store
+                .literature_watch_papers(&session.id, Some(&watch.watch_id), 30)?
+                .len(),
+            21
+        );
+        let events = store.literature_watch_events(&session.id, &watch.watch_id)?;
+        let retained_event = events
+            .iter()
+            .find(|event| event.id == second_event.id)
+            .unwrap();
+        assert_eq!(retained_event.metadata_pending_count, Some(0));
+
+        store.db.execute(
+            "UPDATE literature_watches SET next_due=0 WHERE session_id=?1 AND watch_id=?2",
+            params![session.id, watch.watch_id],
+        )?;
+        for index in 0..MAX_LITERATURE_WATCH_PENDING_METADATA {
+            store.db.execute(
+                "INSERT INTO literature_watch_pending(session_id,watch_id,pmid,first_seen_at) VALUES(?1,?2,?3,?4)",
+                params![session.id, watch.watch_id, format!("{}", 800_000 + index), 1],
+            )?;
+        }
+        let capped_claim = store.claim_due_literature_watches("worker.metadata", 1, 120)?;
+        assert_eq!(
+            capped_claim[0]
+                .pending_metadata_pmids
+                .as_ref()
+                .unwrap()
+                .len(),
+            20
+        );
+        let overflow_event = store.complete_literature_watch(
+            &session.id,
+            &watch.watch_id,
+            "worker.metadata",
+            &["999999".into()],
+            1,
+            &[],
+        )?;
+        assert_eq!(
+            overflow_event.metadata_pending_count,
+            Some(MAX_LITERATURE_WATCH_PENDING_METADATA)
+        );
+        assert_eq!(overflow_event.metadata_overflow_count, Some(1));
+        assert!(overflow_event.incomplete);
+        let overflow_watch = store.literature_watch(&session.id, &watch.watch_id)?;
+        assert!(overflow_watch.enabled);
+        assert!(
+            overflow_watch
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("identifiers were omitted")
         );
         Ok(())
     }

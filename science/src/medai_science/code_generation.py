@@ -7,7 +7,7 @@ from typing import Any
 
 from medai_science.capabilities import draft_manifest
 from medai_science.contract_validation import capability_io_schemas
-from medai_science.llm import JSONModelProvider, ModelCompletion
+from medai_science.llm import JSONModelProvider, ModelCompletion, complete_structured_json
 from medai_science.r_sandbox import validate_r_source
 from medai_science.sandbox import validate_python_source
 from medai_science.sources.safety import ensure_public_research_query
@@ -128,7 +128,8 @@ async def generate_python_capability(
         contract=contract,
         implementation_requirements=implementation_requirements,
     )
-    completion = await provider.complete_json(
+    completion = await complete_structured_json(
+        provider,
         system=_SYSTEM,
         prompt=prompt,
         schema_name="medai_python_capability_source",
@@ -196,7 +197,8 @@ async def generate_r_capability(
         f"Capability: {capability_id}\nDescription: {description.strip()}\n"
         f"Contract and implementation requirements JSON:\n{serialized}"
     )
-    completion = await provider.complete_json(
+    completion = await complete_structured_json(
+        provider,
         system=_SYSTEM_R,
         prompt=prompt,
         schema_name="medai_r_capability_source",

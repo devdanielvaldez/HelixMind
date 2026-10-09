@@ -22,6 +22,7 @@ def pathway_result() -> dict:
         "input_sha256": hashlib.sha256("\n".join(genes).encode()).hexdigest(),
         "analysis_parameters": parameters,
         "request_sha256": _canonical_hash({"endpoint": ReactomeClient.endpoint, "parameters": parameters, "identifiers": genes}),
+        "response_sha256": hashlib.sha256(b'{"pathways":[{"stId":"R-HSA-123","name":"Example pathway"}]}').hexdigest(),
         "result": {"pathways": [{"stId": "R-HSA-123", "name": "Example pathway"}]},
         "interpretation_limit": "Pathway over-representation is an association analysis, not causal evidence.",
     }
@@ -34,6 +35,10 @@ class PathwayBundleTests(unittest.TestCase):
             create_pathway_bundle(bundle, pathway_result())
             self.assertTrue(verify_pathway_bundle(bundle, replay=True)["network_accessed"] is False)
             self.assertTrue(verify_analysis_bundle(bundle, replay=True)["replayed"])
+            report = json.loads((bundle / "pathways.json").read_text())
+            manifest = json.loads((bundle / "manifest.json").read_text())
+            self.assertEqual(report["response_sha256"], pathway_result()["response_sha256"])
+            self.assertEqual(manifest["analysis"]["response_sha256"], report["response_sha256"])
 
     def test_rejects_mismatched_input_digest(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

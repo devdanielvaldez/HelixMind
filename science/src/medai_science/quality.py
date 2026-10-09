@@ -31,6 +31,75 @@ _PUBMED_PUBLICATION_TYPE_UI_DESIGNS = {
 }
 QUALITY_DOMAINS = ("risk_of_bias", "precision", "directness", "consistency", "reporting_bias")
 
+_PUBMED_METADATA_FIELDS = {
+    "title": ("provenance", "title", "text"),
+    "publication_date": (None, "publication_date", "text"),
+    "journal": (None, "journal", "text"),
+    "authors": (None, "authors", "list"),
+    "doi": ("identifiers", "doi", "text"),
+    "pmcid": ("identifiers", "pmc", "text"),
+    "abstract_length": (None, "abstract_length", "length"),
+    "publication_types": (None, "publication_types", "list"),
+    "publication_type_ids": (None, "publication_type_ids", "list"),
+    "mesh_headings": (None, "mesh_headings", "list"),
+}
+
+
+def _pubmed_metadata_coverage(records: list[dict]) -> dict:
+    """Count captured, empty, and malformed source fields without grading papers."""
+    counts = {
+        name: {"nonempty": 0, "empty": 0, "not_captured": 0, "malformed": 0}
+        for name in _PUBMED_METADATA_FIELDS
+    }
+    record_count = 0
+    for paper in records:
+        if not isinstance(paper, dict):
+            continue
+        provenance = paper.get("provenance")
+        if not isinstance(provenance, dict) or provenance.get("source") != "PubMed":
+            continue
+        record_count += 1
+        for name, (parent_key, field, kind) in _PUBMED_METADATA_FIELDS.items():
+            owner = paper.get(parent_key) if parent_key else paper
+            if not isinstance(owner, dict):
+                counts[name]["malformed" if parent_key in paper else "not_captured"] += 1
+                continue
+            if field not in owner:
+                counts[name]["empty" if parent_key == "identifiers" else "not_captured"] += 1
+                continue
+            value = owner[field]
+            if kind == "text":
+                if value is None or value == "":
+                    state = "empty"
+                elif isinstance(value, str) and len(value) <= 100_000:
+                    state = "nonempty"
+                else:
+                    state = "malformed"
+            elif kind == "list":
+                if not isinstance(value, list) or len(value) > 1000:
+                    state = "malformed"
+                elif any(
+                    not isinstance(item, dict if field == "mesh_headings" else str)
+                    for item in value
+                ):
+                    state = "malformed"
+                else:
+                    state = "nonempty" if value else "empty"
+            else:
+                if value is None:
+                    state = "empty"
+                elif isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
+                    state = "nonempty" if value > 0 else "empty"
+                else:
+                    state = "malformed"
+            counts[name][state] += 1
+    return {
+        "methodology": "pubmed-source-metadata-coverage-v1",
+        "records": record_count,
+        "fields": counts,
+        "interpretation": "Counts describe whether bounded PubMed source metadata was retained. Missing or empty fields can reflect provider indexing or retrieval; availability is not study quality, evidence strength, or paper validity.",
+    }
+
 
 def is_valid_quality_annotation(value: object) -> bool:
     """Accept finite numeric annotations in [0, 1], excluding booleans."""
@@ -163,6 +232,7 @@ def summarize_pubmed_design_metadata(records: object) -> dict:
         "related_publication_links": related_publication_links,
         "counts_by_pubmed_related_publication_type": related_publication_counts,
         "example_pmids_by_related_publication_type": related_publication_examples,
+        "source_metadata_coverage": _pubmed_metadata_coverage(records),
         "records_without_recognized_design_signal": records_without_signal,
         "records_with_malformed_design_metadata": malformed_records,
         "records_with_malformed_related_publication_metadata": malformed_related_metadata,

@@ -60,6 +60,23 @@ class UniProtEntryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             asyncio.run(client.get_entry("P05067"))
 
+    def test_search_validates_strict_json_and_every_record(self) -> None:
+        async def run(body: bytes):
+            client = UniProtClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, content=body)))
+            return await client.search("APP", limit=2)
+
+        valid = b'{"results":[{"primaryAccession":"P05067","organism":{"taxonId":9606}}]}'
+        result = asyncio.run(run(valid))
+        self.assertEqual(result[0]["source_id"], "P05067")
+        for body, message in (
+            (b'{"results":[],"results":[]}', "duplicate JSON object key"),
+            (b'{"results":[],"score":Infinity}', "non-standard JSON number"),
+            (b'{"results":[null]}', "malformed search record"),
+            (b'{"results":[{}]}', "missing accession"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                asyncio.run(run(body))
+
 
 if __name__ == "__main__":
     unittest.main()

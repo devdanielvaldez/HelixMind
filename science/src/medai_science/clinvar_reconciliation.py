@@ -74,11 +74,55 @@ def reconcile_clinvar_variants(
                 alt = location.get("alternate_allele")
                 if not isinstance(contig, str) or isinstance(position, bool) or not isinstance(position, int) or position < 1:
                     continue
-                if not isinstance(ref, str) or not isinstance(alt, str) or not ref or not alt:
+                if not isinstance(ref, str) or not isinstance(alt, str):
                     continue
-                if not re.fullmatch(r"[ACGT]+", ref.upper()) or not re.fullmatch(r"[ACGT]+", alt.upper()):
+                if ((ref and not re.fullmatch(r"[ACGT]+", ref.upper()))
+                        or (alt and not re.fullmatch(r"[ACGT]+", alt.upper()))
+                        or (not ref and not alt)):
                     unresolved.append({"variation_id": variation_id, "reason": "ClinVar location contains an ambiguous or unsupported sequence allele"})
                     continue
+                ref, alt = ref.upper(), alt.upper()
+                if not ref:
+                    # A bare insertion occupies the interval between the
+                    # reported left and right HGVS coordinates. Require those
+                    # adjacent coordinates, then derive its VCF anchor locally.
+                    end_position = location.get("end_position_1_based")
+                    if (position <= 1 or isinstance(end_position, bool)
+                            or not isinstance(end_position, int) or end_position != position + 1):
+                        unresolved.append({"variation_id": variation_id, "reason": "ClinVar insertion lacks adjacent source boundaries for VCF anchoring"})
+                        continue
+                    try:
+                        anchor = reference.fetch(contig, position - 1, 1)
+                    except ValueError as error:
+                        unresolved.append({"variation_id": variation_id, "reason": str(error)[:200]})
+                        continue
+                    if not re.fullmatch(r"[ACGT]", anchor):
+                        unresolved.append({"variation_id": variation_id, "reason": "ClinVar insertion lacks an unambiguous reference base for VCF anchoring"})
+                        continue
+                    ref, alt = anchor, anchor + alt
+                elif not alt:
+                    # ClinVar represents a simple deletion as an unanchored
+                    # reference allele. Convert it to the VCF form only after
+                    # obtaining and validating its left anchor from this FASTA.
+                    end_position = location.get("end_position_1_based")
+                    if (end_position is not None
+                            and (isinstance(end_position, bool) or not isinstance(end_position, int)
+                                 or end_position != position + len(ref) - 1)):
+                        unresolved.append({"variation_id": variation_id, "reason": "ClinVar deletion end coordinate does not match its reference-allele length"})
+                        continue
+                    if position <= 1:
+                        unresolved.append({"variation_id": variation_id, "reason": "ClinVar deletion at the first reference base has no left VCF anchor"})
+                        continue
+                    try:
+                        anchor = reference.fetch(contig, position - 2, 1)
+                    except ValueError as error:
+                        unresolved.append({"variation_id": variation_id, "reason": str(error)[:200]})
+                        continue
+                    if not re.fullmatch(r"[ACGT]", anchor):
+                        unresolved.append({"variation_id": variation_id, "reason": "ClinVar deletion lacks an unambiguous reference base for VCF anchoring"})
+                        continue
+                    position -= 1
+                    ref, alt = anchor + ref, anchor
                 try:
                     observed = reference.fetch(contig, position - 1, len(ref))
                     if observed != ref.upper():
@@ -115,6 +159,31 @@ def reconcile_clinvar_variants(
             ref = variant.get("normalized_reference_allele")
             alt = variant.get("normalized_alternate_allele")
             contig = variant.get("contig")
+            if (
+                not isinstance(contig, str)
+                or not contig
+                or isinstance(position, bool)
+                or not isinstance(position, int)
+                or position < 1
+                or not isinstance(ref, str)
+                or not isinstance(alt, str)
+                or not re.fullmatch(r"[ACGT]+", ref)
+                or not re.fullmatch(r"[ACGT]+", alt)
+            ):
+                reconciled.append({"record_number": variant.get("record_number"), "status": "needs_review", "reason": "local normalized allele fields are malformed"})
+                continue
+            try:
+                observed = reference.fetch(contig, position - 1, len(ref))
+                if observed != ref:
+                    reconciled.append({"record_number": variant.get("record_number"), "status": "needs_review", "reason": "local normalized reference allele does not match the supplied FASTA"})
+                    continue
+                recalculated = _normalize_alleles(reference, contig, position, ref, alt)
+            except ValueError as error:
+                reconciled.append({"record_number": variant.get("record_number"), "status": "needs_review", "reason": f"local normalized allele could not be verified: {str(error)[:160]}"})
+                continue
+            if recalculated != (position, ref, alt):
+                reconciled.append({"record_number": variant.get("record_number"), "status": "needs_review", "reason": "local allele fields are not minimally reference-normalized"})
+                continue
             key = (contig, position, ref, alt)
             sources = matches.get(key, [])
             deduped = {item["variation_id"]: item for item in sources}

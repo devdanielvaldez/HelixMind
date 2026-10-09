@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ from medai_science.sources.clinical_trials import ClinicalTrialsClient
 from medai_science.sources.alphafold import AlphaFoldClient
 from medai_science.sources.mygene import MyGeneClient
 from medai_science.sources.clinvar import ClinVarClient
+from medai_science.sources.dbsnp import DbSNPClient
 from medai_science.sources.gnomad import GnomADClient
 from medai_science.sources.uniprot import UniProtClient
 from medai_science.sources.intact import IntActClient
@@ -41,16 +43,20 @@ from medai_science.amcp_export import export_generated_amcp_artifact
 from medai_science.agentmesh_sync import AgentMeshSyncError, inspect_capability_sync, reconcile_runtime_lifecycle, seal_route_plan_for_review, sync_capability_routes
 from medai_science.genomics import analyze_vcf, inspect_fasta, inspect_fastq
 from medai_science.genomics_research import summarize_local_vcf_report
+from medai_science.json_input import read_strict_json
+from medai_science.structure_analysis import MAX_MMCIF_BYTES, MAX_PDB_BYTES, summarize_mmcif, summarize_pdb
 from medai_science.clinvar_reconciliation import reconcile_clinvar_variants
+from medai_science.dbsnp_reconciliation import reconcile_dbsnp_placements
 from medai_science.variant_source_reconciliation import reconcile_gnomad_frequency, reconcile_variant_sources
 from medai_science.orchestrator import plan_research
 from medai_science.capabilities import SemanticCapabilityIndex, LocalSentenceTransformer, apply_authoritative_lifecycle, canonical_amcp_registry_package, draft_manifest, load_amcp_catalog, runtime_capability_statuses
 from medai_science.capability_lifecycle import fetch_approved_lifecycle, fetch_capability_registry
-from medai_science.reproducibility import compare_reproducibility_bundles, create_clinical_trial_bundle, create_compound_bundle, create_genomics_bundle, create_pathway_bundle, create_protein_bundle, create_sequence_bundle, parse_research_bundle_artifact, verify_analysis_bundle
+from medai_science.reproducibility import compare_reproducibility_bundles, create_chembl_bundle, create_clinical_trial_bundle, create_compound_bundle, create_genomics_bundle, create_intact_bundle, create_pathway_bundle, create_protein_bundle, create_sequence_bundle, create_structure_bundle, parse_research_bundle_artifact, verify_analysis_bundle
 from medai_science.sandbox import DockerPythonSandbox
 from medai_science.r_sandbox import DockerRSandbox
 from medai_science.wasm_sandbox import DockerWasmSandbox
-from medai_science.evaluation import calibrate_capability_reuse_threshold, evaluate_adjudicated_cases, load_pinned_capability_calibration
+from medai_science.evaluation import calibrate_capability_reuse_threshold, evaluate_adjudicated_cases, evaluate_biomedical_domain_benchmark, evaluate_drug_pair_benchmark, load_pinned_capability_calibration, write_private_report_no_overwrite
+from medai_science.benchmark_artifacts import load_domain_benchmark_artifact, load_evidence_quality_benchmark_artifact, submit_domain_benchmark_artifact, submit_evidence_quality_benchmark_artifact
 from medai_science.capability_evolution import compare_capability_versions, run_paired_capability_benchmark
 from medai_science.skill_learning import read_skill_index
 from medai_science.provenance_signing import verify_capability_proposal_signature
@@ -224,7 +230,7 @@ def skills_plan_agentmesh(
 @skills_app.command("sync-agentmesh")
 def skills_sync_agentmesh(
     plan_file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
-    approved_plan_sha256: str = typer.Option(..., "--approve-plan-sha256", min_length=64, max_length=64),
+    approved_plan_sha256: str = typer.Option(..., "--approve-plan-sha256"),
     approval_receipt_id: str = typer.Option(..., "--approval-receipt-id"),
     state_file: Path = typer.Option(Path(os.getenv("MEDAI_AGENTMESH_SKILLS_SYNC_STATE", ".medai/agentmesh/skills-sync-state.json")), "--state-file"),
 ):
@@ -233,6 +239,8 @@ def skills_sync_agentmesh(
         plan = json.loads(plan_file.read_text(encoding="utf-8"))
         if not isinstance(plan, dict) or plan.get("lifecycle_source") != "authenticated-medai-api-exact-package-match":
             raise ValueError("Skill route sync requires a plan from skills plan-agentmesh")
+        if not re.fullmatch(r"[a-f0-9]{64}", approved_plan_sha256) or plan.get("plan_review_sha256") != approved_plan_sha256:
+            raise ValueError("approved plan digest must exactly match the reviewed Skill route plan")
         approval = _medai_admin_request(
             f"/v1/admin/agentmesh/route-approvals/{quote(approval_receipt_id, safe='')}/validate",
             {"plan": plan},
@@ -581,7 +589,7 @@ def agentmesh_plan_capabilities(
 @agentmesh_app.command("sync-capabilities")
 def agentmesh_sync_capabilities(
     plan_file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
-    approved_plan_sha256: str = typer.Option(..., "--approve-plan-sha256", min_length=64, max_length=64, help="Exact plan_review_sha256 inspected before rollout"),
+    approved_plan_sha256: str = typer.Option(..., "--approve-plan-sha256", help="Exact plan_review_sha256 inspected before rollout"),
     approval_receipt_id: str = typer.Option(..., "--approval-receipt-id", help="Unexpired receipt created by agentmesh approve-plan"),
     state_file: Path = typer.Option(Path(os.getenv("MEDAI_AGENTMESH_SYNC_STATE", ".medai/agentmesh/sync-state.json")), "--state-file"),
 ):
@@ -590,6 +598,8 @@ def agentmesh_sync_capabilities(
         plan = json.loads(plan_file.read_text(encoding="utf-8"))
         if not isinstance(plan, dict):
             raise ValueError("route plan must be a JSON object")
+        if not re.fullmatch(r"[a-f0-9]{64}", approved_plan_sha256) or plan.get("plan_review_sha256") != approved_plan_sha256:
+            raise ValueError("approved plan digest must exactly match the reviewed AgentMesh route plan")
         approval = _medai_admin_request(
             f"/v1/admin/agentmesh/route-approvals/{quote(approval_receipt_id, safe='')}/validate",
             {"plan": plan},
@@ -822,6 +832,125 @@ def benchmark_evaluate(
         raise typer.BadParameter(str(error)) from error
 
 
+@app.command("drug-pair-benchmark-evaluate")
+def drug_pair_benchmark_evaluate(
+    benchmark_file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    bins: int = typer.Option(10, min=2, max=100, help="Equal-width calibration bins for prediction correctness"),
+):
+    """Evaluate source-bound drug-pair retrieval and conditional conflict screening."""
+    try:
+        if benchmark_file.stat().st_size > 20 * 1024 * 1024:
+            raise ValueError("drug-pair benchmark file exceeds 20 MiB")
+
+        def reject_duplicate_keys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"duplicate JSON key: {key}")
+                result[key] = value
+            return result
+
+        def reject_nonfinite(value):
+            raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+        document = json.loads(
+            benchmark_file.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite,
+        )
+        report = evaluate_drug_pair_benchmark(document, bins=bins)
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+
+@app.command("biomedical-domain-benchmark-evaluate")
+def biomedical_domain_benchmark_evaluate(
+    benchmark_file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    bins: int = typer.Option(10, min=2, max=100, help="Equal-width calibration bins for prediction correctness"),
+):
+    """Evaluate source-bound biomedical cases separately across four scientific domains."""
+    try:
+        if benchmark_file.stat().st_size > 20 * 1024 * 1024:
+            raise ValueError("biomedical domain benchmark file exceeds 20 MiB")
+
+        def reject_duplicate_keys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"duplicate JSON key: {key}")
+                result[key] = value
+            return result
+
+        def reject_nonfinite(value):
+            raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+        document = json.loads(
+            benchmark_file.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite,
+        )
+        report = evaluate_biomedical_domain_benchmark(document, bins=bins)
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+
+@app.command("biomedical-domain-benchmark-submit")
+def biomedical_domain_benchmark_submit(
+    session_id: str = typer.Argument(..., help="Tenant-owned research session to receive the benchmark"),
+    benchmark_file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    bins: int = typer.Option(10, min=2, max=100, help="Calibration bins used to validate benchmark computability"),
+):
+    """Validate and attach one independently adjudicated four-domain benchmark to a research session."""
+    try:
+        document, report, input_file_sha256 = load_domain_benchmark_artifact(benchmark_file, bins=bins)
+        artifact = submit_domain_benchmark_artifact(document, report, session_id, _medai_admin_request)
+    except (OSError, ValueError, httpx.HTTPError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(json.dumps({
+        "submitted": True,
+        "session_id": session_id,
+        "benchmark_id": report["benchmark_id"],
+        "benchmark_sha256": report["benchmark_sha256"],
+        "input_file_sha256": input_file_sha256,
+        "artifact_id": artifact.get("id"),
+        "artifact_sha256": artifact.get("sha256"),
+        "total_cases": report["total_cases"],
+        "complete_domain_coverage": report["complete_domain_coverage"],
+        "missing_domains": report["missing_domains"],
+        "selected_task_required": "benchmark.evaluate must be selected in the Research Director plan",
+        "interpretation_limit": report["interpretation_limit"],
+    }, ensure_ascii=False, indent=2))
+
+
+@app.command("evidence-quality-benchmark-submit")
+def evidence_quality_benchmark_submit(
+    session_id: str = typer.Argument(..., help="Tenant-owned research session to receive the benchmark"),
+    benchmark_file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    bins: int = typer.Option(10, min=2, max=100, help="Calibration bins used to validate benchmark computability"),
+):
+    """Validate and attach a double-reviewed ordinal evidence-quality benchmark."""
+    try:
+        document, report, input_file_sha256 = load_evidence_quality_benchmark_artifact(benchmark_file, bins=bins)
+        artifact = submit_evidence_quality_benchmark_artifact(document, report, session_id, _medai_admin_request)
+    except (OSError, ValueError, httpx.HTTPError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(json.dumps({
+        "submitted": True,
+        "session_id": session_id,
+        "benchmark_id": report["benchmark_id"],
+        "benchmark_sha256": report["benchmark_sha256"],
+        "input_file_sha256": input_file_sha256,
+        "artifact_id": artifact.get("id"),
+        "artifact_sha256": artifact.get("sha256"),
+        "cases": report["cases"],
+        "domains": sorted(report["overall_by_domain"]),
+        "selected_task_required": "benchmark.evaluate must be selected in the Research Director plan",
+        "interpretation_limit": report["interpretation_limit"],
+    }, ensure_ascii=False, indent=2))
+
+
 @app.command("capability-calibrate")
 def capability_calibrate(
     benchmark_file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
@@ -835,9 +964,7 @@ def capability_calibrate(
         document = json.loads(benchmark_file.read_text(encoding="utf-8"))
         report = calibrate_capability_reuse_threshold(document, minimum_precision=minimum_precision)
         rendered = json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(rendered, encoding="utf-8")
-        digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        digest = write_private_report_no_overwrite(output, rendered)
         typer.echo(json.dumps({"report": report, "report_path": str(output), "report_sha256": digest, "ready_for_operator_review": report["reuse_enabled"]}, ensure_ascii=False, indent=2))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise typer.BadParameter(str(error)) from error
@@ -895,6 +1022,15 @@ def variant_records(query: str, limit: int = 10):
     except (OSError, ValueError, httpx.HTTPError) as error:
         raise typer.BadParameter(str(error)) from error
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+@app.command("dbsnp")
+def dbsnp_record(rsid: str):
+    """Retrieve one bounded NCBI dbSNP RefSNP record; placements need assembly validation."""
+    try:
+        result = asyncio.run(DbSNPClient().lookup(rsid))
+    except (OSError, ValueError, httpx.HTTPError) as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
 
 @app.command("variant-frequency")
 def variant_frequency(variant_id: str, assembly: str = typer.Option("GRCh38", "--assembly")):
@@ -1012,6 +1148,39 @@ def gene_panel(panel_id: int, version: str | None = typer.Option(None, "--versio
         raise typer.BadParameter(str(error)) from error
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
 
+@app.command("variant-reconcile-dbsnp")
+def variant_reconcile_dbsnp(
+    genomic_report: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    dbsnp_receipt: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    reference_fasta: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    sequence_map: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    genome_build: str = typer.Option(..., "--genome-build", help="Reference assembly: GRCh37 or GRCh38"),
+):
+    """Join dbSNP RefSNP placements to exact local normalized alleles using an explicit RefSeq map."""
+    try:
+        paths = (genomic_report, dbsnp_receipt, sequence_map)
+        if any(path.stat().st_size > 8_000_000 for path in paths):
+            raise ValueError("dbSNP reconciliation input exceeds the 8 MB limit")
+        def reject_duplicate_keys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("dbSNP reconciliation input contains duplicate JSON keys")
+                result[key] = value
+            return result
+
+        def reject_nonfinite(value):
+            raise ValueError(f"dbSNP reconciliation input contains non-standard JSON number {value}")
+
+        report, receipt, mapping = [
+            json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys, parse_constant=reject_nonfinite)
+            for path in paths
+        ]
+        result = reconcile_dbsnp_placements(report, receipt, reference_fasta, genome_build, mapping)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+
 
 @app.command("gencc-gene")
 def gencc_gene(gene: str, limit: int = typer.Option(50, min=1, max=100)):
@@ -1121,7 +1290,7 @@ def compound(identifier: str, bundle_dir: Path | None = typer.Option(None, "--bu
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 @app.command("drug")
-def drug(identifier: str):
+def drug(identifier: str, bundle_dir: Path | None = typer.Option(None, "--bundle-dir", help="Capture exact ChEMBL records in a private offline-replayable bundle")):
     """Resolve compound identity and retrieve exact-identity ChEMBL pharmacology records."""
     try:
         identity = asyncio.run(PubChemClient().lookup(identifier))
@@ -1130,7 +1299,13 @@ def drug(identifier: str):
             result = {"chemical_identity": identity, "pharmacology": None, "reason": "Choose a single exact compound identity before joining pharmacology records."}
         else:
             inchikey = matches[0].get("inchikey")
-            result = {"chemical_identity": identity, "pharmacology": asyncio.run(ChEMBLClient().investigate(inchikey)) if inchikey else None, "reason": None if inchikey else "PubChem returned no standard InChIKey; pharmacology was not joined."}
+            pharmacology = asyncio.run(ChEMBLClient().investigate(inchikey)) if inchikey else None
+            bundle = None
+            if bundle_dir is not None:
+                if not inchikey or not pharmacology or not pharmacology.get("molecule_matches"):
+                    raise ValueError("drug bundle requires one exact PubChem and ChEMBL identity match")
+                bundle = create_chembl_bundle(bundle_dir, pharmacology)
+            result = {"chemical_identity": identity, "pharmacology": pharmacology, "reproducibility_bundle": bundle, "reason": None if inchikey else "PubChem returned no standard InChIKey; pharmacology was not joined."}
     except (OSError, ValueError, httpx.HTTPError) as error:
         raise typer.BadParameter(str(error)) from error
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
@@ -1228,6 +1403,38 @@ def protein_structure(uniprot_accession: str):
         raise typer.BadParameter(str(error)) from error
     typer.echo(json.dumps({"accession": uniprot_accession, "predictions": records}, ensure_ascii=False, indent=2))
 
+@app.command("protein-structure-analyze")
+def protein_structure_analyze(
+    input_file: Path = typer.Argument(..., exists=True, file_okay=True, dir_okay=False, readable=True),
+    label: str | None = typer.Option(None, "--label", help="Optional stable structure accession/model label"),
+    structure_format: str = typer.Option("auto", "--format", help="auto, pdb, or mmcif"),
+    bundle_dir: Path | None = typer.Option(None, "--bundle-dir", help="Capture a private offline-replayable structure analysis bundle"),
+):
+    """Summarize a local PDB or mmCIF coordinate file without retaining coordinates."""
+    try:
+        if structure_format not in {"auto", "pdb", "mmcif"}:
+            raise ValueError("format must be auto, pdb, or mmcif")
+        selected_format = structure_format
+        if selected_format == "auto":
+            suffix = input_file.suffix.casefold()
+            if suffix in {".cif", ".mmcif"}:
+                selected_format = "mmcif"
+            elif suffix in {".pdb", ".ent"}:
+                selected_format = "pdb"
+            else:
+                raise ValueError("cannot infer structure format from the filename; pass --format pdb or --format mmcif")
+        maximum = MAX_MMCIF_BYTES if selected_format == "mmcif" else MAX_PDB_BYTES
+        with input_file.open("rb") as structure_stream:
+            payload = structure_stream.read(maximum + 1)
+        if not 1 <= len(payload) <= maximum:
+            raise ValueError(f"{selected_format} input must contain 1..{maximum} bytes")
+        result = summarize_mmcif(payload, label=label) if selected_format == "mmcif" else summarize_pdb(payload, label=label)
+        if bundle_dir is not None:
+            result["reproducibility_bundle"] = create_structure_bundle(bundle_dir, result, input_file, selected_format)
+    except (OSError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
 @app.command("protein-record")
 def protein_record(uniprot_accession: str, bundle_dir: Path | None = typer.Option(None, "--bundle-dir", help="Create a private, offline-replayable UniProtKB feature bundle")):
     """Retrieve a UniProtKB entry and optionally capture its replayable feature analysis."""
@@ -1252,13 +1459,14 @@ def protein_residue_mapping(uniprot_accession: str, max_structures: int = 10):
     typer.echo(json.dumps(mapping, ensure_ascii=False, indent=2))
 
 @app.command("interactions")
-def protein_interactions(uniprot_accession: str, limit: int = 100, organism_id: int | None = 9606):
-    """Search IntAct interaction evidence for a UniProt accession."""
+def protein_interactions(uniprot_accession: str, limit: int = 100, organism_id: int | None = 9606, bundle_dir: Path | None = typer.Option(None, "--bundle-dir", help="Capture minimized IntAct source receipts for offline reconciliation replay")):
+    """Search IntAct interaction evidence and optionally capture an offline replay bundle."""
     try:
         result = asyncio.run(IntActClient().interactions(uniprot_accession, limit, organism_id))
+        bundle = create_intact_bundle(bundle_dir, result) if bundle_dir is not None else None
     except (OSError, ValueError, httpx.HTTPError) as error:
         raise typer.BadParameter(str(error)) from error
-    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    typer.echo(json.dumps({**result, **({"reproducibility_bundle": bundle} if bundle else {})}, ensure_ascii=False, indent=2))
 
 @app.command()
 def pathways(genes: str, species: str = "Homo sapiens", page_size: int = 20, bundle_dir: Path | None = typer.Option(None, "--bundle-dir", help="Create a private offline-verifiable Reactome response bundle")):
@@ -1279,6 +1487,8 @@ def genome_vcf(
     annotate_vep: bool = typer.Option(False, "--annotate-vep", help="Cross-check reference-validated alleles with Ensembl VEP and include its receipt in the output/bundle"),
     clinvar_results: Path | None = typer.Option(None, "--clinvar-results", help="Local JSON file containing sourced ClinVar records; requires --reference-fasta"),
     gnomad_frequency_receipts: Path | None = typer.Option(None, "--gnomad-frequency-receipts", help="Local gnomAD frequency receipt JSON; requires --reference-fasta"),
+    dbsnp_receipt_file: Path | None = typer.Option(None, "--dbsnp-receipt", help="Local bounded dbSNP RefSNP receipt; requires --reference-fasta and --dbsnp-sequence-map"),
+    dbsnp_sequence_map_file: Path | None = typer.Option(None, "--dbsnp-sequence-map", help="JSON map from RefSeq accession versions to exact FASTA contig names"),
     output: Path | None = typer.Option(None, "--output", help="Write the local JSON report to this path"),
     bundle_dir: Path | None = typer.Option(None, "--bundle-dir", help="Create a private replayable bundle; copies genomic inputs into this new directory"),
     session_id: str | None = typer.Option(None, "--submit-session", help="Upload only an aggregate receipt; the VCF and variant records stay local"),
@@ -1298,14 +1508,15 @@ def genome_vcf(
         source_reconciliation = None
         gnomad_receipts = None
         gnomad_reconciliation = None
+        dbsnp_receipt = None
+        dbsnp_sequence_map = None
+        dbsnp_reconciliation = None
         if clinvar_results is not None:
             if reference_fasta is None:
                 raise ValueError("--clinvar-results requires --reference-fasta for exact allele normalization")
             if session_id:
                 raise ValueError("--clinvar-results data are retained locally; do not combine them with --submit-session")
-            if clinvar_results.stat().st_size > 8_000_000:
-                raise ValueError("ClinVar results exceed the 8 MB input limit")
-            clinvar_payload = json.loads(clinvar_results.read_text(encoding="utf-8"))
+            clinvar_payload = read_strict_json(clinvar_results, 8_000_000, "ClinVar results")
             clinvar_records = clinvar_payload.get("records") if isinstance(clinvar_payload, dict) else clinvar_payload
             clinvar_receipt = reconcile_clinvar_variants(result, clinvar_records, reference_fasta, genome_build)
             if vep_result is not None:
@@ -1315,11 +1526,19 @@ def genome_vcf(
                 raise ValueError("--gnomad-frequency-receipts requires --reference-fasta for exact allele identity")
             if session_id:
                 raise ValueError("--gnomad-frequency-receipts data are retained locally; do not combine them with --submit-session")
-            if gnomad_frequency_receipts.stat().st_size > 8_000_000:
-                raise ValueError("gnomAD frequency receipts exceed the 8 MB input limit")
-            gnomad_payload = json.loads(gnomad_frequency_receipts.read_text(encoding="utf-8"))
+            gnomad_payload = read_strict_json(gnomad_frequency_receipts, 8_000_000, "gnomAD frequency receipts")
             gnomad_receipts = gnomad_payload.get("receipts") if isinstance(gnomad_payload, dict) and isinstance(gnomad_payload.get("receipts"), list) else gnomad_payload if isinstance(gnomad_payload, list) else [gnomad_payload]
             gnomad_reconciliation = reconcile_gnomad_frequency(result, gnomad_receipts)
+        if (dbsnp_receipt_file is None) != (dbsnp_sequence_map_file is None):
+            raise ValueError("--dbsnp-receipt and --dbsnp-sequence-map must be provided together")
+        if dbsnp_receipt_file is not None:
+            if reference_fasta is None:
+                raise ValueError("--dbsnp-receipt requires --reference-fasta for exact SPDI normalization")
+            if session_id:
+                raise ValueError("--dbsnp-receipt data are retained locally; do not combine them with --submit-session")
+            dbsnp_receipt = read_strict_json(dbsnp_receipt_file, 8_000_000, "dbSNP receipt")
+            dbsnp_sequence_map = read_strict_json(dbsnp_sequence_map_file, 128_000, "dbSNP sequence map")
+            dbsnp_reconciliation = reconcile_dbsnp_placements(result, dbsnp_receipt, reference_fasta, genome_build, dbsnp_sequence_map)
     except (OSError, ValueError, httpx.HTTPError) as error:
         raise typer.BadParameter(str(error)) from error
     if output is not None and bundle_dir is not None:
@@ -1328,12 +1547,12 @@ def genome_vcf(
         raise typer.BadParameter("submit a local report with --output or stdout; private replay bundles are not uploaded")
     if bundle_dir is not None:
         try:
-            bundle = create_genomics_bundle(bundle_dir, result, input_file, genome_build, max_variants, reference_fasta, transcript_gff3, vep_result, clinvar_records=clinvar_records, gnomad_frequency_receipts=gnomad_receipts)
+            bundle = create_genomics_bundle(bundle_dir, result, input_file, genome_build, max_variants, reference_fasta, transcript_gff3, vep_result, clinvar_records=clinvar_records, gnomad_frequency_receipts=gnomad_receipts, dbsnp_receipt=dbsnp_receipt, dbsnp_sequence_accession_to_contig=dbsnp_sequence_map)
         except (OSError, ValueError, httpx.HTTPError) as error:
             raise typer.BadParameter(str(error)) from error
         typer.echo(json.dumps(bundle, ensure_ascii=False, indent=2))
         return
-    if vep_result is not None or clinvar_receipt is not None or gnomad_reconciliation is not None:
+    if vep_result is not None or clinvar_receipt is not None or gnomad_reconciliation is not None or dbsnp_reconciliation is not None:
         rendered_payload = {"genomic_report": result}
         if vep_result is not None:
             rendered_payload["external_vep_validation"] = vep_result
@@ -1344,6 +1563,9 @@ def genome_vcf(
         if gnomad_receipts is not None:
             rendered_payload["external_gnomad_frequency_receipts"] = gnomad_receipts
             rendered_payload["external_gnomad_frequency_reconciliation"] = gnomad_reconciliation
+        if dbsnp_reconciliation is not None:
+            rendered_payload["external_dbsnp_receipt"] = dbsnp_receipt
+            rendered_payload["external_dbsnp_reconciliation"] = dbsnp_reconciliation
     else:
         rendered_payload = result
     rendered = json.dumps(rendered_payload, ensure_ascii=False, indent=2)
@@ -1457,7 +1679,7 @@ def sequence_fastq(
 
 @app.command()
 def execute(session_id: str, max_tasks: int = 32, paper_limit: int | None = typer.Option(None, "--paper-limit", min=1, max=20, help="Override the depth-based source-record ceiling (standard 10, deep 20)"), agent_id: str | None = typer.Option(None, "--agent-id", help="Restrict leases to one registered scientific specialist")):
-    """Run validated research handlers through the AgentMesh MCP gateway."""
+    """Run validated research handlers through the configured authenticated MCP endpoint."""
     from medai_science.worker import execute_session
     try:
         agent_id = agent_id or os.getenv("MEDAI_SCIENTIFIC_AGENT_ID") or None
@@ -1470,7 +1692,7 @@ def execute(session_id: str, max_tasks: int = 32, paper_limit: int | None = type
 
 @app.command()
 def work(poll_seconds: int = 30, max_tasks: int = 32, paper_limit: int | None = typer.Option(None, "--paper-limit", min=1, max=20, help="Override the depth-based source-record ceiling (standard 10, deep 20)"), watch: bool = True, agent_id: str | None = typer.Option(None, "--agent-id", help="Run as one registered specialist actor with a task allowlist")):
-    """Continuously discover and execute runnable sessions through AgentMesh."""
+    """Continuously discover and execute runnable sessions through authenticated MCP."""
     from medai_science.worker import run_worker
     try:
         agent_id = agent_id or os.getenv("MEDAI_SCIENTIFIC_AGENT_ID") or None

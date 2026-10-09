@@ -4,6 +4,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import re
+import zlib
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -240,7 +241,7 @@ def _parse_gff3(path: Path) -> tuple[dict[str, _Transcript], str, str | None]:
                 elif lowered in _UTR_TYPES:
                     for parent in parents:
                         get_transcript(parent, contig, start, end, strand).utrs.append((start, end, _UTR_TYPES[lowered]))
-    except (OSError, UnicodeError, EOFError, gzip.BadGzipFile) as error:
+    except (OSError, UnicodeError, EOFError, gzip.BadGzipFile, zlib.error) as error:
         raise ValueError(f"could not read GFF3 annotation: {error}") from error
 
     if gff_version is None:

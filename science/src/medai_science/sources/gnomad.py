@@ -12,10 +12,101 @@ from typing import Any
 
 import httpx
 
-from medai_science.sources.bounded_http import read_bounded_response
+from medai_science.sources.bounded_http import event_loop_lock, read_bounded_response
 
 
 _VARIANT_ID = re.compile(r"^(?:chr)?(\d{1,2}|X|Y)-(\d+)-([ACGTN]+)-([ACGTN]+)$", re.IGNORECASE)
+_INTROSPECTION_QUERY = """query MedAISchemaContract {
+  query: __type(name: "Query") { fields { name args { name type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } }
+  variantDetails: __type(name: "VariantDetails") { fields { name type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } }
+  sequencingData: __type(name: "VariantSequencingTypeData") { fields { name type { kind name ofType { kind name ofType { kind name } } } } }
+  datasetId: __type(name: "DatasetId") { enumValues { name } }
+}"""
+
+
+def validate_gnomad_schema_contract(data: Any) -> dict[str, Any]:
+    """Fail closed unless live GraphQL introspection matches the fields we consume."""
+    if not isinstance(data, dict):
+        raise ValueError("gnomAD introspection data must be an object")
+
+    def require_type(name: str) -> dict[str, Any]:
+        item = data.get(name)
+        if not isinstance(item, dict):
+            raise ValueError(f"gnomAD schema is missing the {name} type")
+        return item
+
+    def type_name(ref: Any) -> str | None:
+        for _ in range(8):
+            if not isinstance(ref, dict):
+                return None
+            if isinstance(ref.get("name"), str):
+                return ref["name"]
+            ref = ref.get("ofType")
+        return None
+
+    def fields(item: dict[str, Any], typename: str) -> dict[str, dict[str, Any]]:
+        rows = item.get("fields")
+        if not isinstance(rows, list):
+            raise ValueError(f"gnomAD schema type {typename} has no field list")
+        result = {}
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("name"), str) or row["name"] in result:
+                raise ValueError(f"gnomAD schema type {typename} has malformed or duplicate fields")
+            result[row["name"]] = row
+        return result
+
+    query = fields(require_type("query"), "Query")
+    variant = query.get("variant")
+    if not isinstance(variant, dict) or type_name(variant.get("type")) != "VariantDetails":
+        raise ValueError("gnomAD Query.variant must return VariantDetails")
+    arguments = variant.get("args")
+    if not isinstance(arguments, list):
+        raise ValueError("gnomAD Query.variant has no argument list")
+    if any(not isinstance(row, dict) or not isinstance(row.get("name"), str) for row in arguments):
+        raise ValueError("gnomAD Query.variant has malformed argument records")
+    args = {row["name"]: row for row in arguments}
+    if len(args) != len(arguments):
+        raise ValueError("gnomAD Query.variant has duplicate argument names")
+    if type_name(args.get("variantId", {}).get("type")) != "String" or type_name(args.get("dataset", {}).get("type")) != "DatasetId":
+        raise ValueError("gnomAD Query.variant arguments no longer match variantId:String and dataset:DatasetId")
+
+    variant_fields = fields(require_type("variantDetails"), "VariantDetails")
+    if type_name(variant_fields.get("variant_id", {}).get("type")) != "String":
+        raise ValueError("gnomAD VariantDetails.variant_id must be String")
+    for name in ("genome", "exome"):
+        if type_name(variant_fields.get(name, {}).get("type")) != "VariantSequencingTypeData":
+            raise ValueError(f"gnomAD VariantDetails.{name} must be VariantSequencingTypeData")
+    sequencing = fields(require_type("sequencingData"), "VariantSequencingTypeData")
+    for name, expected in (("ac", "Int"), ("an", "Int"), ("af", "Float")):
+        if type_name(sequencing.get(name, {}).get("type")) != expected:
+            raise ValueError(f"gnomAD VariantSequencingTypeData.{name} must be {expected}")
+    dataset = require_type("datasetId")
+    enum_values = dataset.get("enumValues")
+    if not isinstance(enum_values, list) or any(
+        not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"]
+        for row in enum_values
+    ):
+        raise ValueError("gnomAD DatasetId enum values are malformed")
+    enum_names = [row["name"] for row in enum_values]
+    if len(enum_names) != len(set(enum_names)):
+        raise ValueError("gnomAD DatasetId enum contains duplicate values")
+    if "gnomad_r4" not in enum_names:
+        raise ValueError("gnomAD DatasetId no longer includes gnomad_r4")
+    try:
+        canonical_schema = json.dumps(
+            data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8", "strict")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ValueError("gnomAD introspection schema is not strict JSON") from error
+    return {
+        "provider": "gnomAD Browser GraphQL API",
+        "contract": "variant-frequency-v1",
+        "dataset": "gnomad_r4",
+        "fields": ["variant_id", "genome.ac", "genome.an", "genome.af", "exome.ac", "exome.an", "exome.af"],
+        "schema_sha256": hashlib.sha256(canonical_schema).hexdigest(),
+        "introspection_query_sha256": hashlib.sha256(_INTROSPECTION_QUERY.encode("utf-8")).hexdigest(),
+        "validated": True,
+    }
 
 
 def validate_callset_frequency(value: Any, callset: str) -> dict[str, Any] | None:
@@ -45,7 +136,6 @@ class GnomADClient:
     max_response_bytes = 1_000_000
     min_interval_seconds = 6.1
     _last_request_at = 0.0
-    _pace_lock = asyncio.Lock()
 
     def __init__(self, client_factory=None, transport=None, timeout: float = 20):
         self.client_factory = client_factory or httpx.AsyncClient
@@ -71,7 +161,7 @@ class GnomADClient:
         return f"{contig.upper() if not contig.isdigit() else int(contig)}-{int(position)}-{ref}-{alt}"
 
     async def _pace(self) -> None:
-        async with self._pace_lock:
+        async with event_loop_lock("gnomad"):
             delay = self.min_interval_seconds - (time.monotonic() - self._last_request_at)
             if delay > 0:
                 await asyncio.sleep(delay)
@@ -92,7 +182,11 @@ class GnomADClient:
                 raw = await read_bounded_response(response, self.max_response_bytes, "gnomAD GraphQL")
                 response.raise_for_status()
         try:
-            payload = json.loads(raw, object_pairs_hook=self._unique_object)
+            payload = json.loads(
+                raw,
+                object_pairs_hook=self._unique_object,
+                parse_constant=self._reject_nonfinite_json,
+            )
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise ValueError("gnomAD returned invalid or duplicate-key JSON") from error
         if not isinstance(payload, dict) or payload.get("errors"):
@@ -129,6 +223,31 @@ class GnomADClient:
             "interpretation_limit": "The requested variant ID is canonicalized syntactically only; this lookup does not verify the reference allele or left-align indels. Use a reference-validated local VCF analysis for representation normalization before exact reconciliation. Exome and genome allele counts are separate callsets and must not be summed as if they were disjoint cohorts. These population observations do not establish individual genotype, pathogenicity, disease causality, or clinical risk.",
         }
 
+    async def verify_schema_contract(self) -> dict[str, Any]:
+        """Query the live provider introspection endpoint and validate our selection."""
+        await self._pace()
+        async with self.client_factory(transport=self.transport, timeout=self.timeout, follow_redirects=False) as client:
+            async with client.stream(
+                "POST", self.endpoint, json={"query": _INTROSPECTION_QUERY},
+                headers={"Accept": "application/json"},
+            ) as response:
+                raw = await read_bounded_response(response, self.max_response_bytes, "gnomAD GraphQL introspection")
+                response.raise_for_status()
+        try:
+            payload = json.loads(
+                raw,
+                object_pairs_hook=self._unique_object,
+                parse_constant=self._reject_nonfinite_json,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ValueError("gnomAD introspection returned invalid or duplicate-key JSON") from error
+        if not isinstance(payload, dict) or payload.get("errors"):
+            raise ValueError("gnomAD GraphQL introspection returned an error")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("gnomAD introspection is missing its data object")
+        return validate_gnomad_schema_contract(data)
+
     @staticmethod
     def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result = {}
@@ -137,3 +256,7 @@ class GnomADClient:
                 raise ValueError("duplicate JSON key")
             result[key] = value
         return result
+
+    @staticmethod
+    def _reject_nonfinite_json(value: str) -> None:
+        raise ValueError(f"gnomAD returned non-standard JSON number {value}")

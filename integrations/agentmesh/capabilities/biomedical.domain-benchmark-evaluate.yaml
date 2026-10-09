@@ -1,0 +1,48 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.domain-benchmark-evaluate
+  version: 0.1.0
+  intent: Evaluate one independently adjudicated, source-digest-bound biomedical benchmark retained in the same research session and preserve domain-separated metrics.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, input_artifact_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, const: benchmark.evaluate }
+      input_artifact_id: { type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$' }
+      bins: { type: integer, minimum: 2, maximum: 100, default: 10 }
+  outputs:
+    type: object
+    required: [benchmark_id, benchmark_sha256, total_cases, complete_domain_coverage, missing_domains, domains, adjudication_integrity, artifact_id, interpretation_limit]
+    properties:
+      benchmark_id: { type: string }
+      benchmark_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      total_cases: { type: integer, minimum: 1 }
+      complete_domain_coverage: { type: boolean }
+      missing_domains: { type: array, items: { type: string, enum: [genomics, proteomics, pharmacology, literature_extraction] } }
+      domains: { type: object }
+      adjudication_integrity:
+        type: object
+        required: [case_schema_validated, evidence_digest_field_format_validated, evidence_source_content_verified, reviewer_identity_or_independence_verified, adjudication_protocol_externally_audited]
+        properties:
+          case_schema_validated: { type: boolean, const: true }
+          evidence_digest_field_format_validated: { type: boolean, const: true }
+          evidence_source_content_verified: { type: boolean, const: false }
+          reviewer_identity_or_independence_verified: { type: boolean, const: false }
+          adjudication_protocol_externally_audited: { type: boolean, const: false }
+      artifact_id: { type: string, minLength: 1 }
+      interpretation_limit: { type: string, minLength: 1 }
+  successEvidence:
+    - id: same-session-source-bound-benchmark-evaluated
+      assertion: exact_adjudicated_input_artifact_hash_is_bound_to_retained_domain_separated_metrics
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [read_only, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.domain_benchmark.evaluate]
+implementations:
+  - id: medai-domain-benchmark-evaluator
+    kind: mcp
+    reference: mcp://medai/medai_biomedical_domain_benchmark_evaluate

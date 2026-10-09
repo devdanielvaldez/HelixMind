@@ -1,17 +1,19 @@
 """NCBI E-utilities adapter. Respects API limits and retains source identifiers."""
 from __future__ import annotations
 import asyncio
-import json
 import os
 import time
 import xml.etree.ElementTree as ET
+from typing import TYPE_CHECKING
 import httpx
-from medai_science.models import Paper, SourceRecord
 from medai_science.sources.safety import ensure_public_research_query
-from medai_science.sources.bounded_http import read_bounded_response
+from medai_science.sources.bounded_http import event_loop_lock, read_bounded_response
 from medai_science.sources.xml_safety import reject_xml_declarations
-from medai_science.sources.pubmed_search import add_fetch_coverage, parse_esearch_response, parse_related_publications
+from medai_science.sources.pubmed_search import add_fetch_coverage, parse_esearch_response, parse_related_publications, validate_pmid_snapshot
 from medai_science.sources.pubmed_cache import PubMedSearchCache
+
+if TYPE_CHECKING:
+    from medai_science.models import Paper
 
 BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 MAX_SEARCH_RESPONSE_BYTES = 2_000_000
@@ -19,6 +21,9 @@ MAX_FETCH_RESPONSE_BYTES = 25 * 1024 * 1024
 MAX_BIBLIOGRAPHIC_RESPONSE_BYTES = 5 * 1024 * 1024
 
 class PubMedClient:
+    _last_request = 0.0
+    _last_min_interval = 0.0
+
     def __init__(self, email: str, api_key: str | None = None, timeout: float = 20, transport: httpx.AsyncBaseTransport | None = None, search_cache_path: str | None = None):
         if not email or "@" not in email:
             raise ValueError("NCBI requests require a valid contact email")
@@ -28,18 +33,18 @@ class PubMedClient:
         self.timeout = timeout
         self.transport = transport
         self._min_interval = 0.11 if api_key else 0.34
-        self._request_lock = asyncio.Lock()
-        self._last_request = 0.0
         cache_path = search_cache_path or os.environ.get("MEDAI_PUBMED_SEARCH_CACHE")
         self.search_cache = PubMedSearchCache(cache_path) if cache_path else None
 
     async def _get(self, client: httpx.AsyncClient, endpoint: str, params: dict, max_bytes: int) -> bytes:
-        async with self._request_lock:
-            delay = self._min_interval - (time.monotonic() - self._last_request)
+        async with event_loop_lock("pubmed"):
+            minimum_interval = max(self._min_interval, type(self)._last_min_interval)
+            delay = minimum_interval - (time.monotonic() - type(self)._last_request)
             if delay > 0:
                 await asyncio.sleep(delay)
             async with client.stream("GET", BASE + endpoint, params=params, headers={"Accept-Encoding": "identity"}) as response:
-                self._last_request = time.monotonic()
+                type(self)._last_request = time.monotonic()
+                type(self)._last_min_interval = self._min_interval
                 return await read_bounded_response(response, max_bytes, f"PubMed {endpoint}")
 
     async def search(self, query: str, limit: int = 20) -> list[str]:
@@ -49,13 +54,13 @@ class PubMedClient:
     async def search_with_coverage(self, query: str, limit: int = 20) -> tuple[list[str], dict]:
         """Return the bounded PMID page and the provider-reported total search count."""
         query = ensure_public_research_query(query)
-        if not 1 <= limit <= 200:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
             raise ValueError("limit must be 1..200")
         if self.search_cache is not None:
             cached = self.search_cache.get(query, limit)
             if cached is not None:
                 return cached
-        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout) as client:
+        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout, follow_redirects=False) as client:
             raw = await self._get(client, "esearch.fcgi", {**self.params, "db": "pubmed", "term": query, "retmax": limit, "retmode": "json"}, MAX_SEARCH_RESPONSE_BYTES)
             identifiers, coverage = parse_esearch_response(raw, limit)
         if self.search_cache is not None:
@@ -65,26 +70,24 @@ class PubMedClient:
     async def search_recent_ids(self, query: str, window_days: int, limit: int = 200) -> tuple[int, list[str]]:
         """Return recent PMID identifiers and PubMed's total count for an overlapping EDAT window."""
         query = ensure_public_research_query(query)
-        if not 1 <= window_days <= 365 or not 1 <= limit <= 200:
+        if (isinstance(window_days, bool) or not isinstance(window_days, int) or not 1 <= window_days <= 365
+                or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200):
             raise ValueError("window_days must be 1..365 and limit must be 1..200")
-        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout) as client:
+        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout, follow_redirects=False) as client:
             raw = await self._get(client, "esearch.fcgi", {
                 **self.params, "db": "pubmed", "term": query, "retmax": limit,
                 "retmode": "json", "reldate": window_days, "datetype": "edat", "sort": "pub_date",
             }, MAX_SEARCH_RESPONSE_BYTES)
-        result = json.loads(raw)["esearchresult"]
-        identifiers = result.get("idlist", [])
-        count = int(result.get("count", len(identifiers)))
-        if count < 0 or any(not isinstance(value, str) or not value.isdigit() for value in identifiers):
-            raise ValueError("PubMed returned an invalid count or PMID list")
-        return count, identifiers
+        identifiers, coverage = parse_esearch_response(raw, limit)
+        return coverage["total_hits"], identifiers
 
     async def fetch(self, identifiers: list[str]) -> list[Paper]:
+        if not isinstance(identifiers, list):
+            raise ValueError("fetch requires a list of unique ASCII numeric PubMed identifiers")
         if not identifiers:
             return []
-        if len(identifiers) > 200 or any(not x.isdigit() for x in identifiers):
-            raise ValueError("fetch accepts at most 200 numeric PubMed identifiers")
-        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout) as client:
+        validate_pmid_snapshot(identifiers, max_items=200)
+        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout, follow_redirects=False) as client:
             raw = await self._get(client, "efetch.fcgi", {**self.params, "db": "pubmed", "id": ",".join(identifiers), "retmode": "xml"}, MAX_FETCH_RESPONSE_BYTES)
         reject_xml_declarations(raw, "PubMed EFetch")
         root = ET.fromstring(raw)
@@ -128,6 +131,8 @@ class PubMedClient:
             pages = article.findtext(".//Pagination/MedlinePgn")
             language = article.findtext(".//Language")
             if pmid:
+                from medai_science.models import Paper, SourceRecord
+
                 identifiers = {}
                 for article_id in article.findall(".//PubmedData/ArticleIdList/ArticleId"):
                     kind = article_id.attrib.get("IdType", "").casefold()
@@ -139,11 +144,12 @@ class PubMedClient:
 
     async def fetch_bibliographic(self, identifiers: list[str]) -> list[dict[str, str | None]]:
         """Fetch compact PubMed citation metadata without downloading article abstracts."""
+        if not isinstance(identifiers, list):
+            raise ValueError("bibliographic fetch requires a list of unique ASCII numeric PubMed identifiers")
         if not identifiers:
             return []
-        if len(identifiers) > 20 or any(not value.isdigit() for value in identifiers):
-            raise ValueError("bibliographic fetch accepts at most 20 numeric PubMed identifiers")
-        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout) as client:
+        validate_pmid_snapshot(identifiers, max_items=20)
+        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout, follow_redirects=False) as client:
             raw = await self._get(client, "esummary.fcgi", {**self.params, "db": "pubmed", "id": ",".join(identifiers), "retmode": "xml"}, MAX_BIBLIOGRAPHIC_RESPONSE_BYTES)
         reject_xml_declarations(raw, "PubMed ESummary")
         root = ET.fromstring(raw)

@@ -1,0 +1,26 @@
+[Unit]
+Description=Create, verify, and retain MedAI SQLite backups
+OnFailure=medai-backup-alert@%n.service
+
+[Service]
+Type=oneshot
+User=medai
+Group=medai
+EnvironmentFile=/etc/medai/backup.env
+ExecStart=/usr/local/libexec/medai-backup.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/medai
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX
+CPUQuota=100%
+MemoryMax=1G
+TimeoutStartSec=30min

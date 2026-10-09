@@ -5,7 +5,7 @@ import hashlib
 import json
 from typing import Any
 
-from medai_science.llm import JSONModelProvider, ModelCompletion, _validate_schema
+from medai_science.llm import JSONModelProvider, ModelCompletion, _validate_schema, complete_structured_json
 from medai_science.sources.safety import ensure_public_research_query
 from medai_science.orchestrator import DEFAULT_PLAN
 
@@ -100,7 +100,8 @@ async def plan_research_objective(provider: JSONModelProvider, objective: str, d
         "Prepare 1-3 distinct PubMed search queries, one ClinicalTrials.gov search query, "
         "a concise normalized question, grounded concepts, and scope notes. Query text must contain no patient identifiers."
     )
-    completion = await provider.complete_json(
+    completion = await complete_structured_json(
+        provider,
         system=_SYSTEM,
         prompt=prompt,
         schema_name="biomedical_research_objective_plan_v2",

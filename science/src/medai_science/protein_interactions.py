@@ -31,9 +31,26 @@ def _primary_identifier(value: str) -> str | None:
     identifiers = _identifiers(value)
     if not identifiers:
         return None
-    priority = {name: index for index, name in enumerate(_STABLE_ID_ORDER)}
-    namespace, identifier = min(identifiers, key=lambda item: (priority[item[0]], item[1]))
+    for namespace in _STABLE_ID_ORDER:
+        candidates = sorted({identifier for candidate_namespace, identifier in identifiers if candidate_namespace == namespace})
+        if not candidates:
+            continue
+        # Multiple identifiers in the preferred namespace are not safely
+        # resolvable by lexical ordering; doing so could create a false pair.
+        if len(candidates) != 1:
+            return None
+        identifier = candidates[0]
+        break
     return f"{namespace}:{identifier}"
+
+
+def _ambiguous_primary_identifiers(value: str) -> list[str]:
+    identifiers = _identifiers(value)
+    for namespace in _STABLE_ID_ORDER:
+        candidates = sorted({identifier for candidate_namespace, identifier in identifiers if candidate_namespace == namespace})
+        if candidates:
+            return [f"{namespace}:{identifier}" for identifier in candidates] if len(candidates) > 1 else []
+    return []
 
 
 def _xrefs(value: str, namespace: str | None = None) -> list[tuple[str, str]]:
@@ -76,7 +93,10 @@ def _row_key(record: dict[str, Any]) -> tuple[tuple[str, int | None, tuple[str, 
     second = _participant(str(record.get("interactor_b", "")), _taxon_id(str(record.get("organism_b", ""))), str(record.get("biological_role_b", "")))
     if first is None or second is None:
         return None
-    return tuple(sorted((first, second), key=lambda item: (item[0], item[1] or 0)))  # type: ignore[return-value]
+    # Include roles in the tie-breaker: homomer records have identical stable
+    # participant IDs/taxa, so sorting only on identity preserves source order
+    # and would split otherwise equivalent records when their endpoints swap.
+    return tuple(sorted((first, second), key=lambda item: (item[0], item[1] or 0, item[2])))  # type: ignore[return-value]
 
 
 def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
@@ -96,8 +116,20 @@ def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
         "complex_expansion": _mi_terms(str(record.get("complex_expansion", ""))),
         "intact_record_ids": intact_ids,
         "source_confidence_values": sorted(set(str(record.get("confidence", "")).split("|")) - {"", "-"}),
-        "source_record_hash": hashlib.sha256(str(record.get("raw_mitab", "")).encode("utf-8")).hexdigest(),
+        "source_record_hash": _source_record_hash(record),
     }
+
+
+def _source_record_hash(record: dict[str, Any]) -> str:
+    raw = record.get("raw_mitab")
+    if isinstance(raw, str):
+        if not raw or "\x00" in raw:
+            raise ValueError("IntAct source row must be nonempty valid MITAB text")
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    digest = record.get("source_record_sha256")
+    if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+        return digest
+    raise ValueError("IntAct record requires its exact MITAB row or a valid source-row SHA-256")
 
 
 def reconcile_interactions(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -105,13 +137,25 @@ def reconcile_interactions(records: list[dict[str, Any]]) -> dict[str, Any]:
     grouped: dict[tuple[tuple[str, int | None, tuple[str, ...]], tuple[str, int | None, tuple[str, ...]]], list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
     unresolved: list[dict[str, Any]] = []
     for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("IntAct reconciliation records must be objects")
+        _source_record_hash(record)
         key = _row_key(record)
         if key is None:
+            ambiguous = {
+                name: candidates
+                for name, candidates in (
+                    ("interactor_a", _ambiguous_primary_identifiers(str(record.get("interactor_a", "")))),
+                    ("interactor_b", _ambiguous_primary_identifiers(str(record.get("interactor_b", "")))),
+                )
+                if candidates
+            }
             unresolved.append({
-                "reason": "no_supported_stable_participant_identifiers",
+                "reason": "ambiguous_preferred_stable_participant_identifiers" if ambiguous else "no_supported_stable_participant_identifiers",
+                "ambiguous_interactor_candidates": ambiguous,
                 "interactor_a": record.get("interactor_a"),
                 "interactor_b": record.get("interactor_b"),
-                "source_record_hash": hashlib.sha256(str(record.get("raw_mitab", "")).encode("utf-8")).hexdigest(),
+                "source_record_hash": _source_record_hash(record),
             })
             continue
         grouped[key].append((record, _record_metadata(record)))
@@ -133,7 +177,7 @@ def reconcile_interactions(records: list[dict[str, Any]]) -> dict[str, Any]:
             experimental_roles.update(metadata["experimental_roles"])
             complex_expansions.update(metadata["complex_expansion"])
             intact_ids.update(metadata["intact_record_ids"])
-            exact_rows[str(record.get("raw_mitab", ""))] += 1
+            exact_rows[_source_record_hash(record)] += 1
             if not metadata["pubmed_ids"]:
                 records_without_publication.append(metadata["source_record_hash"])
             if not metadata["intact_record_ids"]:

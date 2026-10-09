@@ -53,7 +53,12 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
         chunks.push(value);
       }
     }
-    body = new Blob(chunks);
+    const blobParts = chunks.map((chunk) => {
+      const part = new ArrayBuffer(chunk.byteLength);
+      new Uint8Array(part).set(chunk);
+      return part;
+    });
+    body = new Blob(blobParts);
   }
   try {
     const upstream = await fetch(target, { method: request.method, headers, body, cache: "no-store", redirect: "manual", signal: request.signal });

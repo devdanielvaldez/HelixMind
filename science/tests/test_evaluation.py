@@ -2,14 +2,123 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 
-from medai_science.evaluation import _wilson_precision_lower_bound, calibrate_capability_reuse_threshold, evaluate_adjudicated_cases, load_pinned_capability_calibration
+from medai_science.evaluation import _wilson_interval, _wilson_precision_lower_bound, calibrate_capability_reuse_threshold, evaluate_adjudicated_cases, evaluate_drug_pair_benchmark, load_pinned_capability_calibration, write_private_report_no_overwrite
 
 
 class BenchmarkEvaluationTests(unittest.TestCase):
+    def test_wilson_intervals_cover_small_and_boundary_samples(self):
+        interval = _wilson_interval(1, 2)
+        self.assertIsNotNone(interval)
+        self.assertAlmostEqual(interval["lower"], 0.09453120573423074)
+        self.assertAlmostEqual(interval["upper"], 0.9054687942657693)
+        all_successes = _wilson_interval(2, 2)
+        self.assertGreater(all_successes["lower"], 0.3)
+        self.assertEqual(all_successes["upper"], 1.0)
+        self.assertIsNone(_wilson_interval(0, 0))
+        with self.assertRaisesRegex(ValueError, "integers"):
+            _wilson_interval(True, 2)
+        with self.assertRaisesRegex(ValueError, "0 <= successes"):
+            _wilson_interval(3, 2)
+
+    def test_categorical_metrics_include_nominal_binomial_uncertainty(self):
+        result = evaluate_drug_pair_benchmark(self.drug_pair_benchmark())
+        metrics = result["retrieval"]["overall"]
+        self.assertEqual(metrics["accuracy_wilson_95_ci"], _wilson_interval(3, 5))
+        retrieved = metrics["per_label"]["retrieved"]
+        self.assertEqual(retrieved["precision_wilson_95_ci"], _wilson_interval(2, 3))
+        self.assertEqual(retrieved["recall_wilson_95_ci"], _wilson_interval(2, 3))
+        self.assertIn("assume independent cases", metrics["interval_interpretation"])
+
+    @staticmethod
+    def drug_pair_benchmark():
+        protocol = "Synthetic evaluator fixture only. Two blinded independent primary reviewers; distinct third reviewer resolves disagreements."
+
+        def row(case_id, evidence_type, digest, expected, predicted, confidence=0.8):
+            reviewers = [
+                {"reviewer_id": "r1", "role": "reviewer", "label": expected},
+                {"reviewer_id": "r2", "role": "reviewer", "label": expected},
+            ]
+            return {"case_id": case_id, "evidence_sha256": digest, "evidence_type": evidence_type,
+                    "reviewers": reviewers, "predicted": predicted, "confidence": confidence}
+
+        retrieval_cases = [
+            row("label-1", "versioned_label", "a" * 64, "retrieved", "retrieved"),
+            row("label-2", "versioned_label", "b" * 64, "retrieved", "not_retrieved", 0.6),
+            row("pubmed-1", "pubmed_record", "c" * 64, "retrieved", "retrieved"),
+            row("pubmed-2", "pubmed_record", "d" * 64, "not_retrieved", "not_retrieved"),
+            row("pmc-1", "pmc_full_text", "e" * 64, "not_retrieved", "retrieved", 0.7),
+        ]
+        conflict_cases = [
+            row("label-1", "versioned_label", "a" * 64, "conflict", "conflict"),
+            row("pubmed-1", "pubmed_record", "c" * 64, "no_conflict", "conflict", 0.55),
+        ]
+
+        def stage(cases):
+            return {"schema_version": "2", "benchmark_id": "synthetic-drug-pair-evaluator-fixture",
+                    "labeling_protocol": protocol, "cases": cases}
+
+        return {"schema_version": "1", "benchmark_id": "synthetic-drug-pair-evaluator-fixture",
+                "labeling_protocol": protocol, "retrieval": stage(retrieval_cases),
+                "conflict_screen": stage(conflict_cases)}
+
+    def test_drug_pair_benchmark_separates_retrieval_and_conditional_conflict_metrics(self):
+        result = evaluate_drug_pair_benchmark(self.drug_pair_benchmark(), bins=5)
+        self.assertEqual(result["retrieval"]["overall"]["n"], 5)
+        self.assertAlmostEqual(result["retrieval"]["overall"]["per_label"]["retrieved"]["recall"], 2 / 3)
+        self.assertEqual(result["retrieval"]["by_evidence_type"]["versioned_label"]["n"], 2)
+        self.assertEqual(result["retrieval"]["by_evidence_type"]["pubmed_record"]["per_label"]["retrieved"]["precision"], 1.0)
+        self.assertEqual(result["conflict_screen"]["overall"]["n"], 2)
+        self.assertEqual(result["conflict_screen"]["by_evidence_type"]["versioned_label"]["n"], 1)
+        self.assertIn("conditional on retrieval", result["conflict_screen_population"])
+        self.assertEqual(len(result["benchmark_sha256"]), 64)
+        self.assertIn("Fixture benchmarks validate evaluator logic only", result["interpretation_limit"])
+
+    def test_drug_pair_benchmark_rejects_unretrieved_or_mismatched_source_screen_cases(self):
+        benchmark = self.drug_pair_benchmark()
+        benchmark["conflict_screen"]["cases"][0]["evidence_sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "exact source digest"):
+            evaluate_drug_pair_benchmark(benchmark)
+        benchmark = self.drug_pair_benchmark()
+        benchmark["conflict_screen"]["cases"].append({**benchmark["retrieval"]["cases"][1], "reviewers": [
+            {"reviewer_id": "r1", "role": "reviewer", "label": "conflict"},
+            {"reviewer_id": "r2", "role": "reviewer", "label": "conflict"}], "predicted": "conflict"})
+        with self.assertRaisesRegex(ValueError, "exact source digest"):
+            evaluate_drug_pair_benchmark(benchmark)
+
+    def test_drug_pair_benchmark_requires_distinct_adjudication_and_task_scales(self):
+        benchmark = self.drug_pair_benchmark()
+        case = benchmark["retrieval"]["cases"][0]
+        case["reviewers"][1]["label"] = "not_retrieved"
+        with self.assertRaisesRegex(ValueError, "third-party adjudicator"):
+            evaluate_drug_pair_benchmark(benchmark)
+        benchmark = self.drug_pair_benchmark()
+        benchmark["conflict_screen"]["cases"][0]["reviewers"][0]["label"] = "retrieved"
+        with self.assertRaisesRegex(ValueError, "task-specific scale"):
+            evaluate_drug_pair_benchmark(benchmark)
+
+    def test_drug_pair_benchmark_rejects_non_scalar_labels_as_validation_errors(self):
+        mutations = (
+            ("evidence_type", ["versioned_label"], "unsupported evidence_type"),
+            ("predicted", ["retrieved"], "prediction is outside"),
+        )
+        for field, value, message in mutations:
+            with self.subTest(field=field):
+                benchmark = self.drug_pair_benchmark()
+                benchmark["retrieval"]["cases"][0][field] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    evaluate_drug_pair_benchmark(benchmark)
+
+        benchmark = self.drug_pair_benchmark()
+        benchmark["conflict_screen"]["cases"][0]["reviewers"][0]["label"] = ["conflict"]
+        with self.assertRaisesRegex(ValueError, "label outside its task-specific scale"):
+            evaluate_drug_pair_benchmark(benchmark)
+
     def test_double_adjudicated_v2_reports_primary_agreement_and_third_party_resolution(self):
         benchmark = {
             "schema_version": "2",
@@ -45,6 +154,48 @@ class BenchmarkEvaluationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "third-party adjudicator"):
             evaluate_adjudicated_cases(benchmark)
+
+    def test_double_adjudicated_v2_rejects_repeated_source_digest(self):
+        benchmark = {
+            "schema_version": "2", "benchmark_id": "duplicate-source-fixture", "labeling_protocol": "Two primary reviewers.",
+            "cases": [
+                {"case_id": "case-one", "evidence_sha256": "e" * 64, "evidence_type": "paper", "reviewers": [
+                    {"reviewer_id": "r1", "role": "reviewer", "label": "supports"},
+                    {"reviewer_id": "r2", "role": "reviewer", "label": "supports"},
+                ], "predicted": "supports", "confidence": 0.8},
+                {"case_id": "case-two", "evidence_sha256": "e" * 64, "evidence_type": "paper", "reviewers": [
+                    {"reviewer_id": "r1", "role": "reviewer", "label": "supports"},
+                    {"reviewer_id": "r2", "role": "reviewer", "label": "supports"},
+                ], "predicted": "supports", "confidence": 0.8},
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "unique to avoid repeated-source"):
+            evaluate_adjudicated_cases(benchmark)
+
+    def test_cohen_kappa_is_grouped_by_reviewer_pair_and_independent_of_input_order(self):
+        protocol = "Two blinded primary reviewers label each source; a distinct third reviewer resolves disagreement."
+
+        def case(case_id, digest, reviewers, prediction):
+            return {"case_id": case_id, "evidence_sha256": digest * 64, "evidence_type": "paper",
+                    "reviewers": reviewers, "predicted": prediction, "confidence": 0.8}
+
+        def reviewers(first, first_label, second, second_label):
+            return [
+                {"reviewer_id": first, "role": "reviewer", "label": first_label},
+                {"reviewer_id": second, "role": "reviewer", "label": second_label},
+            ]
+        benchmark = {"schema_version": "2", "benchmark_id": "multiple-review-panels", "labeling_protocol": protocol,
+                     "cases": [
+                         case("ab-1", "a", reviewers("reviewer-a", "supports", "reviewer-b", "supports"), "supports"),
+                         case("ab-2", "b", reviewers("reviewer-b", "contradicts", "reviewer-a", "contradicts"), "contradicts"),
+                         case("cd-1", "c", reviewers("reviewer-c", "supports", "reviewer-d", "contradicts") + [{"reviewer_id": "reviewer-x", "role": "adjudicator", "label": "supports"}], "supports"),
+                         case("cd-2", "d", reviewers("reviewer-c", "contradicts", "reviewer-d", "supports") + [{"reviewer_id": "reviewer-y", "role": "adjudicator", "label": "contradicts"}], "contradicts"),
+                     ]}
+        quality = evaluate_adjudicated_cases(benchmark)["adjudication_quality"]["primary_reviewers"]
+        self.assertEqual(quality["raw_agreement"], 0.5)
+        self.assertIsNone(quality["cohen_kappa"])
+        self.assertEqual(quality["cohen_kappa_by_reviewer_pair"]["reviewer-a|reviewer-b"], {"n": 2, "cohen_kappa": 1.0})
+        self.assertEqual(quality["cohen_kappa_by_reviewer_pair"]["reviewer-c|reviewer-d"], {"n": 2, "cohen_kappa": -1.0})
 
     @staticmethod
     def capability_benchmark():
@@ -136,6 +287,30 @@ class BenchmarkEvaluationTests(unittest.TestCase):
         self.assertGreaterEqual(_wilson_precision_lower_bound(120, 120), 0.95)
         with self.assertRaisesRegex(ValueError, "positive trials"):
             _wilson_precision_lower_bound(0, 0)
+
+    def test_calibration_report_is_private_atomic_and_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "nested" / "calibration.json"
+            digest = write_private_report_no_overwrite(target, '{"threshold":0.9}\n')
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"threshold":0.9}\n')
+            self.assertEqual(digest, hashlib.sha256(target.read_bytes()).hexdigest())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            with self.assertRaisesRegex(FileExistsError, "refusing to overwrite"):
+                write_private_report_no_overwrite(target, '{"threshold":0.5}\n')
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"threshold":0.9}\n')
+
+    def test_calibration_report_rejects_symlink_outputs(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks are unavailable")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            protected = root / "protected.json"
+            protected.write_text("keep", encoding="utf-8")
+            link = root / "calibration.json"
+            link.symlink_to(protected)
+            with self.assertRaisesRegex(ValueError, "cannot be a symlink"):
+                write_private_report_no_overwrite(link, "replace")
+            self.assertEqual(protected.read_text(encoding="utf-8"), "keep")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@ _CORE_STEPS = (
     "objective.normalize", "literature.discover", "literature.extract", "entities.resolve",
     "evidence.grade", "hypotheses.propose", "hypotheses.criticize", "report.reproduce",
 )
+_TASK_STATES = {"blocked", "ready", "running", "succeeded", "failed", "needs_review", "skipped"}
+_OPTIONAL_DEPENDENCY_AGGREGATORS = {"graph.build", "report.reproduce"}
 
 
 def _canonical_hash(value: Any) -> str:
@@ -71,7 +73,32 @@ def learn_research_skill_batch(
         tasks = plan.get("tasks") if isinstance(plan, dict) else None
         if not isinstance(tasks, list) or plan.get("session_id") not in (None, session_id):
             raise ValueError("completed session is missing its same-session live task plan")
-        live_by_id = {task.get("id"): task for task in tasks if isinstance(task, dict) and isinstance(task.get("id"), str)}
+        bundle_tasks = bundle["tasks"]
+        live_by_id: dict[str, dict[str, Any]] = {}
+        bundle_by_id: dict[str, dict[str, Any]] = {}
+        for rows, destination, label in ((tasks, live_by_id, "live task plan"), (bundle_tasks, bundle_by_id, "bundle task receipts")):
+            for task in rows:
+                if not isinstance(task, dict) or not isinstance(task.get("id"), str) or not task["id"]:
+                    raise ValueError(f"completed session has malformed {label}")
+                task_id = task["id"]
+                if task_id in destination:
+                    raise ValueError(f"completed session has duplicate {label} identity")
+                status = task.get("status")
+                if not isinstance(status, str) or status not in _TASK_STATES:
+                    raise ValueError(f"completed session has invalid {label} status")
+                destination[task_id] = task
+        for task_id, live_task in live_by_id.items():
+            receipt = bundle_by_id.get(task_id)
+            if receipt is None:
+                continue  # Older bundles can predate a registered optional DAG stage.
+            observed = receipt["status"]
+            if task_id == "report.reproduce" and observed == "running" and live_task["status"] == "succeeded":
+                continue  # The report snapshot is necessarily taken before this task is finalized.
+            if observed != live_task["status"]:
+                raise ValueError("completed session live task outcomes differ from the hash-verified bundle")
+        for task_id in _CORE_STEPS:
+            if task_id not in live_by_id or task_id not in bundle_by_id:
+                raise ValueError("completed session is missing a core task outcome from its bundle")
         if live_by_id.get("report.reproduce", {}).get("status") != "succeeded":
             continue
         valid.append({"session_id": session_id, "bundle_sha256": bundle["bundle_sha256"], "tasks": live_by_id, "created_at": row.get("created_at", 0)})
@@ -104,6 +131,21 @@ def learn_research_skill_batch(
             "attempted_sessions": len(attempted),
             "observed_success_fraction": passed / len(attempted),
         })
+    # A sequence learned from older or partial sessions must still be a valid
+    # executable subset of today's DAG. Aggregators may consume partial inputs;
+    # every other stage requires its registered prerequisites in the procedure.
+    step_by_id = {step["task_id"]: step for step in steps}
+    changed = True
+    while changed:
+        changed = False
+        for step in tuple(steps):
+            task = next(registered for registered in DEFAULT_PLAN if registered.id == step["task_id"])
+            if task.id in _OPTIONAL_DEPENDENCY_AGGREGATORS:
+                continue
+            if any(dependency not in step_by_id for dependency in task.depends_on):
+                step_by_id.pop(task.id)
+                steps.remove(step)
+                changed = True
     step_ids = {step["task_id"] for step in steps}
     if not set(_CORE_STEPS).issubset(step_ids):
         registry.setdefault("evaluated_batches", []).append({"session_ids": [item["session_id"] for item in batch], "result": "no_common_core_procedure"})

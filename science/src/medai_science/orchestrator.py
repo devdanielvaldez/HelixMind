@@ -31,13 +31,15 @@ DEFAULT_PLAN = (
     ResearchStep("proteins.analyze", "proteomics", "Map protein functions, structures, and interactions", ("entities.resolve",)),
     ResearchStep("pathways.map", "pathways", "Connect entities to pathway evidence", ("entities.resolve",)),
     ResearchStep("trials.discover", "clinical_trials", "Retrieve registry records without making treatment recommendations", ("objective.normalize",)),
-    ResearchStep("drugs.investigate", "pharmacology", "Connect compounds and targets to sourced evidence", ("entities.resolve", "trials.discover")),
+    ResearchStep("compounds.analyze", "chemistry", "Resolve source-identified compounds to exact chemical identities", ("literature.extract",)),
+    ResearchStep("drugs.investigate", "pharmacology", "Connect exact compound identities and targets to sourced pharmacology evidence", ("compounds.analyze", "entities.resolve", "trials.discover")),
     ResearchStep("contradictions.search", "evidence", "Search for contrary findings and methodological differences", ("evidence.grade", "entities.resolve")),
-    ResearchStep("graph.build", "knowledge_graph", "Persist only source-linked nodes and edges", ("entities.resolve", "evidence.grade", "genomics.analyze", "proteins.analyze", "pathways.map", "genes.curate", "drugs.investigate")),
+    ResearchStep("graph.build", "knowledge_graph", "Persist only source-linked nodes and edges", ("entities.resolve", "evidence.grade", "genomics.analyze", "proteins.analyze", "pathways.map", "genes.curate", "compounds.analyze", "drugs.investigate")),
     ResearchStep("hypotheses.propose", "hypothesis", "Propose candidate hypotheses from traceable graph paths", ("graph.build", "contradictions.search")),
     ResearchStep("hypotheses.criticize", "scientific_criticism", "Attempt to refute candidate hypotheses", ("hypotheses.propose",)),
     ResearchStep("skills.learn", "self_extension", "Evaluate completed research histories and draft a disabled reusable Skill when a common procedure is supported", ("hypotheses.criticize",)),
     ResearchStep("report.reproduce", "reproducibility", "Emit report with source, tool, version, and session provenance", ("hypotheses.criticize", "skills.learn", "trials.discover")),
+    ResearchStep("benchmark.evaluate", "scientific_evaluation", "Evaluate independently adjudicated domain benchmark cases supplied to this research session", ("objective.normalize",)),
 )
 
 @dataclass
@@ -54,7 +56,7 @@ def plan_research(objective: str, depth: str = "standard", budget: int = 100) ->
         raise ValueError("research objective cannot be empty")
     if depth not in {"standard", "deep"}:
         raise ValueError("depth must be standard or deep")
-    if not 1 <= budget <= 100_000:
+    if isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= 100_000:
         raise ValueError("budget must be in the range 1..100000")
     steps = tuple(replace(step, state=StepState.READY if not step.depends_on else StepState.BLOCKED) for step in DEFAULT_PLAN)
     return ResearchPlan(id=f"PLAN-{uuid4().hex[:12]}", objective=objective, depth=depth, budget=budget, steps=steps)

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/medai-core", "crates/medai-cli", "crates/medai-api"]
+members = ["crates/medai-core", "crates/medai-cli", "crates/medai-api", "science/wasm-fixture"]
 resolver = "2"
 [workspace.package]
 version = "0.1.0"

@@ -6,7 +6,7 @@ import unittest
 
 import httpx
 
-from medai_science.sources.bounded_http import read_bounded_response
+from medai_science.sources.bounded_http import event_loop_lock, read_bounded_response
 
 
 class ChunkStream(httpx.AsyncByteStream):
@@ -24,6 +24,24 @@ class ChunkStream(httpx.AsyncByteStream):
 
 
 class BoundedHttpTests(unittest.TestCase):
+    def test_async_rate_limit_locks_are_lazy_and_event_loop_scoped(self):
+        loops = [asyncio.new_event_loop(), asyncio.new_event_loop()]
+
+        async def lock_for(namespace):
+            return event_loop_lock(namespace)
+
+        try:
+            first = loops[0].run_until_complete(lock_for("fixture"))
+            same_loop = loops[0].run_until_complete(lock_for("fixture"))
+            other_namespace = loops[0].run_until_complete(lock_for("other"))
+            second = loops[1].run_until_complete(lock_for("fixture"))
+            self.assertIs(first, same_loop)
+            self.assertIsNot(first, other_namespace)
+            self.assertIsNot(first, second)
+        finally:
+            for loop in loops:
+                loop.close()
+
     def test_reads_exact_limit_and_rejects_actual_stream_overflow_without_length(self):
         async def run(stream):
             async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=stream))) as client:

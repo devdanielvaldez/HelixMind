@@ -1,0 +1,9 @@
+[Unit]
+Description=Report failed MedAI backup unit %i to the system journal
+
+[Service]
+Type=oneshot
+User=medai
+Group=medai
+EnvironmentFile=/etc/medai/backup.env
+ExecStart=/usr/local/libexec/medai-backup-alert.sh "%i"

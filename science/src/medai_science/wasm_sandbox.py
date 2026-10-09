@@ -20,6 +20,7 @@ from medai_science.sandbox import (
     SandboxError,
     _IMAGE_REFERENCE,
     _run_limited,
+    strict_json_loads,
     validate_capability_run_request,
 )
 
@@ -50,7 +51,7 @@ class DockerWasmSandbox:
         max_memory_bytes: int = MAX_WASM_MEMORY_BYTES,
     ):
         if not _IMAGE_REFERENCE.fullmatch(image):
-            raise ValueError("WASM sandbox image must be pinned by immutable sha256 digest")
+            raise ValueError("WASM sandbox image must use an immutable sha256 repository digest or local image ID")
         if not 1 <= timeout <= SANDBOX_TIMEOUT_SECONDS:
             raise ValueError(f"sandbox timeout must be 1..{SANDBOX_TIMEOUT_SECONDS} seconds")
         if isinstance(fuel, bool) or not isinstance(fuel, int) or not 1 <= fuel <= MAX_WASM_FUEL:
@@ -146,8 +147,8 @@ class DockerWasmSandbox:
                     detail = stderr.decode("utf-8", errors="replace")[-2000:]
                     raise SandboxError(f"WASM guest failed (exit {return_code}): {detail}")
                 try:
-                    output = json.loads(stdout)
-                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    output = strict_json_loads(stdout)
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
                     raise SandboxError("WASM guest stdout must contain exactly one JSON result object") from error
                 if not isinstance(output, dict):
                     raise SandboxError("WASM guest result must be a JSON object")

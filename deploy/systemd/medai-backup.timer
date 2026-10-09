@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily MedAI database backup schedule
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+Unit=medai-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -4,10 +4,17 @@ import json
 import unittest
 import xml.etree.ElementTree as ET
 
-from medai_science.sources.pubmed_search import add_fetch_coverage, parse_esearch_response, parse_related_publications
+from medai_science.sources.pubmed_search import add_fetch_coverage, parse_esearch_response, parse_related_publications, validate_pmid_snapshot
 
 
 class PubMedSearchCoverageTests(unittest.TestCase):
+    def test_watch_snapshot_is_bounded_unique_ascii_and_normalized(self):
+        self.assertEqual(validate_pmid_snapshot(None), [])
+        self.assertEqual(validate_pmid_snapshot(["001", "2"]), ["001", "2"])
+        for invalid in (["1", "1"], ["١"], ["1" * 21], [str(value) for value in range(201)]):
+            with self.subTest(invalid=invalid[:2]), self.assertRaises(ValueError):
+                validate_pmid_snapshot(invalid)
+
     def test_reports_total_hits_and_bounded_search_truncation(self):
         raw = json.dumps({"esearchresult": {"count": "248", "idlist": ["101", "102"]}}).encode()
         identifiers, coverage = parse_esearch_response(raw, 2)
@@ -29,6 +36,16 @@ class PubMedSearchCoverageTests(unittest.TestCase):
                 parse_esearch_response(raw, 2)
         with self.assertRaisesRegex(ValueError, "absent from the ESearch"):
             add_fetch_coverage({"search_truncated": False}, ["101"], ["102"])
+
+    def test_rejects_duplicate_keys_and_nonstandard_numbers_in_provider_json(self):
+        for raw in (
+            b'{"esearchresult":{"count":"1","count":"2","idlist":["101"]}}',
+            b'{"esearchresult":{"count":"1","idlist":["101"],"idlist":[]}}',
+            b'{"esearchresult":{"count":"1","idlist":["101"],"score":NaN}}',
+            b'{"esearchresult":{"count":"1","idlist":["101"],"score":Infinity}}',
+        ):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, "invalid JSON"):
+                parse_esearch_response(raw, 2)
 
     def test_retains_bounded_deduplicated_related_pubmed_links_only_for_valid_pmids(self):
         article = ET.fromstring("""<PubmedArticle><MedlineCitation><CommentsCorrectionsList>

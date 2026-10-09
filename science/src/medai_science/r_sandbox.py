@@ -22,6 +22,7 @@ from medai_science.sandbox import (
     _IMAGE_REFERENCE,
     _RESULT_PREFIX,
     _run_limited,
+    strict_json_loads,
     validate_capability_run_request,
 )
 from medai_science.contract_validation import validate_value
@@ -92,7 +93,7 @@ class DockerRSandbox:
 
     def __init__(self, image: str, docker_binary: str = "docker", timeout: int = SANDBOX_TIMEOUT_SECONDS):
         if not _IMAGE_REFERENCE.fullmatch(image):
-            raise ValueError("sandbox image must be pinned by immutable sha256 digest")
+            raise ValueError("sandbox image must use an immutable sha256 repository digest or local image ID")
         if not 1 <= timeout <= SANDBOX_TIMEOUT_SECONDS:
             raise ValueError(f"sandbox timeout must be 1..{SANDBOX_TIMEOUT_SECONDS} seconds")
         self.image = image
@@ -116,13 +117,15 @@ class DockerRSandbox:
         request_bytes = json.dumps(request, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
         with tempfile.TemporaryDirectory(prefix="medai-r-capability-") as temporary:
             root = Path(temporary)
-            source_file, request_file, runner_file = root / "capability.R", root / "request.json", root / "runner.R"
+            bundle = root / "bundle"
+            bundle.mkdir(mode=0o755)
+            source_file, request_file, runner_file = bundle / "capability.R", bundle / "request.json", bundle / "runner.R"
             source_file.write_text(source, encoding="utf-8")
             request_file.write_bytes(request_bytes)
             runner_file.write_text(_RUNNER_SOURCE, encoding="utf-8")
             for file in (source_file, request_file, runner_file):
                 file.chmod(0o444)
-            root.chmod(0o755)
+            bundle.chmod(0o755)
             cid_file = root / "container.cid"
             try:
                 image_check = subprocess.run([self.docker_binary, "image", "inspect", "--format={{.Id}}", self.image], capture_output=True, timeout=10, check=False)
@@ -139,7 +142,7 @@ class DockerRSandbox:
                 "--memory-swap=512m", "--cpus=1.0", "--ulimit=cpu=30:30", "--ulimit=fsize=1048576:1048576",
                 "--ulimit=nofile=64:64", "--ulimit=core=0:0", "--user=65534:65534",
                 "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m", "--entrypoint=Rscript",
-                "--volume", f"{root}:/capability:ro,noexec,nosuid,nodev", self.image,
+                "--volume", f"{bundle}:/capability:ro,noexec,nosuid,nodev", self.image,
                 "--vanilla", "/capability/runner.R", "/capability/capability.R", "/capability/request.json", secrets.token_hex(24),
             ]
             nonce = command[-1]
@@ -159,8 +162,8 @@ class DockerRSandbox:
             for line in stdout.splitlines():
                 if line.startswith(result_prefix):
                     try:
-                        receipt = json.loads(line[len(result_prefix):])
-                    except json.JSONDecodeError:
+                        receipt = strict_json_loads(line[len(result_prefix):])
+                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                         receipt = None
             if not isinstance(receipt, dict):
                 detail = stderr.decode("utf-8", errors="replace")[-4000:]
@@ -170,8 +173,13 @@ class DockerRSandbox:
                 raise SandboxError("R sandbox produced an invalid measured CPU usage receipt")
             result = receipt.get("result")
             output_schema = request["output_schema"]
-            if result is not None:
-                validate_value(result, output_schema)
+            if receipt.get("ok") is True:
+                if "result" not in receipt:
+                    raise SandboxError("successful R sandbox receipt omitted its result")
+                try:
+                    validate_value(result, output_schema)
+                except (TypeError, ValueError) as error:
+                    raise SandboxError("R sandbox result violates its output contract") from error
             observations = receipt.get("test_results", [])
             if not isinstance(observations, list) or len(observations) != len(test_cases):
                 if test_cases and receipt.get("ok") is True:

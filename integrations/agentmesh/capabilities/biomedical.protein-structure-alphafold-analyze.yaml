@@ -1,0 +1,43 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.protein-structure-alphafold-analyze
+  version: 0.1.0
+  intent: Download one canonical AlphaFold PDB model and retain a bounded, hash-linked structural summary for computational research.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, uniprot_accession, model_id]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      uniprot_accession: { type: string, pattern: '^[A-Za-z0-9]{6,10}(-[1-9][0-9]*)?$' }
+      model_id: { type: string, pattern: '^AF-[A-Za-z0-9-]+-F[0-9]+-v[0-9]+$' }
+  outputs:
+    type: object
+    required: [accession, model_id, source, source_url, license, coordinate_sha256, coordinate_bytes, retrieved_at, summary, experimental_structure, research_only, artifact_id]
+    properties:
+      accession: { type: string }
+      model_id: { type: string }
+      source: { type: string, const: AlphaFold Protein Structure Database }
+      source_url: { type: string, format: uri }
+      license: { type: string, const: CC-BY-4.0 }
+      coordinate_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      coordinate_bytes: { type: integer, minimum: 1, maximum: 33554432 }
+      retrieved_at: { type: string, format: date-time }
+      summary: { type: object }
+      experimental_structure: { type: boolean, const: false }
+      research_only: { type: boolean, const: true }
+      artifact_id: { type: string, minLength: 1 }
+  successEvidence:
+    - id: alphafold-coordinate-analysis-retained
+      assertion: artifact.source_is_alphafold_db_and_coordinate_digest_matches_bounded_pdb_summary
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.proteins.structure.read, biomedical.artifacts.write]
+implementations:
+  - id: medai-alphafold-coordinate-analysis
+    kind: mcp
+    reference: mcp://medai/medai_proteins_analyze_alphafold_coordinates

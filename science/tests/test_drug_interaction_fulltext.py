@@ -52,6 +52,15 @@ class DrugInteractionFullTextScreenTests(unittest.TestCase):
         self.assertEqual(result["unanchored_lexical_match_count"], 1)
         self.assertEqual(result["status"], "no_anchored_lexical_leads")
 
+    def test_reports_anchored_source_sentence_and_overlong_omission_counts(self):
+        long_sentence = "Metformin and warfarin were administered " + "x" * 1201 + "."
+        text = long_sentence + " A second short sentence documents an assay."
+        article = {**self.article, "sections": [{"section": "methods", "source_section": "METHODS", "passage_index": 4, "offset": 300, "text": text}]}
+        result = build_interaction_fulltext_screen(article, **self.arguments)
+        self.assertEqual(result["anchored_source_sentence_count"], 2)
+        self.assertEqual(result["omitted_overlong_sentence_count"], 1)
+        self.assertEqual(result["candidate_count"], 0)
+
     def test_emits_sentence_level_offsets_and_hashes_for_adjudication(self):
         text = "Metformin and warfarin were coadministered. A second unrelated sentence describes the assay."
         article = {**self.article, "sections": [{"section": "methods", "source_section": "METHODS", "passage_index": 4, "offset": 300, "text": text}]}

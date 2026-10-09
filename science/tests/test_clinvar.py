@@ -7,6 +7,31 @@ from medai_science.sources.clinvar import ClinVarClient
 
 
 class ClinVarTests(unittest.IsolatedAsyncioTestCase):
+    def test_vcv_parser_preserves_empty_alternate_for_simple_deletions(self):
+        xml = (
+            b'<VariationArchiveSet><VariationArchive VariationID="123"><ClassifiedRecord>'
+            b'<SimpleAllele><Location><SequenceLocation Assembly="GRCh38" Chr="19" start="2989674" '
+            b'stop="2989674" Accession="NC_000019.10" referenceAllele="C" alternateAllele=""/>'
+            b'</Location></SimpleAllele></ClassifiedRecord></VariationArchive></VariationArchiveSet>'
+        )
+        rows = ClinVarClient._parse_vcv_locations(xml)
+        self.assertEqual(rows["123"][0]["reference_allele"], "C")
+        self.assertEqual(rows["123"][0]["alternate_allele"], "")
+        self.assertEqual(rows["123"][0]["position_1_based"], 2989674)
+
+    def test_vcv_parser_normalizes_dash_insertion_allele_and_retains_boundaries(self):
+        xml = (
+            b'<VariationArchiveSet><VariationArchive VariationID="124"><ClassifiedRecord>'
+            b'<SimpleAllele><Location><SequenceLocation Assembly="GRCh38" Chr="12" start="3" stop="4" '
+            b'Accession="NC_000012.12" referenceAllele="-" alternateAllele="G"/>'
+            b'</Location></SimpleAllele></ClassifiedRecord></VariationArchive></VariationArchiveSet>'
+        )
+        row = ClinVarClient._parse_vcv_locations(xml)["124"][0]
+        self.assertEqual(row["reference_allele"], "")
+        self.assertEqual(row["alternate_allele"], "G")
+        self.assertEqual(row["position_1_based"], 3)
+        self.assertEqual(row["end_position_1_based"], 4)
+
     def test_excludes_clinvar_curated_composite_cftr_haplotype(self):
         fixture = Path(__file__).parent / "fixtures" / "clinvar_cftr_haplotype_vcv.xml"
         locations = ClinVarClient._parse_vcv_locations(fixture.read_bytes())

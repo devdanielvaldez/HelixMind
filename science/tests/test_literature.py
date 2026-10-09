@@ -92,6 +92,19 @@ class PubMedAbstractStructureTests(unittest.TestCase):
         self.assertEqual(node["label"], "NCBI:348")
         self.assertEqual(node["metadata"]["source_artifact_id"], "ART-1")
         self.assertIsNone(source_entity_node({"entity_type": "Gene", "mentions": [{"text": "APOE"}]}, receipt_id="ART", receipt_sha256="x", pmc_id="PMC1"))
+        self.assertIsNone(source_entity_node({"identifier": "NCBI:348", "entity_type": "Gene", "mentions": []}, receipt_id="ART", receipt_sha256="c" * 64, pmc_id="PMC1"))
+
+    def test_uniprot_entity_aliases_link_to_tool_namespace_without_losing_source_identity(self):
+        options = {"entity_type": "Protein", "identifier": "p04156", "mentions": []}
+        source_alias = source_entity_node({**options, "database": " UniProt "}, receipt_id="ART-A", receipt_sha256="a" * 64, pmc_id="PMC1")
+        canonical_source = source_entity_node({**options, "database": "UniProtKB"}, receipt_id="ART-B", receipt_sha256="b" * 64, pmc_id="PMC2")
+        self.assertEqual(source_alias["id"], "UniProtKB:P04156")
+        self.assertEqual(source_alias["id"], canonical_source["id"])
+        self.assertEqual(source_alias["metadata"]["database"], "UniProt")
+        self.assertEqual(source_alias["metadata"]["identifier"], "p04156")
+        self.assertEqual(source_alias["label"], "p04156")
+        self.assertIsNone(source_entity_node({**options, "identifier": "APOE", "database": "UniProt"}, receipt_id="ART", receipt_sha256="c" * 64, pmc_id="PMC3"))
+        self.assertIsNone(source_entity_node({**options, "identifier": "A12345", "database": "UniProt"}, receipt_id="ART", receipt_sha256="d" * 64, pmc_id="PMC4"))
 
     def test_mygene_resolution_accepts_only_exact_entrez_ids(self):
         results = [

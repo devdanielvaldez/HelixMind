@@ -15,6 +15,43 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MIN_CASES = 10
 
 
+def _evolution_review(report: dict[str, Any], *, repeated_and_stable: bool, candidate_all_passed: bool) -> dict[str, Any]:
+    """Translate measured comparison into a review lead without changing lifecycle state."""
+    recommendation = report["recommendation"]
+    if not repeated_and_stable:
+        action = "repeat_or_stabilize_benchmark"
+        eligible = False
+    elif not candidate_all_passed:
+        action = "retain_baseline_and_review_candidate_failures"
+        eligible = False
+    elif recommendation in {
+        "candidate_improves_pass_rate_review_before_promotion",
+        "candidate_is_faster_without_observed_pass_loss_review_before_promotion",
+    }:
+        action = "candidate_ready_for_human_promotion_review"
+        eligible = True
+    elif recommendation in {
+        "retain_baseline_and_review_regressions",
+        "retain_baseline_pending_latency_review",
+    }:
+        action = "retain_baseline_pending_human_review"
+        eligible = False
+    else:
+        action = "no_lifecycle_change_recommended"
+        eligible = False
+    return {
+        "action": action,
+        "eligible_for_promotion_review": eligible,
+        "comparison_sha256": report["comparison_sha256"],
+        "benchmark_sha256": report["benchmark_sha256"],
+        "baseline_version": report["baseline_version"],
+        "candidate_version": report["candidate_version"],
+        "requires_platform_admin_decision": True,
+        "lifecycle_mutation": False,
+        "interpretation_limit": "This execution-performance lead is bound to the paired benchmark report; it does not establish scientific validity, authorize production, or change either version's lifecycle state.",
+    }
+
+
 def _paired_exact_outcome_p_value(candidate_only_passes: int, baseline_only_passes: int) -> float | None:
     """Two-sided exact sign test over discordant paired pass/fail outcomes."""
     discordant = candidate_only_passes + baseline_only_passes
@@ -27,6 +64,15 @@ def _paired_exact_outcome_p_value(candidate_only_passes: int, baseline_only_pass
         term = term * (discordant - index + 1) // index
         tail += term
     return float(min(Fraction(1), Fraction(2 * tail, 1 << discordant)))
+
+
+def _one_sided_sign_test_p_value(candidate_wins: int, baseline_wins: int) -> float | None:
+    """Exact one-sided sign test over non-tied paired measurements."""
+    discordant = candidate_wins + baseline_wins
+    if discordant == 0:
+        return None
+    tail = sum(math.comb(discordant, index) for index in range(candidate_wins, discordant + 1))
+    return float(Fraction(tail, 1 << discordant))
 
 
 def compare_capability_versions(document: dict[str, Any]) -> dict[str, Any]:
@@ -86,13 +132,22 @@ def compare_capability_versions(document: dict[str, Any]) -> dict[str, Any]:
     baseline_median = statistics.median(baseline_latency)
     candidate_median = statistics.median(candidate_latency)
     latency_change = (candidate_median - baseline_median) / baseline_median if baseline_median else None
+    outcome_p_value = _paired_exact_outcome_p_value(improved, regressed)
+    latency_wins = sum(candidate_latency[index] < baseline_latency[index] for index in range(total))
+    latency_losses = sum(candidate_latency[index] > baseline_latency[index] for index in range(total))
+    latency_p_value = _one_sided_sign_test_p_value(latency_wins, latency_losses)
+    latency_regression_p_value = _one_sided_sign_test_p_value(latency_losses, latency_wins)
     if candidate_passes < baseline_passes or regressed:
         recommendation = "retain_baseline_and_review_regressions"
-    elif candidate_passes > baseline_passes:
+    elif candidate_passes > baseline_passes and outcome_p_value is not None and outcome_p_value <= 0.05:
         recommendation = "candidate_improves_pass_rate_review_before_promotion"
-    elif latency_change is not None and latency_change <= -0.05:
+    elif latency_change is not None and latency_change <= -0.05 and latency_p_value is not None and latency_p_value <= 0.05:
         recommendation = "candidate_is_faster_without_observed_pass_loss_review_before_promotion"
-    elif latency_change is not None and latency_change >= 0.05:
+    elif candidate_passes > baseline_passes:
+        recommendation = "candidate_pass_rate_trend_requires_more_paired_cases"
+    elif latency_change is not None and latency_change <= -0.05:
+        recommendation = "candidate_latency_trend_requires_more_paired_cases"
+    elif latency_change is not None and latency_change >= 0.05 and latency_regression_p_value is not None and latency_regression_p_value <= 0.05:
         recommendation = "retain_baseline_pending_latency_review"
     else:
         recommendation = "no_material_observed_difference"
@@ -116,10 +171,19 @@ def compare_capability_versions(document: dict[str, Any]) -> dict[str, Any]:
         "candidate": {"passed": candidate_passes, "pass_rate": candidate_rate, "median_latency_ms": candidate_median},
         "paired": {"candidate_only_passes": improved, "baseline_only_passes": regressed, "same_outcome": unchanged},
         "paired_outcome_exact_sign_test": {
-            "two_sided_p_value": _paired_exact_outcome_p_value(improved, regressed),
+            "two_sided_p_value": outcome_p_value,
             "discordant_pairs": improved + regressed,
             "method": "two-sided exact binomial sign test over candidate-only versus baseline-only passing cases",
             "interpretation_limit": "This descriptive paired test assumes independent benchmark cases; correlated cases, benchmark selection, and external validity are not assessed.",
+        },
+        "paired_latency_exact_sign_test": {
+            "candidate_faster_cases": latency_wins,
+            "baseline_faster_cases": latency_losses,
+            "ties": total - latency_wins - latency_losses,
+            "one_sided_p_value_candidate_faster": latency_p_value,
+            "one_sided_p_value_baseline_faster": latency_regression_p_value,
+            "method": "one-sided exact binomial sign test over per-case median latency differences",
+            "interpretation_limit": "This descriptive test assumes independent benchmark cases; case dependence, benchmark selection, and external validity are not assessed.",
         },
         "pass_rate_delta": candidate_rate - baseline_rate,
         "median_latency_relative_change": latency_change,
@@ -246,4 +310,27 @@ def run_paired_capability_benchmark(
         "baseline_all_repeats_passed": all(all(row["passed"] for row in run["cases"]) for run in results["baseline"]),
         "candidate_all_repeats_passed": all(all(row["passed"] for row in run["cases"]) for run in results["candidate"]),
     }
+    unstable = {
+        key: [
+            case_ids[index]
+            for index in range(len(case_ids))
+            if len({run["cases"][index]["passed"] for run in results[key]}) > 1
+        ]
+        for key in ("baseline", "candidate")
+    }
+    report["repeat_stability"] = {
+        "baseline_unstable_case_ids": unstable["baseline"],
+        "candidate_unstable_case_ids": unstable["candidate"],
+        "all_outcomes_stable": not unstable["baseline"] and not unstable["candidate"],
+        "interpretation_limit": "Any case whose pass/fail outcome changed across repeated sandbox executions makes a lifecycle performance recommendation inconclusive.",
+    }
+    if not report["repeat_stability"]["all_outcomes_stable"]:
+        report["paired_recommendation"] = report["recommendation"]
+        report["recommendation"] = "inconclusive_due_to_repeat_instability"
+    candidate_all_passed = report["repeat_consistency"]["candidate_all_repeats_passed"]
+    report["evolution_review"] = _evolution_review(
+        report,
+        repeated_and_stable=report["repeat_stability"]["all_outcomes_stable"],
+        candidate_all_passed=candidate_all_passed,
+    )
     return report

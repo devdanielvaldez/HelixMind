@@ -8,13 +8,12 @@ import time
 import httpx
 
 from medai_science.paper_understanding import MAX_BIOC_BYTES, parse_bioc_xml
-from medai_science.sources.bounded_http import read_bounded_response
+from medai_science.sources.bounded_http import event_loop_lock, read_bounded_response
 
 
 class PMCBioCClient:
     endpoint = "https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi"
     _identifier = re.compile(r"^(?:PMC[1-9][0-9]*|PMID:[1-9][0-9]{0,8})$", re.IGNORECASE)
-    _shared_request_lock = asyncio.Lock()
     _shared_last_request = 0.0
 
     def __init__(self, timeout: float = 30.0, client_factory=httpx.AsyncClient):
@@ -31,7 +30,7 @@ class PMCBioCClient:
     async def fetch(self, identifier: str) -> dict:
         identifier = self.validate_identifier(identifier)
         url = f"{self.endpoint}/BioC_xml/{identifier}/unicode"
-        async with self._shared_request_lock:
+        async with event_loop_lock("pmc_bioc"):
             delay = (1 / 3) - (time.monotonic() - type(self)._shared_last_request)
             if delay > 0:
                 await asyncio.sleep(delay)

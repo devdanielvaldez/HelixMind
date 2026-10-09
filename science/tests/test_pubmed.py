@@ -20,6 +20,43 @@ class OversizedStream(httpx.AsyncByteStream):
 
 
 class PubMedStructuredMetadataTests(unittest.TestCase):
+    def test_pubmed_fetch_ids_require_unique_ascii_strings_before_network_dispatch(self):
+        client = PubMedClient("research@example.org")
+        invalid_values = (["١٢٣"], [12345], ["12345", "12345"], "12345", [True])
+        for operation in (client.fetch, client.fetch_bibliographic):
+            for values in invalid_values:
+                with self.subTest(operation=operation.__name__, values=values), self.assertRaises(ValueError):
+                    asyncio.run(operation(values))
+
+    def test_pubmed_search_limits_reject_booleans_and_noninteger_values(self):
+        client = PubMedClient("research@example.org")
+        with self.assertRaisesRegex(ValueError, "limit"):
+            asyncio.run(client.search_with_coverage("APOE", True))
+        with self.assertRaisesRegex(ValueError, "window_days"):
+            asyncio.run(client.search_recent_ids("APOE", True))
+
+    def test_all_pubmed_operations_fail_closed_on_provider_redirects(self):
+        calls = []
+
+        def redirect(request):
+            calls.append(request.url.host)
+            return httpx.Response(302, headers={"Location": "https://untrusted.example/redirect"})
+
+        async def exercise():
+            client = PubMedClient("research@example.org", transport=httpx.MockTransport(redirect))
+            for operation in (
+                lambda: client.search_with_coverage("APOE", 1),
+                lambda: client.search_recent_ids("APOE", 1, 1),
+                lambda: client.fetch(["12345"]),
+                lambda: client.fetch_bibliographic(["12345"]),
+            ):
+                with self.assertRaises(httpx.HTTPStatusError):
+                    await operation()
+
+        asyncio.run(exercise())
+        self.assertTrue(calls)
+        self.assertEqual(set(calls), {"eutils.ncbi.nlm.nih.gov"})
+
     def test_search_cache_reuses_only_esearch_and_fetches_records_fresh(self):
         calls = []
 

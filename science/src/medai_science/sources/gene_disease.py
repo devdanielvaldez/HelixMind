@@ -143,9 +143,14 @@ class GeneDiseaseClient:
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ValueError("GWAS Catalog returned a malformed association record")
-            genes = entry.get("mappedGenes", entry.get("mapped_genes", []))
+            if "mappedGenes" in entry:
+                genes = entry["mappedGenes"]
+            elif "mapped_genes" in entry:
+                genes = entry["mapped_genes"]
+            else:
+                raise ValueError("GWAS Catalog association is missing its mapped-gene collection")
             if genes is None:
-                genes = []
+                raise ValueError("GWAS Catalog mapped-gene collection is null")
             if isinstance(genes, str):
                 genes = [item.strip() for item in genes.split(",") if item.strip()]
             if isinstance(genes, dict):

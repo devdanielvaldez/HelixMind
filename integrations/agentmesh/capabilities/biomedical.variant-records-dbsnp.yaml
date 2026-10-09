@@ -1,0 +1,37 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.variant-records-dbsnp
+  version: 0.1.0
+  intent: Retrieve one bounded NCBI dbSNP RefSNP record by exact rs identifier and retain its source digest for later assembly-aware review.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, rsid]
+    properties:
+      session_id: { type: string, minLength: 1 }
+      task_id: { type: string, minLength: 1 }
+      rsid: { type: string, pattern: '^(?i:rs)?[1-9][0-9]{0,11}$' }
+  outputs:
+    type: object
+    required: [rsid, source, source_record_sha256, source_record_canonical_sha256, source_record, artifact_id, research_only]
+    properties:
+      rsid: { type: string }
+      source: { type: string, const: NCBI dbSNP Variation Services }
+      source_record_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      source_record_canonical_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      source_record: { type: object }
+      artifact_id: { type: string }
+      research_only: { type: boolean, const: true }
+  successEvidence:
+    - id: dbsnp-source-record-retained
+      assertion: exact_bounded_refsnp_record_and_response_digest_are_persisted
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [external_communication, network_egress, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.genetics.variant_records]
+implementations:
+  - id: medai-dbsnp-refsnp-record
+    kind: mcp
+    reference: mcp://medai/medai_variants_lookup_dbsnp

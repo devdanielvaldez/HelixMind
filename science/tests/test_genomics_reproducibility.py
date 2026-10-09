@@ -116,6 +116,44 @@ def _inputs(directory: Path) -> tuple[Path, Path, Path]:
 
 
 class GenomicsReproducibilityTests(unittest.TestCase):
+    def test_unanchored_clinvar_insertion_reconciles_and_replays_offline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="medai-clinvar-insertion-bundle-") as temp:
+            root = Path(temp)
+            reference = root / "reference.fa"
+            vcf = root / "cohort.vcf"
+            reference.write_text(">12\nAACGTA\n", encoding="ascii")
+            vcf.write_text(
+                "##fileformat=VCFv4.3\n##reference=GRCh38\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+                "12\t3\t.\tC\tCT\t.\tPASS\t.\n",
+                encoding="ascii",
+            )
+            report = analyze_vcf(vcf, "GRCh38", 10, reference)
+            locations = [{
+                "assembly": "GRCh38", "contig": "12", "position_1_based": 3,
+                "end_position_1_based": 4, "reference_allele": "", "alternate_allele": "T",
+                "sequence_accession": "NC_000012.12",
+            }]
+            clinvar_record = {
+                "variation_id": "123458", "accession": "VCV000123458.1",
+                "source": "NCBI ClinVar E-utilities", "source_url": "https://www.ncbi.nlm.nih.gov/clinvar/variation/123458/",
+                "source_record_sha256": "b" * 64,
+                "location_source_sha256": hashlib.sha256(json.dumps(locations, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                "assembly_locations": locations,
+            }
+            bundle = root / "insertion-bundle"
+            created = create_genomics_bundle(
+                bundle, report, vcf, "GRCh38", 10, reference, clinvar_records=[clinvar_record],
+            )
+            replay = verify_genomics_bundle(bundle, replay=True)
+
+        self.assertTrue(created["external_clinvar_captured"])
+        self.assertTrue(replay["valid"])
+        self.assertTrue(replay["replayed"])
+        self.assertTrue(replay["external_clinvar_receipt_verified"])
+        self.assertFalse(replay["cross_source_reconciliation_verified"])
+        self.assertFalse(replay["external_source_requeried"])
+
     def test_frameshift_matches_independent_ensembl_vep_documentation_fixture(self) -> None:
         fixture = json.loads((Path(__file__).parent / "fixtures/ensembl_vep_frameshift.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory(prefix="medai-vep-frameshift-") as temp:
@@ -220,6 +258,67 @@ class GenomicsReproducibilityTests(unittest.TestCase):
             checked = verify_genomics_bundle(bundle, replay=True)
             self.assertTrue(checked["external_gnomad_frequency_verified"])
             self.assertFalse(checked["external_source_requeried"])
+
+    def test_dbsnp_placement_receipt_is_bound_and_replayed_offline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="medai-dbsnp-bundle-") as temp:
+            root = Path(temp)
+            reference = root / "reference.fa"
+            vcf = root / "cohort.vcf"
+            reference.write_text(">1\nCAAAAG\n", encoding="ascii")
+            vcf.write_text(
+                "##fileformat=VCFv4.3\n##reference=GRCh38\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+                "1\t6\t.\tG\tT\t.\tPASS\t.\n",
+                encoding="ascii",
+            )
+            report = analyze_vcf(vcf, "GRCh38", 10, reference)
+            source_record = {
+                "refsnp_id": 328,
+                "primary_snapshot_data": {"placements_with_allele": [{
+                    "seq_id": "NC_000001.11", "is_ptlp": True,
+                    "placement_annot": {"seq_id_traits_by_assembly": [{"assembly_name": "GRCh38.p14", "assembly_accession": "GCF_000001405.40"}]},
+                    "alleles": [
+                        {"allele": {"spdi": {"seq_id": "NC_000001.11", "position": 5, "deleted_sequence": "G", "inserted_sequence": "G"}}},
+                        {"allele": {"spdi": {"seq_id": "NC_000001.11", "position": 5, "deleted_sequence": "G", "inserted_sequence": "T"}}},
+                    ],
+                }]},
+            }
+            record_digest = hashlib.sha256(json.dumps(source_record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+            dbsnp_receipt = {
+                "rsid": "rs328", "source": "NCBI dbSNP Variation Services",
+                "source_url": "https://www.ncbi.nlm.nih.gov/snp/328",
+                "api_endpoint": "https://api.ncbi.nlm.nih.gov/variation/v0/refsnp/328",
+                "source_record_sha256": "a" * 64, "source_record_canonical_sha256": record_digest,
+                "source_record": source_record,
+            }
+            sequence_map = {"NC_000001.11": "1"}
+            bundle = root / "with-dbsnp"
+            created = create_genomics_bundle(
+                bundle, report, vcf, "GRCh38", 10, reference,
+                dbsnp_receipt=dbsnp_receipt,
+                dbsnp_sequence_accession_to_contig=sequence_map,
+            )
+            self.assertTrue(created["external_dbsnp_captured"])
+            checked = verify_genomics_bundle(bundle)
+            self.assertTrue(checked["external_dbsnp_placement_verified"])
+            replayed = verify_genomics_bundle(bundle, replay=True)
+            self.assertTrue(replayed["external_dbsnp_placement_verified"])
+            self.assertFalse(replayed["external_source_requeried"])
+
+            receipt_path = bundle / "external/dbsnp-ref-snp.json"
+            tampered = json.loads(receipt_path.read_text(encoding="utf-8"))
+            tampered["source_record"]["primary_snapshot_data"]["placements_with_allele"][0]["alleles"][1]["allele"]["spdi"]["inserted_sequence"] = "A"
+            tampered["source_record_canonical_sha256"] = hashlib.sha256(json.dumps(tampered["source_record"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+            receipt_path.write_text(json.dumps(tampered, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+            manifest_path = bundle / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for artifact in manifest["artifacts"]:
+                if artifact["path"] == "external/dbsnp-ref-snp.json":
+                    artifact["size"] = receipt_path.stat().st_size
+                    artifact["sha256"] = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "recomputed dbSNP placement reconciliation"):
+                verify_genomics_bundle(bundle)
 
     def test_positive_strand_coding_consequence_classes_on_a_synthetic_transcript(self) -> None:
         cases = [

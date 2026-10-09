@@ -4,7 +4,7 @@ import unittest
 import hashlib
 import json
 
-from medai_science.claim_alignment import build_claim_alignment_candidates, decode_verified_annotation_artifact, validate_semantic_claim_pair
+from medai_science.claim_alignment import build_claim_alignment_candidates, decode_verified_annotation_artifact, semantic_claim_pair_marker, validate_semantic_claim_pair
 
 
 def annotation_artifact(document_id: str, candidate_id: str, direction: str, entities: list[str], *, artifact_id: str | None = None, study_system: str = "human") -> dict:
@@ -35,6 +35,22 @@ def annotation_artifact(document_id: str, candidate_id: str, direction: str, ent
 
 
 class ClaimAlignmentTests(unittest.TestCase):
+    def test_resume_pair_key_includes_document_and_artifact_identity(self):
+        left = {"artifact_id": "artifact-a", "document_id": "PMC1", "source_sha256": "a" * 64, "candidate_id": "sentence-0"}
+        right = {"artifact_id": "artifact-b", "document_id": "PMC2", "source_sha256": "b" * 64, "candidate_id": "sentence-0"}
+        other_right = {"artifact_id": "artifact-c", "document_id": "PMC3", "source_sha256": "c" * 64, "candidate_id": "sentence-0"}
+
+        first_pair = semantic_claim_pair_marker(left, right)
+        self.assertNotEqual(first_pair, semantic_claim_pair_marker(left, other_right))
+        self.assertEqual(first_pair, semantic_claim_pair_marker(right, left))
+
+    def test_resume_pair_key_rejects_missing_or_invalid_source_identity(self):
+        valid = {"artifact_id": "artifact-a", "document_id": "PMC1", "source_sha256": "a" * 64, "candidate_id": "sentence-0"}
+        with self.assertRaisesRegex(ValueError, "stable artifact"):
+            semantic_claim_pair_marker(valid, {"candidate_id": "sentence-0"})
+        with self.assertRaisesRegex(ValueError, "invalid source digest"):
+            semantic_claim_pair_marker(valid, {"artifact_id": "artifact-b", "document_id": "PMC2", "source_sha256": "not-a-digest", "candidate_id": "sentence-0"})
+
     def test_semantic_pair_requires_same_result_category_and_exact_shared_entity(self):
         first = {"result_kind": "association", "direction": "increase", "entity_ids": ["NCBI:1", "NCBI:2"]}
         second = {"result_kind": "association", "direction": "decrease", "entity_ids": ["NCBI:2"]}

@@ -5,11 +5,142 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from medai_science.cancellation import ResearchSessionCancelled
-from medai_science.worker import ArtifactCollectionLimitError, ResearchWorker, _collect_artifact_pages, _literature_watch_pmids, _register_association_source_graph, _register_gene_disease_curation_graph, _register_orphadata_gene_graph, _resolve_objective_disease_identifiers, _retrieve_gene_disease_curations, _retrieve_objective_disease_evidence, _retrieve_source_identified_compounds, _search_hypothesis_literature, _specialist_meta, _tool_value
+from medai_science.claim_alignment import semantic_claim_pair_marker
+from medai_science.worker import ArtifactCollectionLimitError, ResearchWorker, _biomedical_domain_benchmark_inputs, _evidence_quality_benchmark_inputs, _collect_artifact_pages, _exact_pubchem_identity, _hypothesis_criticism_needs_review, _hypothesis_proposal_needs_review, _is_budget_exhaustion_error, _literature_watch_pmids, _pmc_extraction_receipts, _record_control_plane_update_failure, _register_association_source_graph, _register_gene_disease_curation_graph, _register_orphadata_gene_graph, _resolve_objective_disease_identifiers, _retrieve_gene_disease_curations, _retrieve_objective_disease_evidence, _retrieve_source_identified_compounds, _search_hypothesis_literature, _semantic_claim_screening_batch, _session_research_budget, _source_identified_compound_artifacts, _specialist_meta, _tool_value
+from medai_science.benchmark_artifacts import EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_KIND, EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_SOURCE
 from medai_science.scientific_agents import agent_may_call
 
 
 class WorkerLeaseTests(unittest.IsolatedAsyncioTestCase):
+    def test_control_plane_transition_failure_is_visible_without_error_body(self):
+        summary = {}
+        _record_control_plane_update_failure(
+            summary,
+            "task-1",
+            RuntimeError("upstream source contained private response text"),
+            PermissionError("API response contained a bearer token"),
+        )
+        self.assertEqual(summary["control_plane_update_failures"], [{
+            "task_id": "task-1",
+            "original_error_type": "RuntimeError",
+            "update_error_type": "PermissionError",
+            "state": "unknown",
+        }])
+        self.assertNotIn("private response text", repr(summary))
+        self.assertNotIn("bearer token", repr(summary))
+
+    def test_hypothesis_tasks_route_all_unreported_or_truncated_work_to_review(self):
+        proposal = {"artifact_id": "ART-PROPOSAL", "truncated": False}
+        literature = {"artifact_id": "ART-LITERATURE", "omitted_candidate_count": 0, "warnings": []}
+        self.assertFalse(_hypothesis_proposal_needs_review(proposal, literature))
+        self.assertTrue(_hypothesis_proposal_needs_review({**proposal, "truncated": True}, literature))
+        self.assertTrue(_hypothesis_proposal_needs_review(proposal, {**literature, "omitted_candidate_count": True}))
+        self.assertTrue(_hypothesis_proposal_needs_review(proposal, {**literature, "warnings": [{"reason": "source_incomplete"}]}))
+
+        critique = {"artifact_id": "ART-CRITIQUE", "reviews": [{"alternative_graph_routes_truncated": False}]}
+        self.assertFalse(_hypothesis_criticism_needs_review(critique, 0))
+        self.assertTrue(_hypothesis_criticism_needs_review(critique, 1))
+        self.assertTrue(_hypothesis_criticism_needs_review({**critique, "reviews": [{"alternative_graph_routes_truncated": True}]}, 0))
+
+    def test_semantic_pair_screening_reports_candidates_beyond_per_task_limit(self):
+        links = []
+        for index in range(13):
+            sources = [
+                {"artifact_id": f"artifact-{index}-a", "document_id": f"PMC{index}-a", "source_sha256": f"{index:064x}", "candidate_id": "sentence-0"},
+                {"artifact_id": f"artifact-{index}-b", "document_id": f"PMC{index}-b", "source_sha256": f"{index + 1:064x}", "candidate_id": "sentence-0"},
+            ]
+            links.append({"candidate_id": f"pair-{index}", "sources": sources})
+        selected, omitted = _semantic_claim_screening_batch(links)
+        self.assertEqual(len(selected), 10)
+        self.assertEqual(selected, links[:10])
+        self.assertEqual(omitted, 3)
+        completed = {semantic_claim_pair_marker(*link["sources"]) for link in selected}
+        resumed, still_omitted = _semantic_claim_screening_batch(links, completed)
+        self.assertEqual(resumed, links[10:])
+        self.assertEqual(still_omitted, 0)
+
+    def test_reproducibility_specialist_can_capture_but_not_mutate_citation_network(self):
+        self.assertTrue(agent_may_call("reproducibility_agent", "medai_papers_citation_network"))
+        self.assertFalse(agent_may_call("reproducibility_agent", "medai_papers_resolve_crossref_reference"))
+        self.assertFalse(agent_may_call("reproducibility_agent", "medai_citation_links_index"))
+
+    def test_session_or_specialist_budget_exhaustion_is_reviewable(self):
+        for message in (
+            "specialist credit budget exhausted; research task requires review",
+            "research session execution budget exhausted; research task requires review",
+            "Client error '402 Payment Required' for url 'http://medai/v1/research/RES-1/artifacts'",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(_is_budget_exhaustion_error(message))
+        self.assertFalse(_is_budget_exhaustion_error("provider returned malformed JSON"))
+
+    def test_domain_benchmark_worker_accepts_only_one_typed_researcher_input(self):
+        accepted = {
+            "id": "input-1", "session_id": "RES-1", "task_id": "benchmark.evaluate",
+            "kind": "biomedical_domain_benchmark_input",
+            "source": "researcher-supplied adjudicated biomedical benchmark",
+        }
+        rows = [
+            accepted,
+            {**accepted, "id": "other-session", "session_id": "RES-2"},
+            {**accepted, "id": "wrong-kind", "kind": "biomedical_domain_benchmark"},
+            {**accepted, "id": "wrong-source", "source": "generated"},
+            {**accepted, "id": "wrong-task", "task_id": "report.reproduce"},
+            None,
+        ]
+        self.assertEqual(_biomedical_domain_benchmark_inputs(rows, "RES-1"), [accepted])
+        self.assertEqual(
+            len(_biomedical_domain_benchmark_inputs([accepted, {**accepted, "id": "input-2"}], "RES-1")),
+            2,
+        )
+
+    def test_evidence_quality_benchmark_worker_accepts_only_typed_researcher_input(self):
+        accepted = {
+            "id": "quality-input-1", "session_id": "RES-1", "task_id": "benchmark.evaluate",
+            "kind": EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_KIND,
+            "source": EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_SOURCE,
+        }
+        self.assertEqual(_evidence_quality_benchmark_inputs([
+            accepted,
+            {**accepted, "id": "other-session", "session_id": "RES-2"},
+            {**accepted, "id": "wrong-kind", "kind": "evidence_quality_benchmark_report"},
+            {**accepted, "id": "wrong-source", "source": "generated"},
+            {**accepted, "id": "wrong-task", "task_id": "evidence.grade"},
+            None,
+        ], "RES-1"), [accepted])
+        self.assertTrue(agent_may_call("benchmark_analyst", "medai_evidence_quality_benchmark_evaluate"))
+
+    def test_chemical_join_inputs_require_registered_source_task_provenance(self):
+        self.assertEqual(_pmc_extraction_receipts([
+            {"id": "good", "kind": "paper_extraction_receipt", "task_id": "literature.extract", "source": "PMC BioC"},
+            {"id": "wrong-task", "kind": "paper_extraction_receipt", "task_id": "entities.resolve", "source": "PMC BioC"},
+            {"id": "wrong-source", "kind": "paper_extraction_receipt", "task_id": "literature.extract", "source": "untrusted"},
+        ]), [{"id": "good", "kind": "paper_extraction_receipt", "task_id": "literature.extract", "source": "PMC BioC"}])
+        self.assertEqual(_source_identified_compound_artifacts([
+            {"id": "good", "kind": "compound_chemical_identity", "task_id": "compounds.analyze", "source": "PubChem PUG REST"},
+            {"id": "wrong-task", "kind": "compound_chemical_identity", "task_id": "drugs.investigate"},
+        ]), [{"id": "good", "kind": "compound_chemical_identity", "task_id": "compounds.analyze", "source": "PubChem PUG REST"}])
+
+    def test_pubchem_join_requires_exact_cid_unambiguous_match_and_standard_inchikey(self):
+        artifact = {"kind": "compound_chemical_identity", "task_id": "compounds.analyze", "source": "PubChem PUG REST", "source_id": "2244", "payload": {"source": "PubChem PUG REST", "query": "2244", "matches": [{"cid": 2244, "inchikey": "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"}]}}
+        self.assertEqual(_exact_pubchem_identity(artifact)[1]["cid"], 2244)
+        for payload in (
+            {**artifact["payload"], "ambiguous": True, "matches": [artifact["payload"]["matches"][0], {"cid": 2245, "inchikey": "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"}]},
+            {**artifact["payload"], "matches": [{"cid": 2245, "inchikey": "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"}]},
+            {**artifact["payload"], "matches": [{"cid": 2244, "inchikey": "not-an-inchikey"}]},
+        ):
+            self.assertIsNone(_exact_pubchem_identity({**artifact, "payload": payload}))
+
+    def test_session_credit_budget_must_be_a_bounded_integer_from_the_api(self):
+        self.assertEqual(_session_research_budget({"budget": 250}), 250)
+        for malformed in (
+            {}, None, {"budget": None}, {"budget": True}, {"budget": False},
+            {"budget": 1.5}, {"budget": "250"}, {"budget": 0}, {"budget": 100_001},
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(ValueError, "invalid integer credit budget"):
+                    _session_research_budget(malformed)
+
     async def test_ols_disease_resolution_uses_only_literal_preferred_labels_not_synonyms_or_rank(self):
         calls = []
 
@@ -134,13 +265,13 @@ class WorkerLeaseTests(unittest.IsolatedAsyncioTestCase):
                 return {"saved": True}
             raise AssertionError(name)
 
-        receipts = [{"id": "extract-1", "kind": "paper_extraction_receipt", "payload": {"normalized_entities": [
+        receipts = [{"id": "extract-1", "kind": "paper_extraction_receipt", "task_id": "literature.extract", "source": "PMC BioC", "payload": {"normalized_entities": [
             {"database": "PubChem", "entity_type": "Chemical", "identifier": "CID:2244"},
             {"database": "PubChem", "entity_type": "Chemical", "identifier": "aspirin"},
-        ]}}]
+        ]}}, {"id": "forged-extract", "kind": "paper_extraction_receipt", "task_id": "entities.resolve", "source": "PMC BioC", "payload": {"normalized_entities": [{"database": "PubChem", "entity_type": "Chemical", "identifier": "CID:999"}]}}]
         completed, artifact_ids, checkpoint = set(), [], {}
         result = await _retrieve_source_identified_compounds(
-            call, "RES-1", "drugs.investigate", "worker", receipts, [], 2,
+            call, "RES-1", "compounds.analyze", "worker", receipts, [], 2,
             asyncio.Event(), completed, artifact_ids, checkpoint,
         )
         self.assertEqual([name for name, _ in calls if name == "medai_compounds_lookup_pubchem"], ["medai_compounds_lookup_pubchem"])
@@ -149,6 +280,7 @@ class WorkerLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pubchem-cid:2244", completed)
         self.assertIn("pubchem-2244", artifact_ids)
         self.assertEqual(checkpoint["stage"], "source_identified_compounds_resolved")
+        self.assertEqual([row["cid"] for row in result["discovered"]], ["2244"])
 
     async def test_hypothesis_literature_search_is_budgeted_source_linked_and_never_scores_novelty(self):
         calls = []
@@ -158,7 +290,7 @@ class WorkerLeaseTests(unittest.IsolatedAsyncioTestCase):
             if name == "medai_research_get_budget":
                 return {"remaining": 13}
             if name == "medai_papers_search_pubmed":
-                return {"results": [{"provenance": {"source": "PubMed", "source_id": "12345", "title": "Candidate paper"}, "abstract": "Do not copy this abstract.", "identifiers": {}}], "coverage": {"total_hits": 3, "search_truncated": False}, "coverage_artifact_id": "coverage-1"}
+                return {"results": [{"provenance": {"source": "PubMed", "source_id": "12345", "title": "Candidate paper"}, "abstract": "Do not copy this abstract.", "identifiers": {}}], "coverage": {"total_hits": 3, "requested_limit": 2, "returned_pmids": 2, "search_truncated": True, "fetched_records": 1, "missing_record_pmids": ["67890"], "fetch_incomplete": True, "retrieval_incomplete": True}, "coverage_artifact_id": "coverage-1"}
             if name == "medai_research_store_artifact":
                 return {"id": f"artifact-{sum(call_name == name for call_name, _ in calls)}"}
             if name == "medai_research_save_checkpoint":
@@ -322,7 +454,9 @@ class WorkerLeaseTests(unittest.IsolatedAsyncioTestCase):
             "io.medai/specialist-api-bearer": token,
             "io.medai/scientific-agent": "literature_librarian",
         })
-        self.assertTrue(agent_may_call("pharmacology_analyst", "medai_compounds_lookup_pubchem"))
+        self.assertTrue(agent_may_call("chemistry_analyst", "medai_compounds_lookup_pubchem"))
+        self.assertFalse(agent_may_call("pharmacology_analyst", "medai_compounds_lookup_pubchem"))
+        self.assertTrue(agent_may_call("pharmacology_analyst", "medai_drug_profile_chembl"))
         self.assertFalse(agent_may_call("entity_curator", "medai_compounds_lookup_pubchem"))
 
     async def test_literature_watch_snapshot_decodes_api_json_before_mcp_call(self):
@@ -330,8 +464,12 @@ class WorkerLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_literature_watch_pmids(None), [])
         with self.assertRaisesRegex(ValueError, "invalid JSON"):
             _literature_watch_pmids("not-json")
-        with self.assertRaisesRegex(ValueError, "snapshot is invalid"):
+        with self.assertRaisesRegex(ValueError, "snapshot"):
             _literature_watch_pmids(["123", "bad"])
+        for invalid in (["123", "123"], ["١٢٣"], ["1" * 21], [str(value) for value in range(201)]):
+            with self.subTest(invalid=invalid[:2]):
+                with self.assertRaisesRegex(ValueError, "PubMed snapshot"):
+                    _literature_watch_pmids(invalid)
 
     async def test_gene_curation_stage_resumes_exact_mygene_symbols_and_keeps_sources_separate(self):
         calls = []

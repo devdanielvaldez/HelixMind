@@ -143,6 +143,8 @@ def build_interaction_fulltext_screen(
     candidates = []
     unanchored_match_count = 0
     scan_truncated = False
+    anchored_source_sentence_count = 0
+    overlong_sentence_count = 0
     for index, section in enumerate(sections):
         if len(candidates) >= 5000:
             scan_truncated = True
@@ -167,7 +169,11 @@ def build_interaction_fulltext_screen(
             local_start += trim_start
             local_end = local_start + max(0, trim_end - trim_start)
             sentence = text[local_start:local_end]
-            if not sentence or len(sentence) > 1200:
+            if not sentence:
+                continue
+            anchored_source_sentence_count += 1
+            if len(sentence) > 1200:
+                overlong_sentence_count += 1
                 continue
             matched_a = [name for name, pattern in names_a if pattern.search(sentence)]
             matched_b = [name for name, pattern in names_b if pattern.search(sentence)]
@@ -214,6 +220,8 @@ def build_interaction_fulltext_screen(
         "source_license": article.get("source_license"),
         "parser_version": article.get("parser_version"),
         "section_count": len(sections),
+        "anchored_source_sentence_count": anchored_source_sentence_count,
+        "omitted_overlong_sentence_count": overlong_sentence_count,
         "candidate_count": min(len(candidates), limit),
         "omitted_candidate_count": max(0, len(candidates) - limit),
         "candidate_scan_truncated": scan_truncated,

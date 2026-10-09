@@ -2,7 +2,18 @@
 
 ## Source SBOM
 
-The `sbom` job in `.github/workflows/ci.yml` uses Anchore's Syft-backed GitHub Action to generate an SPDX JSON inventory from the checked-out repository. CI retains the file as the `medai-source.spdx.json` workflow artifact. When a GitHub release is published, the same SBOM is attached to the release assets. Review the SBOM for the exact source revision before distributing a build.
+The `sbom` job in `.github/workflows/ci.yml` uses Anchore's Syft-backed GitHub Action to generate an SPDX JSON inventory from the checked-out repository. CI retains the file as the `medai-source.spdx.json` workflow artifact. The separate `Prepare source release` workflow runs on `v*` tag pushes (or a manual rerun against that exact tag), packages the tagged commit as `medai-source.tar.gz`, generates its SBOM, and creates or updates a GitHub draft release with the archive, SBOM, and `SHA256SUMS`. Review the draft and its attestations, then publish it. Assets are attached before publication so repositories with immutable releases can use the workflow.
+
+## Release attestations
+
+The release job creates a keyless Sigstore build-provenance attestation for `medai-source.tar.gz` and an SPDX SBOM attestation that binds the same archive to `medai-source.spdx.json`. Attestations are stored by GitHub and are associated with the repository; they are not signing-key files attached to the release. Verify the downloaded files and provenance with:
+
+```sh
+sha256sum --check SHA256SUMS
+gh attestation verify medai-source.tar.gz --repo OWNER/REPOSITORY
+```
+
+Use a current GitHub CLI with network access. The verification command checks the attestation signature and repository identity. Releases should be created from protected tags, and reviewers should confirm the attested source commit matches the intended release. GitHub documents artifact attestation availability for public repositories and for private/internal repositories on supported Enterprise Cloud plans; the release workflow will fail if repository settings or plan do not permit attestation writes.
 
 The SBOM inventories dependency data present in the source tree; it is not proof that every deployed container image was built from that revision. The web package currently has no committed npm lockfile, so transitive JavaScript resolution is not yet reproducible or fully represented. Python dependencies are declared in `science/pyproject.toml`; Rust dependencies are resolved by the committed `Cargo.lock`.
 
@@ -14,4 +25,4 @@ The Python CI environment also runs pinned `pip-licenses` metadata collection af
 
 ## Remaining release controls
 
-SBOM generation is inventory, not a complete software clearance. Frontend dependency license enforcement is also pending because the web package has no committed lockfile. Signed build provenance and release artifacts, and image-specific SBOM publication remain release work. Do not use the source SBOM alone as a compliance attestation.
+SBOM generation is inventory, not a complete software clearance. Frontend dependency license enforcement is also pending because the web package has no committed lockfile. The release attestation covers the source archive, not deployment images; image-specific SBOM publication and provenance remain open. Do not use the source SBOM alone as a compliance attestation.

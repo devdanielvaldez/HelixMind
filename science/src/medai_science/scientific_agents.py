@@ -25,7 +25,7 @@ class ScientificAgent:
 
 AGENTS: dict[str, ScientificAgent] = {
     "research_director": ScientificAgent("research_director", "Research Director", "planning", "Coordinate the persisted research DAG, select objective-relevant registered stages, and delegate execution to their declared specialists.", ("medai_research_plan_objective", "medai_research_apply_task_scope")),
-    "literature_librarian": ScientificAgent("literature_librarian", "Literature Librarian", "literature", "Retrieve bounded scholarly records and citation metadata; do not assert scientific support.", ("medai_papers_search_pubmed", "medai_papers_resolve_crossref")),
+    "literature_librarian": ScientificAgent("literature_librarian", "Literature Librarian", "literature", "Retrieve bounded scholarly records and citation metadata, and resolve DOI-less references to unverified candidates; do not assert scientific support or create citation edges from search matches.", ("medai_papers_search_pubmed", "medai_papers_resolve_crossref")),
     "paper_curator": ScientificAgent("paper_curator", "Paper Understanding Agent", "literature", "Extract source-labeled structure and source-annotated entities; do not infer claims from unclassified text.", ("medai_papers_understand_pmc",)),
     "entity_curator": ScientificAgent("entity_curator", "Entity Resolution Agent", "knowledge_graph", "Resolve only stable source identifiers and register provenance-bearing entities.", ("medai_graph_add_entity", "medai_genes_search_mygene")),
     "gene_disease_curator": ScientificAgent("gene_disease_curator", "Gene-Disease Evidence Agent", "gene_disease", "Resolve only literal preferred disease labels through OLS, retrieve independent gene-disease assertions without merging source scales, and create source-record nodes linked to retained artifacts. Retrieve direct OxO cross-reference candidates for human review without using them as identity equivalences.", ("medai_gene_disease_", "medai_ontology_search", "medai_ontology_cross_mapping_review", "medai_graph_add_entity", "medai_graph_link_evidence")),
@@ -34,12 +34,14 @@ AGENTS: dict[str, ScientificAgent] = {
     "protein_analyst": ScientificAgent("protein_analyst", "Protein Agent", "proteomics", "Retrieve accession-bound protein records, structures, residue mappings, and observed interactions; register exact source-identified proteins in the session graph.", ("medai_proteins_", "medai_graph_add_entity")),
     "pathway_analyst": ScientificAgent("pathway_analyst", "Pathway Agent", "pathways", "Run bounded Reactome over-representation analysis and add result- and artifact-linked analysis nodes without inferring pathway causality.", ("medai_pathways_", "medai_graph_add_entity", "medai_graph_link_evidence")),
     "trial_librarian": ScientificAgent("trial_librarian", "Clinical Trials Agent", "clinical_trials", "Retrieve public registry records without assessing personal suitability or recommending treatment.", ("medai_trials_",)),
-    "pharmacology_analyst": ScientificAgent("pharmacology_analyst", "Drug and Chemistry Agent", "pharmacology", "Resolve source-identified compound CIDs, retrieve source-linked pharmacology records, and record only artifact-backed provider target assertions.", ("medai_drug_", "medai_compound_", "medai_compounds_", "medai_graph_add_entity", "medai_graph_link_evidence")),
+    "chemistry_analyst": ScientificAgent("chemistry_analyst", "Chemistry Agent", "chemistry", "Resolve only source-identified PubChem CIDs to unambiguous chemical identities; never infer identity from free-text mentions.", ("medai_compounds_lookup_pubchem",)),
+    "pharmacology_analyst": ScientificAgent("pharmacology_analyst", "Pharmacology Agent", "pharmacology", "Retrieve source-linked pharmacology records for exact compound identities and record only artifact-backed provider target assertions.", ("medai_drug_", "medai_graph_add_entity", "medai_graph_link_evidence")),
     "scientific_critic": ScientificAgent("scientific_critic", "Scientific Critic", "scientific_criticism", "Find review leads and alternative explanations; retrieved or model-screened records are not refutations.", ("medai_papers_search_pubmed", "medai_papers_align_pmc_claims", "medai_evidence_list", "medai_hypotheses_criticize")),
     "knowledge_graph_curator": ScientificAgent("knowledge_graph_curator", "Knowledge Graph Agent", "knowledge_graph", "Snapshot only registered stable entities and evidence-linked relationships.", ("medai_graph_snapshot",)),
     "hypothesis_generator": ScientificAgent("hypothesis_generator", "Hypothesis Agent", "hypothesis", "Generate traceable candidate hypotheses, search bounded source literature, and preserve uncertainty; make no discovery claims.", ("medai_hypotheses_propose", "medai_papers_search_pubmed")),
     "capability_learner": ScientificAgent("capability_learner", "Capability Learning Agent", "self_extension", "Draft disabled Python/R capability proposals, validate signed source only in the bounded no-network sandbox, and compare paired sandbox benchmarks; never invoke production capabilities, activate a Skill, or promote a capability.", ("medai_skills_", "medai_capabilities_generate_python_proposal", "medai_capabilities_generate_r_proposal", "medai_capabilities_validate_python_proposal", "medai_capabilities_validate_r_proposal", "medai_capabilities_benchmark_")),
-    "reproducibility_agent": ScientificAgent("reproducibility_agent", "Reproducibility Agent", "reproducibility", "Package source, task, graph, and evidence receipts with interpretation limits.", ("medai_graph_snapshot", "medai_evidence_list")),
+    "reproducibility_agent": ScientificAgent("reproducibility_agent", "Reproducibility Agent", "reproducibility", "Package source, task, graph, evidence, and citation receipts with interpretation limits.", ("medai_graph_snapshot", "medai_evidence_list", "medai_papers_citation_network")),
+    "benchmark_analyst": ScientificAgent("benchmark_analyst", "Scientific Evaluation Agent", "scientific_evaluation", "Evaluate only source-digest-bound, independently adjudicated domain or double-reviewed evidence-quality benchmark inputs; report domains separately and never claim performance from synthetic fixtures.", ("medai_biomedical_domain_benchmark_evaluate", "medai_evidence_quality_benchmark_evaluate")),
 }
 
 # These tools form the worker's bounded execution substrate and are available
@@ -67,6 +69,7 @@ AGENT_BY_TASK: dict[str, str] = {
     "proteins.analyze": "protein_analyst",
     "pathways.map": "pathway_analyst",
     "trials.discover": "trial_librarian",
+    "compounds.analyze": "chemistry_analyst",
     "drugs.investigate": "pharmacology_analyst",
     "contradictions.search": "scientific_critic",
     "graph.build": "knowledge_graph_curator",
@@ -74,6 +77,7 @@ AGENT_BY_TASK: dict[str, str] = {
     "hypotheses.criticize": "scientific_critic",
     "skills.learn": "capability_learner",
     "report.reproduce": "reproducibility_agent",
+    "benchmark.evaluate": "benchmark_analyst",
 }
 
 
@@ -99,7 +103,7 @@ class ResearchDirector:
     ) -> dict[str, Any]:
         if not session_id or not isinstance(objective, str) or not objective.strip():
             raise ValueError("research director requires a session and objective")
-        if depth not in {"standard", "deep"} or isinstance(budget, bool) or not 1 <= budget <= 100_000:
+        if depth not in {"standard", "deep"} or isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= 100_000:
             raise ValueError("research director received invalid depth or budget")
         expected = {step.id: step for step in DEFAULT_PLAN}
         if not isinstance(tasks, list) or len(tasks) != len(expected):

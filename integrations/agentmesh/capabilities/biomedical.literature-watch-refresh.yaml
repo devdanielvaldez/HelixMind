@@ -1,12 +1,12 @@
 schemaVersion: amcp/0.1
 capability:
   id: biomedical.literature-watch-refresh
-  version: 0.1.0
-  intent: Run a bounded PubMed EDAT query and record discovered PMIDs without validating claims.
+  version: 0.2.0
+  intent: Run a bounded PubMed EDAT query, retry a bounded queued metadata batch, and record discovery without validating claims.
 contract:
   inputs:
     type: object
-    required: [session_id, watch_id, query, interval_seconds, worker_id]
+    required: [session_id, watch_id, query, interval_seconds, worker_id, pending_metadata_pmids]
     properties:
       session_id: {"type":"string","minLength":1}
       watch_id: {"type":"string","pattern":"^[a-f0-9]{64}$"}
@@ -14,9 +14,10 @@ contract:
       interval_seconds: {"type":"integer","minimum":86400,"maximum":31536000}
       worker_id: {"type":"string","minLength":1,"maxLength":128}
       last_pmids: {"type":["array","null"],"items":{"type":"string","pattern":"^[0-9]+$"},"maxItems":200}
+      pending_metadata_pmids: {"type":"array","items":{"type":"string","pattern":"^[0-9]+$"},"maxItems":20}
   outputs:
     type: object
-    required: [event, window_days, returned_pmids, new_pmids, new_pmid_identifiers, retained_record_count, incomplete, research_only, evidence_validated]
+    required: [event, window_days, returned_pmids, new_pmids, new_pmid_identifiers, metadata_candidates, retained_record_count, metadata_pending_count, metadata_overflow_count, incomplete, research_only, evidence_validated]
     properties:
       event: { type: object }
       window_days: { type: integer }
@@ -24,6 +25,9 @@ contract:
       new_pmids: { type: integer }
       new_pmid_identifiers: { type: array }
       retained_record_count: { type: integer, minimum: 0, maximum: 20 }
+      metadata_candidates: { type: integer, minimum: 0, maximum: 20 }
+      metadata_pending_count: { type: integer, minimum: 0, maximum: 10000 }
+      metadata_overflow_count: { type: integer, minimum: 0, maximum: 400 }
       incomplete: { type: boolean }
       research_only: { type: boolean, const: true }
       evidence_validated: { type: boolean, const: false }

@@ -5,7 +5,7 @@ import hashlib
 import json
 from typing import Any
 
-from medai_science.llm import JSONModelProvider, ModelCompletion, _validate_schema
+from medai_science.llm import JSONModelProvider, ModelCompletion, _validate_schema, complete_structured_json
 
 
 MAX_CLAIM_CHARS = 1200
@@ -64,7 +64,10 @@ def claim_context_receipt(metadata: dict[str, Any]) -> dict[str, Any]:
         if len(value) > maximum:
             raise ValueError(f"claim {field} exceeds {maximum} characters")
         lengths[field] = len(value)
-    encoded = json.dumps(metadata, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    try:
+        encoded = json.dumps(metadata, ensure_ascii=False, sort_keys=True, allow_nan=False, separators=(",", ":")).encode("utf-8", "strict")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ValueError("claim source metadata must be strict JSON") from error
     if len(encoded) > 4096:
         raise ValueError("claim source metadata exceeds its 4096-byte limit")
     return {
@@ -85,13 +88,22 @@ async def compare_claim_pair(
     metadata_b: dict[str, Any],
 ) -> ModelCompletion:
     """Return categorical semantic review labels without generated prose or source text retention."""
-    if not isinstance(candidate_a, str) or not isinstance(candidate_b, str) or candidate_a == candidate_b:
+    if (
+        not isinstance(candidate_a, str)
+        or not isinstance(candidate_b, str)
+        or not candidate_a.strip()
+        or not candidate_b.strip()
+        or len(candidate_a) > 64
+        or len(candidate_b) > 64
+        or candidate_a == candidate_b
+    ):
         raise ValueError("claim pair requires two distinct source candidate identifiers")
     for text in (text_a, text_b):
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_CLAIM_CHARS:
             raise ValueError(f"each claim sentence must contain 1..{MAX_CLAIM_CHARS} characters")
     if not isinstance(metadata_a, dict) or not isinstance(metadata_b, dict):
         raise ValueError("claim source metadata must be objects")
+    context_receipts = [claim_context_receipt(metadata_a), claim_context_receipt(metadata_b)]
     annotation_keys = {"result_kind", "direction", "entity_ids"}
     annotation_a = annotation_keys.issubset(metadata_a)
     annotation_b = annotation_keys.issubset(metadata_b)
@@ -135,7 +147,8 @@ async def compare_claim_pair(
     prompt = "Classify this pair of source-anchored claim candidates:\n" + json.dumps(prompt_value, ensure_ascii=False, separators=(",", ":"))
     if len(prompt.encode("utf-8")) > MAX_CONTEXT_CHARS:
         raise ValueError("claim pair context exceeds its byte limit")
-    completion = await provider.complete_json(
+    completion = await complete_structured_json(
+        provider,
         system=_SYSTEM if source_annotated else _CROSS_SOURCE_SYSTEM,
         prompt=prompt,
         schema_name="claim_alignment",
@@ -145,20 +158,33 @@ async def compare_claim_pair(
     if completion.value["candidate_a"] != candidate_a or completion.value["candidate_b"] != candidate_b:
         raise ValueError("model claim alignment returned different source candidate identifiers")
     relation = completion.value["relation"]
+    reason_codes = completion.value["reason_codes"]
+    if len(reason_codes) != len(set(reason_codes)):
+        raise ValueError("model claim alignment returned duplicate reason codes")
+    reason_set = set(reason_codes)
+    if {"same_outcome", "different_outcome"}.issubset(reason_set):
+        raise ValueError("model claim alignment returned conflicting outcome reason codes")
     if source_annotated and relation == "same_question_opposing" and (
         (direction_a, direction_b) not in {("increase", "decrease"), ("decrease", "increase")}
     ):
         raise ValueError("model opposing-claim label conflicts with source-annotated direction")
-    if relation == "same_question_opposing" and "opposite_direction" not in completion.value["reason_codes"]:
-        raise ValueError("model opposing-claim label lacks an opposite-direction reason")
+    if relation == "same_question_opposing" and not {"same_outcome", "opposite_direction"}.issubset(reason_set):
+        raise ValueError("model opposing-claim label requires same-outcome and opposite-direction reasons")
+    if relation == "same_question_consistent" and (
+        "same_outcome" not in reason_set
+        or "opposite_direction" in reason_set
+        or "different_outcome" in reason_set
+    ):
+        raise ValueError("model consistent-claim label has incompatible outcome or direction reasons")
     if source_annotated and relation == "same_question_consistent" and (
-        direction_a != direction_b or "opposite_direction" in completion.value["reason_codes"]
+        direction_a != direction_b or "opposite_direction" in reason_set
     ):
         raise ValueError("model consistent-claim label conflicts with source-annotated direction")
     value = {
         **completion.value,
         "assessment_type": "local_model_semantic_screening",
         "review_status": "requires_human_scientific_review",
+        "source_context_receipts": context_receipts,
         "interpretation_limit": "Categorical model screening only. Not a validated claim alignment, evidence judgment, or confirmed contradiction.",
     }
     return ModelCompletion(value, completion.provider, completion.model, completion.prompt_sha256, completion.response_sha256, completion.usage, completion.max_output_tokens)

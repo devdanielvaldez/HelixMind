@@ -148,19 +148,25 @@ class ClinVarClient:
                 continue
             for location in alleles[0].findall(".//SequenceLocation"):
                 attrs = location.attrib
-                required = ("Assembly", "Chr", "start", "referenceAllele", "alternateAllele")
-                if not all(attrs.get(key) for key in required):
+                required = ("Assembly", "Chr", "start", "referenceAllele")
+                if not all(attrs.get(key) for key in required) or "alternateAllele" not in attrs:
                     continue
                 if attrs["Assembly"] not in {"GRCh37", "GRCh38"} or not attrs["start"].isdigit():
                     continue
-                if not attrs["referenceAllele"].isalpha() or not attrs["alternateAllele"].isalpha():
+                reference_allele = "" if attrs["referenceAllele"] == "-" else attrs["referenceAllele"]
+                alternate_allele = "" if attrs["alternateAllele"] == "-" else attrs["alternateAllele"]
+                if (not reference_allele and not alternate_allele
+                        or (reference_allele and not reference_allele.isalpha())
+                        or (alternate_allele and not alternate_allele.isalpha())):
                     continue
+                stop = attrs.get("stop")
                 output.setdefault(uid, []).append({
                     "assembly": attrs["Assembly"],
                     "contig": attrs["Chr"],
                     "position_1_based": int(attrs["start"]),
-                    "reference_allele": attrs["referenceAllele"].upper(),
-                    "alternate_allele": attrs["alternateAllele"].upper(),
+                    "end_position_1_based": int(stop) if stop and stop.isdigit() else None,
+                    "reference_allele": reference_allele.upper(),
+                    "alternate_allele": alternate_allele.upper(),
                     "sequence_accession": attrs.get("Accession"),
                     "source_coordinate_convention": "ClinVar VCV XML SequenceLocation, 1-based and HGVS-right-shifted per NCBI documentation; normalize against the supplied reference before comparison",
                 })

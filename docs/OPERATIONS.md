@@ -2,6 +2,12 @@
 
 This runbook covers the implemented local and single-host deployment. It does not certify a multi-user internet-facing deployment: external immutable audit anchoring, PostgreSQL/object storage, and a production security review are not implemented.
 
+Compose isolates service paths with an internal `api-backend` network: the API and web join it, while scientific MCP and workers also join `provider-egress` for public data sources and optional AgentMesh access. Prometheus can reach the API only through the internal `metrics` network; Alertmanager joins metrics and provider egress to send operator-configured notifications. The API, MCP, and web host ports bind to loopback. MCP HTTP and WebSocket requests require the dedicated `X-MedAI-MCP-Token`; the middleware compares it in constant time and removes credential headers before dispatch. Direct workers use this transport token over the internal Compose network. Keep host firewall rules restrictive and review TLS and trusted proxy behavior before exposing any service. CI verifies this rendered network topology for all Compose profiles.
+
+See [the deployment security review](SECURITY_REVIEW.md) for the reviewed trust boundaries, implemented controls, and remaining production gates.
+
+On Unix, the SQLite database is created with owner-only `0600` permissions, and MedAI tightens an existing database file to the same mode before opening it. Database paths must be regular files; symlinks and special files are rejected. Keep the parent directory writable only by the MedAI service account so another local user cannot replace the database path or inspect SQLite sidecars and backups.
+
 ### Capability version comparisons
 
 `medai-science capability-benchmark-versions baseline.py candidate.py benchmark.json --image "$MEDAI_PYTHON_SANDBOX_IMAGE"` runs each version repeatedly in alternating order in the same digest-pinned no-network Docker sandbox. The benchmark JSON contains `schema_version`, `capability_id`, both version IDs, `benchmark_id`, and 10–100 cases with unique `case_id`, object `input`, and object `expected`. The runner derives the benchmark digest from the exact input, records per-case monotonic wall time and per-run process CPU, binds both source digests, execution order, and sandbox image, and reports pass-rate and median-latency differences. `medai-science capability-compare-versions comparison.json` remains available for already collected measurements. Neither command changes lifecycle state; reports are review evidence only, and the corpus still needs independent adjudication for scientific promotion decisions.
@@ -12,12 +18,15 @@ AgentMesh clients can run the same comparison on two installation-signed proposa
 
 Newly ingested PubMed paper artifacts and MCP search results omit abstract text and retain only bibliographic metadata, source section labels, character counts, and SHA-256 receipts; transient retrieval text is discarded after ranking and section-label extraction. Drug-interaction receipts additionally use an explicit bibliographic allowlist and mark article licensing as undetermined. PubMed record availability does not establish reuse rights: [NLM notes abstracts may remain copyrighted by publishers or authors](https://www.ncbi.nlm.nih.gov/books/NBK25501/). PMC full-text model processing requires an exact article license allowlisted by the operator. For existing data, first call `GET /v1/research/{id}/pubmed-abstract-retention/preview`, review the exact artifact IDs and plan digest, then explicitly apply with `POST /v1/research/{id}/pubmed-abstract-retention` and JSON `{ "plan_sha256": "<reviewed digest>", "reason": "<retention rationale>" }`. Retrieve durable migration receipts with `GET /v1/research/{id}/pubmed-abstract-retention/receipts`. This is tenant scoped and requires researcher/admin authentication. The transaction replaces eligible PubMed abstract fields, updates the current artifact digest, and records original/replacement digests, plan, actor, reason, and time in an audit receipt; any intervening artifact change invalidates the reviewed plan. It does not rewrite external backups or previously exported bundles, so operators must apply their separate retention policy to those copies. Source-specific cache expiry/update scheduling remains open.
 
+Crossref metadata is cached locally for five minutes in Compose at `/data/crossref-metadata-cache.sqlite`; set `MEDAI_CROSSREF_METADATA_CACHE` to a SQLite path for local runs, or leave it unset to disable the cache. The cache is bounded to 500 entries and 256 KiB per entry, hashes DOI/query keys rather than persisting search text, checks a payload digest on read, and stores normalized bibliographic metadata only. It preserves source-provided license metadata but stores no abstracts, full text, or unstructured reference strings; this metadata cache does not grant rights to referenced articles. Entries expire automatically, and oversized results are returned without caching. Cache hits do not bypass the separate session-budget charge for a requested research operation.
+
 ## Configuration and startup
 
 Copy `.env.example` to a private deployment environment. Generate the service bearer outside source control:
 
 ```sh
 export MEDAI_API_BEARER_TOKEN="$(openssl rand -hex 32)"
+export MEDAI_MCP_BEARER_TOKEN="$(openssl rand -hex 32)"
 export MEDAI_WEB_SESSION_SECRET="$(openssl rand -hex 32)"
 docker compose config --quiet
 docker compose up -d --build
@@ -56,7 +65,19 @@ To plan AgentMesh routes from these platform-admin decisions, set `MEDAI_API_URL
 
 Local ClinVar-to-VCF reconciliation (`medai-science variant-reconcile`) accepts only E-utilities result records with a VCV accession, matching ClinVar URL/source label, and a recomputed canonical digest of their assembly-location list. It normalizes each location against the exact same local FASTA used for the VCF. Those checks detect inconsistent records; hashes inside caller-supplied JSON do not authenticate ClinVar as the origin, so retain source downloads and retrieval provenance separately when audit-grade external verification is required. Composite haplotype/genotype and complex records remain excluded from exact single-allele matches.
 
-To run a specialist worker, give it a separate random token configured in `MEDAI_API_TOKENS` as a `service` credential with its `scientific_agent_id`, then set that exact token as `MEDAI_SPECIALIST_API_TOKEN`. Example role record: `{"token":"<secret>","subject":"worker-literature","tenant_id":"local","role":"service","scientific_agent_id":"literature_librarian"}`. The specialist worker profile does not receive the general `MEDAI_API_BEARER_TOKEN`. It sends its role-bound token as MCP `_meta`; the MCP service validates the identity with the API and scopes every API request for that invocation to the specialist credential. All claims and task-attributed writes must match the role's DAG assignment. Lease recovery remains the general worker's responsibility.
+`medai-science dbsnp rs328` (also available as `medai dbsnp rs328`) retrieves one bounded NCBI dbSNP RefSNP record and reports a digest of the exact response. Its placements may span multiple sequence accessions and assemblies; the command does not select an assembly, normalize alleles, or reconcile to local variants. Use the exact local reference-validated variant workflow before joining a placement. The session-scoped `medai_variants_lookup_dbsnp` MCP tool charges the session before retrieval and retains the source receipt as an artifact; it does not run automatically on user VCF data.
+
+To reconcile a retained RefSNP receipt locally, provide the generated VCF report, source receipt, the exact reference FASTA, and a JSON map from RefSeq placement accessions to FASTA contig names. The reconciler accepts only placements explicitly labeled for the requested GRCh37/GRCh38 assembly, checks deleted sequence against the exact local FASTA, converts SPDI to VCF representation, normalizes simple indels, and joins exact alleles:
+
+```sh
+medai-science variant-reconcile-dbsnp report.json rs-receipt.json reference.fa sequence-accession-map.json --genome-build GRCh38
+```
+
+Example map: `{"NC_000001.11":"1","NC_000016.10":"16"}`. Validate accession versions against the FASTA provider/build. Unsupported or unmapped placements are returned for review; the reconciler does not infer chromosome mappings or clinical significance.
+
+Capture this comparison in a private offline-replayable VCF bundle by passing `--dbsnp-receipt` and `--dbsnp-sequence-map` alongside `--bundle-dir`. Verification recomputes the local normalization and placement join from the captured receipt, FASTA, map, and hash-pinned code; it makes no NCBI request. The response hash is a provenance receipt and does not authenticate the provider or prove scientific interpretation.
+
+To run a specialist worker, give it a separate random token configured in `MEDAI_API_TOKENS` as a `service` credential with its `scientific_agent_id`, then set that exact token as `MEDAI_SPECIALIST_API_TOKEN`. Example role record: `{"token":"<secret>","subject":"worker-literature","tenant_id":"local","role":"service","scientific_agent_id":"literature_librarian"}`. The specialist worker profile does not receive the general `MEDAI_API_BEARER_TOKEN`. It sends its role-bound token as MCP `_meta`; the MCP service validates the identity with the API and scopes every API request for that invocation to the specialist credential. All claims and task-attributed writes must match the role's DAG assignment. Lease recovery remains the general worker's responsibility. Specialist credentials are also denied platform-wide admin/audit routes and global recurring queue claims; only platform admins or unscoped general service credentials can perform those operations.
 
 Platform administrators set per-tenant research limits:
 
@@ -71,16 +92,22 @@ Read the same URL with `GET` for limits and current usage. Tenant administrators
 
 ## AgentMesh and workers
 
-Configure `MEDAI_AGENTMESH_URL` to the governed MCP gateway. Install the reviewed contracts using `integrations/agentmesh/register-capability.sh`; validation/installation in AgentMesh is separate from enabling a capability or approving generated code. The worker profile is opt-in:
+Workers can connect directly to MedAI's authenticated MCP service without AgentMesh credential injection. Set `MEDAI_DIRECT_MCP_URL=http://science-mcp:8091/mcp` and provide the distinct `MEDAI_MCP_BEARER_TOKEN`; then start the opt-in direct profile:
+
+```sh
+docker compose --profile direct-worker up -d --build
+```
+
+The direct worker service is attached only to the internal `api-backend` network; it has no provider egress and receives the MCP transport token without the general API service credential. It sends the secret only in `X-MedAI-MCP-Token`. This credential must differ from API bearer credentials. AgentMesh remains an optional governed gateway mode: its workers stay on the egress network but do not receive the direct MCP token. Leave `MEDAI_DIRECT_MCP_URL` empty, configure `MEDAI_AGENTMESH_URL`, install reviewed contracts using `integrations/agentmesh/register-capability.sh`, and enable its worker profile:
 
 ```sh
 docker compose --profile agentmesh-worker up -d --build
 ```
 
-For independent queue consumers, deploy the specialist profile with one registered role selected by `MEDAI_SCIENTIFIC_AGENT_ID`:
+For independent queue consumers, deploy the direct specialist profile with one registered role selected by `MEDAI_SCIENTIFIC_AGENT_ID` (use `agentmesh-specialist` only when routing through the AgentMesh gateway):
 
 ```sh
-MEDAI_SCIENTIFIC_AGENT_ID=literature_librarian docker compose --profile agentmesh-specialist up -d --build
+MEDAI_SCIENTIFIC_AGENT_ID=literature_librarian docker compose --profile direct-specialist up -d --build
 ```
 
 Other accepted IDs are defined in `science/src/medai_science/scientific_agents.py`. Specialist workers lease only their role's task IDs; each process has a unique lease owner. Run the general and specialist profiles together only when a general worker is intentionally allowed to consume tasks from every specialist. Task filtering is operational routing; the API also enforces specialist identity and DAG role. Keep workers on a trusted network and give them only the service credentials they need. For semantic capability discovery, configure `MEDAI_API_URL`, `MEDAI_API_BEARER_TOKEN`, `AGENTMESH_CONTROL_URL`, `AGENTMESH_ADMIN_TOKEN`, `AGENTMESH_TENANT`, `AGENTMESH_NAMESPACE`, and `MEDAI_AGENTMESH_SERVICE`; that path requires an authenticated MedAI lifecycle registry and a valid AgentMesh runtime snapshot with an exact active route. Any local catalog entry without an exact approved MedAI registry record remains experimental. The search recommends reuse only and does not execute the capability.
@@ -99,6 +126,46 @@ Back up before upgrades, maintenance, or restore. The CLI uses SQLite's online b
 medai database backup ./backups/medai-before-upgrade.sqlite
 medai database verify ./backups/medai-before-upgrade.sqlite
 ```
+
+For a dedicated directory containing only MedAI snapshots, preview retention by age and count before deleting anything:
+
+```sh
+medai database prune-backups ./backups --keep-newest 7 --max-age-days 90
+```
+
+The planner verifies every `.sqlite` candidate and prints its size, digest, timestamp, action, and a plan digest. Invalid or symlinked candidates stop the operation without deleting files. The policy retains the newest requested count and every backup still within the age window. To apply a reviewed plan, rerun it with the same policy and the exact printed digest:
+
+```sh
+medai database prune-backups ./backups --keep-newest 7 --max-age-days 90 --apply --confirm-plan-sha256 "$REVIEWED_PLAN_SHA256"
+```
+
+The command recalculates the plan and re-verifies every deletion candidate before removing any file. A changed directory or mismatched digest aborts the prune. This operates on local SQLite snapshots only; off-host backup, retention, and disaster recovery remain separately managed.
+
+An operator can schedule this fixed policy after reviewing the dedicated directory and retention limits. The scheduled invocation is explicit and still verifies each backup and binds deletion to the freshly computed plan:
+
+```sh
+medai database prune-backups /data/backups --keep-newest 7 --max-age-days 90 --apply-policy
+```
+
+Run the scheduled job under a service account that can write only to the backup directory and keep its output as an operational receipt. The command does not upload or remove off-host backups.
+
+For a managed Linux host, install the included systemd timer. The backup job runs as the `medai` account, is network-isolated, locks against overlapping runs, verifies each new snapshot, and applies retention only after verification succeeds. `Persistent=true` catches up a missed daily run after the host returns. Its failure handler always logs to journald and can also send a content-free alert to the Alertmanager v2 API (or another compatible endpoint); remote endpoints must use HTTPS and loopback HTTP is allowed for a local Alertmanager:
+
+```sh
+sudo install -d -o root -g medai -m 0750 /etc/medai
+sudo install -o root -g medai -m 0640 deploy/backup.env.example /etc/medai/backup.env
+sudo install -d -o medai -g medai -m 0700 /var/lib/medai/backups
+sudo install -o root -g root -m 0755 deploy/medai-backup.sh /usr/local/libexec/medai-backup.sh
+sudo install -o root -g root -m 0755 deploy/medai-backup-alert.sh /usr/local/libexec/medai-backup-alert.sh
+sudo install -o root -g root -m 0644 deploy/systemd/medai-backup.service /etc/systemd/system/
+sudo install -o root -g root -m 0644 deploy/systemd/medai-backup.timer /etc/systemd/system/
+sudo install -o root -g root -m 0644 deploy/systemd/medai-backup-alert@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start medai-backup.service
+sudo systemctl enable --now medai-backup.timer
+```
+
+Edit `/etc/medai/backup.env` to match the live database and backup paths before starting the service. Set `MEDAI_BACKUP_ALERT_WEBHOOK=http://127.0.0.1:9093/api/v2/alerts` when the local Compose Alertmanager is enabled, or configure a compatible HTTPS endpoint. Keep the backup directory dedicated to MedAI snapshots; the service applies its age/count deletion policy there. Success and failure output is available with `journalctl -u medai-backup.service`; failures also reach the configured alert receiver. Check `systemctl list-timers medai-backup.timer` and run `systemctl start medai-backup.service` after changing the policy. This host scheduler does not provide off-host copies or guarantee restore readiness; replicate snapshots to separate protected storage and periodically test restore.
 
 Schema migrations run when MedAI opens the database. The SQLite `user_version` records the schema version only after a successful transactional upgrade; startup rejects a database stamped by a newer MedAI build before it makes schema changes. Migration DDL and legacy backfills are serialized across concurrent API/worker startup. Test upgrades against a copy of the production database first. For restore:
 
@@ -124,12 +191,17 @@ The chain detects changes across retained rows and archived NDJSON segments. Con
 
 Use public research queries only; do not send patient identifiers or protected health information to public literature APIs or model providers. Configure `NCBI_EMAIL` and follow each provider's usage and license terms. Retained artifacts include source IDs, hashes, retrieval metadata, and bounded structured payloads; PMC full text is parsed transiently and excluded from persistent extraction receipts. A source record or model-generated review lead is not automatically a validated scientific claim. Computational hypotheses are not clinical decisions.
 
-Session budgets cover task starts, implemented provider/model/storage operations, and authenticated research API calls. Model calls reserve credits before the provider request using a conservative ceiling of UTF-8 system/prompt/schema bytes, the configured output-token ceiling, and protocol overhead, converted by `MEDAI_MODEL_TOKENS_PER_CREDIT`; successful responses settle to provider-reported usage, while uncertain outcomes retain the full reservation. Only service identities can reserve or settle, and the reservation is bound to the same authenticated subject for both operations. A crashed worker's outstanding reservation becomes uncertain when its task lease is recovered. Each API request under `/v1/research/{session_id}/...` costs one credit by default; set `MEDAI_API_REQUEST_CREDITS` to a positive integer to change the per-request rate. The `POST /v1/research` creation request is charged at the same rate inside the session-creation transaction; creation fails with HTTP 402 and leaves no session behind when its requested budget cannot cover that charge. A valid budget-reservation settlement request is exempt from the per-session request surcharge so a fully reserved call can always settle. The `GET /v1/research/{session_id}/budget` endpoint remains available after exhaustion so operators can inspect usage. Health checks and non-research API requests without a research-session context are not charged to a session. Physical storage overhead, GPU time, and every system/provider compute cost remain unmetered. Tenant quotas limit active sessions and their declared credit budgets, not complete infrastructure consumption. Generated Python execution requires the digest-pinned, no-network Docker sandbox and still needs a host with a working hardened container runner.
+Session budgets cover task starts, implemented provider/model/storage operations, and authenticated research API calls. Model calls reserve credits before the provider request using a conservative ceiling of UTF-8 system/prompt/schema bytes, the configured output-token ceiling, and protocol overhead, converted by `MEDAI_MODEL_TOKENS_PER_CREDIT`; successful responses settle to provider-reported usage, while uncertain outcomes retain the full reservation. Only service identities can reserve or settle, and the reservation is bound to the same authenticated subject for both operations. A crashed worker's outstanding reservation becomes uncertain when its task lease is recovered. Each API request under `/v1/research/{session_id}/...` costs one credit by default; set `MEDAI_API_REQUEST_CREDITS` to a positive integer to change the per-request rate. The `POST /v1/research` creation request is charged at the same rate inside the session-creation transaction; creation fails with HTTP 402 and leaves no session behind when its requested budget cannot cover that charge. A valid budget-reservation settlement request is exempt from the per-session request surcharge so a fully reserved call can always settle. Task transitions meter themselves; if the balance cannot cover a transition charge, only a leased task's transition to `needs_review` is allowed through without charge so the worker can pause cleanly. Other task transitions still receive HTTP 402. Researcher and research-director cancellation is also available after exhaustion so an operator can stop a depleted run; other scoped specialist credentials cannot cancel the session. The `GET /v1/research/{session_id}/budget` endpoint remains available after exhaustion so operators can inspect usage. Health checks and non-research API requests without a research-session context are not charged to a session. Physical storage overhead, GPU time, and every system/provider compute cost remain unmetered. Tenant quotas limit active sessions and their declared credit budgets, not complete infrastructure consumption. Generated Python execution requires the digest-pinned, no-network Docker sandbox and still needs a host with a working hardened container runner.
 
 ## Common recovery checks
 
 - **API fails on startup:** confirm `MEDAI_API_TOKENS` is valid JSON and non-loopback binds have a valid bearer credential; inspect database migration errors before retrying.
-- **Worker cannot claim work:** check that the AgentMesh gateway is reachable, the API service token is current, the session is not cancelled, and the task lease/retry time has elapsed.
+- **Worker cannot claim work:** check that the configured MCP endpoint is reachable, the MCP transport token and API credentials are current, the session is not cancelled, and the task lease/retry time has elapsed.
 - **Quota rejects session creation:** inspect `GET /v1/admin/tenants/{tenant_id}/quota`; a platform administrator can adjust the limit after reviewing current usage.
 - **Capability reuse returns no match:** check the local embedding model/catalog, authenticated AgentMesh control-plane health and scope, active service route, capability lifecycle metadata, and declared schema/permission fit.
 - **Restore or backup fails integrity checks:** preserve the source and receipts, do not replace the live database manually, and recover from another verified snapshot.
+# Drug-pair benchmark evaluation
+
+`medai-science drug-pair-benchmark-evaluate benchmark.json` evaluates a frozen two-stage corpus. The top-level document contains `schema_version: "1"`, a benchmark ID and adjudication protocol, plus `retrieval` and `conflict_screen` documents. Each stage uses the double-adjudicated schema (`schema_version: "2"`): source-backed cases have a stable case ID, lowercase SHA-256 digest of the exact source artifact, evidence type (`versioned_label`, `pubmed_record`, or `pmc_full_text`), two independent primary labels, a distinct third-party resolution for disagreements, a categorical prediction, and correctness confidence. Retrieval labels are `retrieved` and `not_retrieved`; conflict-screen labels are `conflict`, `no_conflict`, and `unassessable`.
+
+The retrieval stage must include eligible records that were not returned if recall is to be measured. Precision, recall, and F1 are reported per label in the overall result and separately for each evidence type. Conflict-screen cases must join to a retrieval case by case ID, exact source digest, and evidence type, and the system must have predicted that record as retrieved. Consequently, conflict-screen metrics describe only the retrieved population; they do not include retrieval misses. Calibration bins and correctness Brier/ECE are also reported for each evidence type. The benchmark digest binds the complete input. Fixture corpora validate evaluator behavior only and are not scientific performance results; report corpus selection, reviewer protocol, and independent adjudication alongside any real result.

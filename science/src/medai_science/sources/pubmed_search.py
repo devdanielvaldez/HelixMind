@@ -7,8 +7,40 @@ import xml.etree.ElementTree as ET
 from typing import Any
 
 
+def _strict_json_loads(raw: bytes) -> Any:
+    """Reject duplicate object keys and non-standard numbers in provider JSON."""
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"PubMed ESearch contains a duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> Any:
+        raise ValueError(f"PubMed ESearch contains a non-standard JSON number: {value}")
+
+    return json.loads(raw, object_pairs_hook=reject_duplicate_keys, parse_constant=reject_constant)
+
+
 def _pmid(value: Any) -> bool:
     return isinstance(value, str) and value.isascii() and value.isdecimal() and 1 <= len(value) <= 20
+
+
+def validate_pmid_snapshot(value: Any, *, max_items: int = 200) -> list[str]:
+    """Validate a persisted PMID snapshot before using it to suppress discoveries."""
+    if isinstance(max_items, bool) or not isinstance(max_items, int) or not 1 <= max_items <= 200:
+        raise ValueError("PubMed snapshot item limit must be 1..200")
+    if value is None:
+        return []
+    if (
+        not isinstance(value, list)
+        or len(value) > max_items
+        or any(not _pmid(pmid) for pmid in value)
+        or len(value) != len(set(value))
+    ):
+        raise ValueError(f"PubMed snapshot must contain at most {max_items} unique ASCII PMID identifiers")
+    return value
 
 
 def parse_related_publications(article: ET.Element) -> list[dict[str, str]]:
@@ -33,8 +65,8 @@ def parse_esearch_response(raw: bytes, requested_limit: int) -> tuple[list[str],
     if not isinstance(raw, bytes) or not raw or len(raw) > 2_000_000:
         raise ValueError("PubMed ESearch JSON must contain 1..2000000 bytes")
     try:
-        payload = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        payload = _strict_json_loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("PubMed ESearch returned invalid JSON") from error
     result = payload.get("esearchresult") if isinstance(payload, dict) else None
     if not isinstance(result, dict):

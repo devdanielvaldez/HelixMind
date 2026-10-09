@@ -23,13 +23,33 @@ MAX_REQUEST_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
 MAX_TEST_CASES = 100
 SANDBOX_TIMEOUT_SECONDS = 60
-_IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:+-]*@sha256:[0-9a-f]{64}$")
+_IMAGE_REFERENCE = re.compile(
+    r"^(?:[A-Za-z0-9][A-Za-z0-9._/:+-]*@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$"
+)
 _ALLOWED_IMPORTS = {"__future__", "math", "statistics", "re", "json", "collections", "itertools", "functools", "decimal", "fractions", "numpy", "scipy", "Bio", "rdkit"}
 _DENIED_NAMES = {
     "__import__", "eval", "exec", "compile", "open", "breakpoint",
     "getattr", "setattr", "delattr", "hasattr", "vars", "dir", "globals", "locals",
 }
 _RESULT_PREFIX = b"MEDAI_SANDBOX_RESULT:"
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("sandbox receipt contains a duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"sandbox receipt contains non-standard JSON number {value}")
+
+
+def strict_json_loads(payload: bytes | str) -> Any:
+    """Decode JSON while rejecting ambiguous keys and non-standard numbers."""
+    return json.loads(payload, object_pairs_hook=_strict_json_object, parse_constant=_reject_json_constant)
 
 _RUNNER_SOURCE = r'''import json, runpy, sys, time
 code_path, request_path, nonce = sys.argv[1:4]
@@ -286,7 +306,7 @@ class DockerPythonSandbox:
 
     def __init__(self, image: str, docker_binary: str = "docker", timeout: int = SANDBOX_TIMEOUT_SECONDS):
         if not _IMAGE_REFERENCE.fullmatch(image):
-            raise ValueError("sandbox image must be pinned by immutable sha256 digest")
+            raise ValueError("sandbox image must use an immutable sha256 repository digest or local image ID")
         if not 1 <= timeout <= SANDBOX_TIMEOUT_SECONDS:
             raise ValueError(f"sandbox timeout must be 1..{SANDBOX_TIMEOUT_SECONDS} seconds")
         self.image = image
@@ -310,15 +330,17 @@ class DockerPythonSandbox:
         request_bytes = json.dumps(request, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
         with tempfile.TemporaryDirectory(prefix="medai-capability-") as temporary:
             root = Path(temporary)
-            source_file = root / "capability.py"
-            request_file = root / "request.json"
-            runner_file = root / "runner.py"
+            bundle = root / "bundle"
+            bundle.mkdir(mode=0o755)
+            source_file = bundle / "capability.py"
+            request_file = bundle / "request.json"
+            runner_file = bundle / "runner.py"
             source_file.write_text(source, encoding="utf-8")
             request_file.write_bytes(request_bytes)
             runner_file.write_text(_RUNNER_SOURCE, encoding="utf-8")
             for file in (source_file, request_file, runner_file):
                 file.chmod(0o444)
-            root.chmod(0o755)
+            bundle.chmod(0o755)
             cid_file = root / "container.cid"
             try:
                 image_check = subprocess.run([self.docker_binary, "image", "inspect", "--format={{.Id}}", self.image], capture_output=True, timeout=10, check=False)
@@ -337,7 +359,7 @@ class DockerPythonSandbox:
                 "--entrypoint=python", "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "PYTHONHASHSEED=0",
                 # The interpreter reads these files by path; no executable or
                 # device semantics are needed from the host-provided bundle.
-                "--volume", f"{root}:/capability:ro,noexec,nosuid,nodev", self.image,
+                "--volume", f"{bundle}:/capability:ro,noexec,nosuid,nodev", self.image,
                 "/capability/runner.py", "/capability/capability.py", "/capability/request.json", secrets.token_hex(24),
             ]
             nonce = command[-1]
@@ -357,16 +379,46 @@ class DockerPythonSandbox:
             for line in stdout.splitlines():
                 if line.startswith(result_prefix):
                     try:
-                        receipt = json.loads(line[len(result_prefix):])
-                    except json.JSONDecodeError:
+                        receipt = strict_json_loads(line[len(result_prefix):])
+                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                         receipt = None
             if receipt is None:
                 detail = stderr.decode("utf-8", errors="replace")[-4000:]
                 raise SandboxError(f"sandbox produced no valid result receipt (exit {return_code}): {detail}")
+            if not isinstance(receipt, dict):
+                raise SandboxError("sandbox result receipt must be a JSON object")
+            if not isinstance(receipt.get("ok"), bool):
+                raise SandboxError("sandbox result receipt has an invalid execution status")
+            if receipt["ok"] and not isinstance(receipt.get("result"), dict):
+                raise SandboxError("successful sandbox result must be a JSON object")
+            if receipt["ok"]:
+                try:
+                    validate_value(receipt["result"], request["output_schema"], "$.result")
+                except ValueError as error:
+                    raise SandboxError(f"sandbox result violates the host-validated output contract: {error}") from error
             cpu_time_microseconds = receipt.get("cpu_time_microseconds")
             if isinstance(cpu_time_microseconds, bool) or not isinstance(cpu_time_microseconds, int) or cpu_time_microseconds < 0:
                 raise SandboxError("sandbox produced an invalid measured CPU usage receipt")
-            validation = receipt.get("validation", {})
+            validation = receipt.get("validation")
+            if not isinstance(validation, dict):
+                raise SandboxError("sandbox produced a malformed validation receipt")
+            cases = validation.get("cases")
+            passed = validation.get("passed")
+            failed = validation.get("failed")
+            if (not isinstance(cases, list) or len(cases) > MAX_TEST_CASES
+                    or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (passed, failed))):
+                raise SandboxError("sandbox produced a malformed validation receipt")
+            for index, case in enumerate(cases):
+                if (not isinstance(case, dict) or case.get("index") != index or not isinstance(case.get("passed"), bool)
+                        or isinstance(case.get("wall_time_microseconds"), bool)
+                        or not isinstance(case.get("wall_time_microseconds"), int)
+                        or case["wall_time_microseconds"] < 0):
+                    raise SandboxError("sandbox produced a malformed per-case validation receipt")
+            if receipt["ok"] and (len(cases) != len(test_cases)
+                                   or passed != sum(case["passed"] for case in cases)
+                                   or failed != sum(not case["passed"] for case in cases)
+                                   or passed + failed != len(test_cases)):
+                raise SandboxError("successful sandbox validation receipt does not match supplied test cases")
             return {
                 **source_receipt,
                 "runner": "docker-no-network-python",

@@ -1,0 +1,104 @@
+name: Prepare source release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing protected release tag to package as a draft
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Package and attest release draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Validate tag and require any existing release to remain a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          tag_commit="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" && "$tag_commit" == "$GITHUB_SHA" ]] || {
+            echo "Workflow ref and event commit must match the requested release tag." >&2
+            exit 1
+          }
+          [[ -z "$REQUESTED_TAG" || "$REQUESTED_TAG" == "$RELEASE_TAG" ]] || {
+            echo "Manual tag input must match the selected Git ref." >&2
+            exit 1
+          }
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+            [[ "$draft" == "true" ]] || { echo "Refusing to change an already published release." >&2; exit 1; }
+          fi
+      - name: Prepare release asset directory
+        run: mkdir -p release-assets
+      - name: Generate SPDX source SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: release-assets/medai-source.spdx.json
+          syft-version: v1.54.1
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Package the tagged source commit and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git archive --format=tar --prefix=medai-source/ "$commit" | gzip -n > release-assets/medai-source.tar.gz
+          cd release-assets
+          sha256sum medai-source.tar.gz medai-source.spdx.json > SHA256SUMS
+      - name: Attest source build provenance
+        uses: actions/attest@v4.2.2
+        with:
+          subject-path: release-assets/medai-source.tar.gz
+      - name: Attest the SPDX SBOM for the source archive
+        uses: actions/attest@v4.2.2
+        with:
+          subject-path: release-assets/medai-source.tar.gz
+          sbom-path: release-assets/medai-source.spdx.json
+      - name: Create or update the draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              release-assets/medai-source.tar.gz \
+              release-assets/medai-source.spdx.json \
+              release-assets/SHA256SUMS
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --title "$RELEASE_TAG" --generate-notes \
+              release-assets/medai-source.tar.gz \
+              release-assets/medai-source.spdx.json \
+              release-assets/SHA256SUMS
+          fi

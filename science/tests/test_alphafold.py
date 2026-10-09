@@ -81,6 +81,42 @@ class AlphaFoldTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             asyncio.run(client.predictions("P05067"))
 
+    def test_prediction_api_does_not_follow_provider_redirects(self) -> None:
+        calls = []
+
+        def redirect(request):
+            calls.append(request.url.host)
+            return httpx.Response(302, headers={"Location": "https://untrusted.example/redirect"})
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            asyncio.run(AlphaFoldClient(transport=httpx.MockTransport(redirect)).predictions("P05067"))
+        self.assertEqual(calls, ["alphafold.com"])
+
+    def test_downloads_canonical_bounded_coordinate_file_and_hashes_bytes(self) -> None:
+        body = b"HEADER    TEST\n"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(str(request.url), "https://alphafold.ebi.ac.uk/files/AF-P05067-F1-v6.pdb")
+            return httpx.Response(200, content=body)
+
+        result = asyncio.run(AlphaFoldClient(transport=httpx.MockTransport(handler)).coordinate_file("AF-P05067-F1-v6"))
+        self.assertEqual(result["content"], body)
+        self.assertEqual(result["byte_length"], len(body))
+        self.assertEqual(result["sha256"], __import__("hashlib").sha256(body).hexdigest())
+        self.assertEqual(result["license"], "CC-BY-4.0")
+
+    def test_rejects_untrusted_model_id_format_redirect_and_oversized_file(self) -> None:
+        with self.assertRaisesRegex(ValueError, "model entity"):
+            AlphaFoldClient.coordinate_url("AF-P05067-F1-v6.evil")
+        with self.assertRaisesRegex(ValueError, "format"):
+            AlphaFoldClient.coordinate_url("AF-P05067-F1-v6", "json")
+        redirect = AlphaFoldClient(transport=httpx.MockTransport(lambda _: httpx.Response(302, headers={"Location": "https://evil.example/x"})))
+        with self.assertRaises(httpx.HTTPStatusError):
+            asyncio.run(redirect.coordinate_file("AF-P05067-F1-v6"))
+        oversized = AlphaFoldClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, headers={"Content-Length": str(33 * 1024 * 1024)})))
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            asyncio.run(oversized.coordinate_file("AF-P05067-F1-v6"))
+
 
 if __name__ == "__main__":
     unittest.main()

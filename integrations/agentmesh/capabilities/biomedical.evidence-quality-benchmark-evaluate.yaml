@@ -1,0 +1,41 @@
+schemaVersion: amcp/0.1
+capability:
+  id: biomedical.evidence-quality-benchmark-evaluate
+  version: 0.1.0
+  intent: Evaluate a source-digest-bound, double-reviewed ordinal evidence-quality benchmark and retain domain-separated agreement, prediction, abstention, and calibration metrics.
+contract:
+  inputs:
+    type: object
+    required: [session_id, task_id, input_artifact_id]
+    properties:
+      session_id: { type: string, minLength: 1, maxLength: 128 }
+      task_id: { type: string, const: benchmark.evaluate }
+      input_artifact_id: { type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$' }
+      bins: { type: integer, minimum: 2, maximum: 100, default: 10 }
+  outputs:
+    type: object
+    required: [benchmark_id, benchmark_sha256, input_artifact_id, input_artifact_sha256, cases, overall_by_domain, by_evidence_type, primary_reviewer_agreement_by_domain, artifact_id, interpretation_limit]
+    properties:
+      benchmark_id: { type: string }
+      benchmark_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      input_artifact_id: { type: string }
+      input_artifact_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      cases: { type: integer, minimum: 1 }
+      overall_by_domain: { type: object }
+      by_evidence_type: { type: object }
+      primary_reviewer_agreement_by_domain: { type: object }
+      artifact_id: { type: string, minLength: 1 }
+      interpretation_limit: { type: string, minLength: 1 }
+  successEvidence:
+    - id: evidence-quality-input-hash-bound-to-domain-metrics
+      assertion: exact_double_reviewed_source_bound_input_hash_is_retained_with_domain_separated_metrics
+      acceptedTypes: [provider_receipt, state_assertion]
+  effects: [read_only, data_write]
+  idempotency: not_guaranteed
+  recovery: reconcile
+authority:
+  permissions: [biomedical.evidence_quality.evaluate]
+implementations:
+  - id: medai-evidence-quality-benchmark-evaluator
+    kind: mcp
+    reference: mcp://medai/medai_evidence_quality_benchmark_evaluate

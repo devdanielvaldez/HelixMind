@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+from unittest.mock import patch
 
 from medai_science.sandbox import DockerPythonSandbox, SandboxCancelledError, SandboxError, _RESULT_PREFIX, _RUNNER_SOURCE, _run_limited, capability_validation_request_hash, validate_capability_run_request, validate_python_source
 
@@ -34,9 +36,11 @@ class PythonCapabilitySandboxTests(unittest.TestCase):
                 validate_python_source(source)
 
     def test_requires_pinned_image_and_bounded_finite_test_cases(self):
-        with self.assertRaisesRegex(ValueError, "pinned by immutable sha256"):
+        with self.assertRaisesRegex(ValueError, "immutable sha256"):
             DockerPythonSandbox("python:3.12-slim")
         runner = DockerPythonSandbox("python:3.12-slim@sha256:" + "a" * 64)
+        local_image = DockerPythonSandbox("sha256:" + "b" * 64)
+        self.assertEqual(local_image.image, "sha256:" + "b" * 64)
         with self.assertRaisesRegex(ValueError, "1..100"):
             runner.execute("def run(input): return {}", {}, [])
         with self.assertRaisesRegex(ValueError, "finite JSON"):
@@ -87,7 +91,9 @@ class PythonCapabilitySandboxTests(unittest.TestCase):
                 "    assert volume.endswith(':/capability:ro,noexec,nosuid,nodev'), volume\n"
                 "    host=volume.split(':',1)[0]\n"
                 "    assert os.path.isdir(host) and os.access(host, os.R_OK|os.X_OK)\n"
-                "    print('MEDAI_SANDBOX_RESULT:'+args[-1]+':'+json.dumps({'ok':True,'result':{'value':3},'cpu_time_microseconds':1234,'validation':{'passed':1,'failed':0,'cases':[{'index':0,'passed':True}]}}))\n",
+                "    cidfile=next(x.split('=',1)[1] for x in args if x.startswith('--cidfile='))\n"
+                "    assert not cidfile.startswith(host+os.sep), 'host container ID file must stay outside guest mount'\n"
+                "    print('MEDAI_SANDBOX_RESULT:'+args[-1]+':'+json.dumps({'ok':True,'result':{'value':3},'cpu_time_microseconds':1234,'validation':{'passed':1,'failed':0,'cases':[{'index':0,'passed':True,'wall_time_microseconds':12}]}}))\n",
                 encoding="utf-8",
             )
             docker.chmod(0o755)
@@ -102,6 +108,84 @@ class PythonCapabilitySandboxTests(unittest.TestCase):
         self.assertEqual(result["lifecycle_status"], "experimental; no automatic registration or promotion")
         self.assertEqual(result["result"], {"value": 3})
         self.assertEqual(result["cpu_time_microseconds"], 1234)
+
+    def test_rejects_ambiguous_or_nonstandard_container_receipts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            docker = Path(folder) / "docker"
+            docker.write_text(
+                "#!" + sys.executable + "\n"
+                "import os, sys\n"
+                "args=sys.argv[1:]\n"
+                "if args[:2] == ['image','inspect']:\n    print('sha256:local')\n"
+                "else:\n    print('MEDAI_SANDBOX_RESULT:'+args[-1]+':'+os.environ['MOCK_RECEIPT'])\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            sandbox = DockerPythonSandbox("python:3.12-slim@sha256:" + "e" * 64, docker_binary=str(docker))
+            for receipt in (
+                '{"ok":true,"ok":false,"result":{},"cpu_time_microseconds":1}',
+                '{"ok":true,"result":{"value":NaN},"cpu_time_microseconds":1}',
+            ):
+                with self.subTest(receipt=receipt), patch.dict(os.environ, {"MOCK_RECEIPT": receipt}):
+                    with self.assertRaisesRegex(SandboxError, "no valid result receipt"):
+                        sandbox.execute("def run(input): return {}", {}, [], require_test_cases=False)
+
+    def test_rejects_well_formed_json_with_invalid_runner_receipt_shape(self):
+        with tempfile.TemporaryDirectory() as folder:
+            docker = Path(folder) / "docker"
+            docker.write_text(
+                "#!" + sys.executable + "\n"
+                "import os, sys\n"
+                "args=sys.argv[1:]\n"
+                "if args[:2] == ['image','inspect']:\n    print('sha256:local')\n"
+                "else:\n    print('MEDAI_SANDBOX_RESULT:'+args[-1]+':'+os.environ['MOCK_RECEIPT'])\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            sandbox = DockerPythonSandbox("python:3.12-slim@sha256:" + "f" * 64, docker_binary=str(docker))
+            cases = (
+                ('[]', "receipt must be a JSON object"),
+                ('{"ok":true,"result":{},"cpu_time_microseconds":1,"validation":[]}', "malformed validation receipt"),
+                ('{"ok":true,"result":{},"cpu_time_microseconds":1,"validation":{"passed":0,"failed":0,"cases":[]}}', "does not match supplied test cases"),
+            )
+            for receipt, message in cases:
+                with self.subTest(receipt=receipt), patch.dict(os.environ, {"MOCK_RECEIPT": receipt}):
+                    with self.assertRaisesRegex(SandboxError, message):
+                        sandbox.execute("def run(input): return {}", {}, [{"input": {}, "expected": {}}])
+
+    def test_host_revalidates_successful_runner_result_against_output_contract(self):
+        with tempfile.TemporaryDirectory() as folder:
+            docker = Path(folder) / "docker"
+            docker.write_text(
+                "#!" + sys.executable + "\n"
+                "import os, sys\n"
+                "args=sys.argv[1:]\n"
+                "if args[:2] == ['image','inspect']:\n    print('sha256:local')\n"
+                "else:\n    print('MEDAI_SANDBOX_RESULT:'+args[-1]+':'+os.environ['MOCK_RECEIPT'])\n",
+                encoding="utf-8",
+            )
+            docker.chmod(0o755)
+            sandbox = DockerPythonSandbox("python:3.12-slim@sha256:" + "d" * 64, docker_binary=str(docker))
+            receipt = json.dumps({
+                "ok": True,
+                "result": {"value": "wrong type"},
+                "cpu_time_microseconds": 1,
+                "validation": {
+                    "performed": True, "passed": 1, "failed": 0,
+                    "cases": [{"index": 0, "passed": True, "wall_time_microseconds": 1}],
+                },
+            })
+            contract = {
+                "input": {"type": "object"},
+                "output": {"type": "object", "required": ["value"],
+                           "properties": {"value": {"type": "integer"}}},
+            }
+            with patch.dict(os.environ, {"MOCK_RECEIPT": receipt}):
+                with self.assertRaisesRegex(SandboxError, "host-validated output contract"):
+                    sandbox.execute(
+                        "def run(input): return {'value': 3}", {},
+                        [{"input": {}, "expected": {"value": 3}}], contract=contract,
+                    )
 
     def test_execution_only_sandbox_receipt_does_not_claim_validation(self):
         with tempfile.TemporaryDirectory() as folder:

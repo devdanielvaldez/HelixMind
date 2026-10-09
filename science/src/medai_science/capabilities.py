@@ -5,14 +5,27 @@ import copy
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import itertools
 import json
 import math
 import os
-from pathlib import Path
 import re
+from pathlib import Path
 import sqlite3
 import threading
 from typing import Iterable, Protocol
+
+
+_MAX_INDEXED_CAPABILITIES = 1_000
+_MAX_INDEXED_MANIFEST_BYTES = 1_000_000
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _strict_json_loads(value: str) -> object:
+    return json.loads(value, parse_constant=_reject_json_constant)
 
 class Decision(str, Enum):
     REUSE = "reuse"
@@ -100,10 +113,123 @@ class LocalSentenceTransformer(EmbeddingProvider):
         return [float(value) for value in vector.tolist()]
 
 
+_JSON_SCHEMA_TYPES = {"null", "boolean", "object", "array", "number", "integer", "string"}
+_SUPPORTED_SCHEMA_KEYWORDS = {
+    "$schema", "$id", "$anchor", "$comment", "title", "description", "default", "examples",
+    "deprecated", "readOnly", "writeOnly", "type", "enum", "const", "minimum", "maximum",
+    "minLength", "maxLength", "pattern", "format",
+    "minItems", "maxItems", "items", "properties", "required", "additionalProperties",
+}
+
+
+def _schema_type_set(schema: dict) -> set[str] | None:
+    """Return the JSON value types constrained by a supported schema."""
+    value = schema.get("type")
+    if value is None:
+        return set(_JSON_SCHEMA_TYPES)
+    values = [value] if isinstance(value, str) else value
+    if (
+        not isinstance(values, list)
+        or not values
+        or any(not isinstance(item, str) or item not in _JSON_SCHEMA_TYPES for item in values)
+        or len(values) != len(set(values))
+    ):
+        return None
+    result = set(values)
+    if "number" in result:
+        result.add("integer")
+    return result
+
+
+def _is_json_value(value: object) -> bool:
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
+
+
+def _schema_is_supported(schema: dict) -> bool:
+    """Validate the supported schema subset before comparing contracts."""
+    if not isinstance(schema, dict) or set(schema) - _SUPPORTED_SCHEMA_KEYWORDS:
+        return False
+    if _schema_type_set(schema) is None:
+        return False
+    if any(
+        keyword in schema and not _is_json_value(schema[keyword])
+        for keyword in ("default", "examples", "enum", "const")
+    ):
+        return False
+    if "format" in schema and not isinstance(schema["format"], str):
+        return False
+    for keyword in ("minimum", "maximum"):
+        if keyword in schema and (
+            isinstance(schema[keyword], bool)
+            or not isinstance(schema[keyword], (int, float))
+            or not math.isfinite(schema[keyword])
+        ):
+            return False
+    for keyword in ("minLength", "maxLength", "minItems", "maxItems"):
+        if keyword in schema and (type(schema[keyword]) is not int or schema[keyword] < 0):
+            return False
+    if "pattern" in schema:
+        if not isinstance(schema["pattern"], str):
+            return False
+        try:
+            re.compile(schema["pattern"])
+        except re.error:
+            return False
+    if "enum" in schema and (not isinstance(schema["enum"], list) or not schema["enum"]):
+        return False
+    if "required" in schema and (
+        not isinstance(schema["required"], list)
+        or any(not isinstance(item, str) for item in schema["required"])
+        or len(schema["required"]) != len(set(schema["required"]))
+    ):
+        return False
+    if "properties" in schema:
+        if not isinstance(schema["properties"], dict) or any(
+            not isinstance(name, str) or not _schema_is_supported(child)
+            for name, child in schema["properties"].items()
+        ):
+            return False
+    for keyword in ("additionalProperties", "items"):
+        if keyword in schema:
+            value = schema[keyword]
+            if not isinstance(value, bool) and not _schema_is_supported(value):
+                return False
+    if "required" in schema and not set(schema["required"]).issubset(schema.get("properties", {})):
+        # Required fields may be declared without `properties` in JSON Schema,
+        # but the subset comparator cannot establish their value contract.
+        return False
+    return True
+
+
 def _schema_compatible(expected: dict, actual: dict, direction: str) -> bool:
     """Return whether an implementation schema satisfies a requested JSON schema subset."""
-    if expected.get("type") and actual.get("type") != expected["type"]:
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
         return False
+    # Semantic reuse is only safe for the assertion keywords this comparator
+    # understands. In particular, silently ignoring combinators, references,
+    # or unevaluated-property rules can approve a materially different schema.
+    if not _schema_is_supported(expected) or not _schema_is_supported(actual):
+        return False
+    expected_types = _schema_type_set(expected)
+    actual_types = _schema_type_set(actual)
+    if expected_types is None or actual_types is None:
+        return False
+    if direction == "input":
+        if not expected_types.issubset(actual_types):
+            return False
+    elif not actual_types.issubset(expected_types):
+        return False
+    if "format" in expected or "format" in actual:
+        if expected.get("format") != actual.get("format"):
+            return False
     if expected.get("enum"):
         expected_values = {json.dumps(value, sort_keys=True) for value in expected["enum"]}
         if direction == "output":
@@ -419,7 +545,9 @@ class SemanticCapabilityIndex:
     def index(self, packages: Iterable[dict]) -> int:
         with self._lock:
             indexed = 0
-            packages = list(packages)
+            packages = list(itertools.islice(iter(packages), _MAX_INDEXED_CAPABILITIES + 1))
+            if len(packages) > _MAX_INDEXED_CAPABILITIES:
+                raise ValueError(f"capability index accepts at most {_MAX_INDEXED_CAPABILITIES} packages")
             seen = set()
             with self.db:
                 stored_vectors = self.db.execute("SELECT vector_json FROM capability_vectors").fetchall()
@@ -428,7 +556,9 @@ class SemanticCapabilityIndex:
                     raise ValueError("capability index contains mixed embedding dimensions; rebuild it")
                 dimension = next(iter(dimensions), None)
                 for package in packages:
-                    capability = package.get("capability", {})
+                    if not isinstance(package, dict) or not isinstance(package.get("capability"), dict):
+                        raise ValueError("capability package must be an object with capability metadata")
+                    capability = package["capability"]
                     capability_id, version = capability.get("id"), capability.get("version")
                     if not isinstance(capability_id, str) or not isinstance(version, str):
                         raise ValueError("capability package requires a stable id and version")
@@ -436,8 +566,14 @@ class SemanticCapabilityIndex:
                     if key in seen:
                         raise ValueError(f"duplicate capability package {capability_id}@{version}")
                     seen.add(key)
-                    serialized = json.dumps(package, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                    digest = hashlib.sha256(serialized.encode()).hexdigest()
+                    try:
+                        serialized = json.dumps(package, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                    except (TypeError, ValueError) as error:
+                        raise ValueError("capability package must contain only finite JSON values") from error
+                    encoded = serialized.encode("utf-8")
+                    if len(encoded) > _MAX_INDEXED_MANIFEST_BYTES:
+                        raise ValueError("capability package exceeds 1 MiB index limit")
+                    digest = hashlib.sha256(encoded).hexdigest()
                     previous = self.db.execute("SELECT content_sha256 FROM capability_vectors WHERE capability_id=? AND version=?", key).fetchone()
                     if previous and previous[0] == digest:
                         continue
@@ -474,10 +610,14 @@ class SemanticCapabilityIndex:
             ).fetchall()
         matches = []
         for row_id, row_version, raw_package, stored_digest, raw_vector in rows:
-            package, vector = json.loads(raw_package), _stored_vector(raw_vector)
-            canonical_package = json.dumps(
-                package, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            )
+            try:
+                package = _strict_json_loads(raw_package)
+                canonical_package = json.dumps(
+                    package, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ValueError("capability index contains invalid JSON; rebuild the index from the trusted catalog") from error
+            vector = _stored_vector(raw_vector)
             actual_digest = hashlib.sha256(canonical_package.encode()).hexdigest()
             capability = package.get("capability", {}) if isinstance(package, dict) else {}
             if (

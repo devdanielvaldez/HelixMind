@@ -1,4 +1,4 @@
-"""Leased research worker that routes every operation through the AgentMesh MCP gateway."""
+"""Leased research worker that routes operations through an authenticated MCP endpoint."""
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +9,7 @@ import math
 import re
 import unicodedata
 import time
+from urllib.parse import urlsplit
 from typing import Any
 from uuid import uuid4
 from medai_science.sources.safety import ensure_public_research_query
@@ -17,13 +18,96 @@ from medai_science.research_planning import objective_plan_from_artifacts, objec
 from medai_science.quality import is_valid_quality_annotation, summarize_pubmed_design_metadata
 from medai_science.reproducibility import build_reproducibility_bundle
 from medai_science.research_workflows import build_research_workflow_proposal
-from medai_science.claim_alignment import build_claim_alignment_candidates
+from medai_science.claim_alignment import build_claim_alignment_candidates, semantic_claim_pair_marker
 from medai_science.contradiction_search import build_contradiction_query, select_contradiction_claims
 from medai_science.cancellation import ResearchSessionCancelled
 from medai_science.scientific_agents import AGENT_BY_TASK, AGENTS, ResearchDirector, agent_may_call
 from medai_science.sources.gene_disease import GeneDiseaseClient
+from medai_science.sources.pubmed_search import validate_pmid_snapshot
 from medai_science.hypothesis_literature import build_hypothesis_literature_query, build_hypothesis_literature_receipt, bounded_paper_record
 from medai_science.genomics_research import validate_local_vcf_summary
+from medai_science.benchmark_artifacts import DOMAIN_BENCHMARK_ARTIFACT_KIND, DOMAIN_BENCHMARK_ARTIFACT_SOURCE, EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_KIND, EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_SOURCE
+
+MAX_SEMANTIC_CLAIM_PAIRS_PER_TASK = 10
+MCP_TRANSPORT_HEADER = "X-MedAI-MCP-Token"
+
+
+def _worker_mcp_connection() -> tuple[str, dict[str, str]]:
+    """Resolve the optional direct MedAI MCP route or the legacy AgentMesh route."""
+    direct_url = os.getenv("MEDAI_DIRECT_MCP_URL", "").strip()
+    if not direct_url:
+        return os.getenv("MEDAI_AGENTMESH_URL", "http://127.0.0.1:8080/mcp"), {}
+
+    parsed = urlsplit(direct_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("MEDAI_DIRECT_MCP_URL must be an http(s) endpoint without credentials, query, or fragment")
+    token = os.getenv("MEDAI_MCP_BEARER_TOKEN", "")
+    api_tokens = {
+        value for value in (
+            os.getenv("MEDAI_API_BEARER_TOKEN", ""),
+            os.getenv("MEDAI_SPECIALIST_API_TOKEN", ""),
+        ) if value
+    }
+    if len(token) < 32 or len(token) > 4096 or any(char.isspace() for char in token):
+        raise ValueError("direct MCP transport requires MEDAI_MCP_BEARER_TOKEN with 32..4096 non-whitespace characters")
+    if token in api_tokens:
+        raise ValueError("MEDAI_MCP_BEARER_TOKEN must be distinct from API bearer credentials")
+    return direct_url, {MCP_TRANSPORT_HEADER: token}
+
+
+def _semantic_claim_screening_batch(
+    links: list[dict[str, Any]], completed_source_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return the next bounded uncompleted batch and explicit remaining count."""
+    if not isinstance(links, list):
+        raise ValueError("semantic claim candidates must be a list")
+    completed = completed_source_ids or set()
+    pending = [
+        link for link in links
+        if semantic_claim_pair_marker(*link["sources"]) not in completed
+    ]
+    selected = pending[:MAX_SEMANTIC_CLAIM_PAIRS_PER_TASK]
+    return selected, len(pending) - len(selected)
+
+
+def _hypothesis_proposal_needs_review(proposal: dict[str, Any], literature: dict[str, Any]) -> bool:
+    """Treat every omitted or unreported proposal/search bound as incomplete."""
+    if not isinstance(proposal, dict) or not isinstance(literature, dict):
+        return True
+    omitted = literature.get("omitted_candidate_count")
+    warnings = literature.get("warnings")
+    return (
+        not isinstance(proposal.get("artifact_id"), str)
+        or not proposal["artifact_id"]
+        or proposal.get("truncated") is not False
+        or not isinstance(literature.get("artifact_id"), str)
+        or not literature["artifact_id"]
+        or isinstance(omitted, bool)
+        or not isinstance(omitted, int)
+        or omitted != 0
+        or not isinstance(warnings, list)
+        or bool(warnings)
+    )
+
+
+def _hypothesis_criticism_needs_review(critique: dict[str, Any], unlinked_candidate_count: int) -> bool:
+    """Surface incomplete graph-route or retrieved-candidate criticism."""
+    reviews = critique.get("reviews") if isinstance(critique, dict) else None
+    return (
+        not isinstance(critique, dict)
+        or not isinstance(critique.get("artifact_id"), str)
+        or not critique["artifact_id"]
+        or unlinked_candidate_count > 0
+        or not isinstance(reviews, list)
+        or any(not isinstance(row, dict) or row.get("alternative_graph_routes_truncated") is not False for row in reviews)
+    )
 
 
 def _tool_value(result: Any) -> Any:
@@ -49,6 +133,18 @@ def _tool_value(result: Any) -> Any:
     return None
 
 
+def _is_budget_exhaustion_error(error: BaseException | str) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "specialist credit budget exhausted",
+            "research session execution budget exhausted",
+            "402 payment required",
+        )
+    )
+
+
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
 
@@ -60,11 +156,7 @@ def _literature_watch_pmids(value: Any) -> list[str]:
             value = json.loads(value)
         except json.JSONDecodeError as error:
             raise ValueError("stored literature watch PMID snapshot is invalid JSON") from error
-    if value is None:
-        return []
-    if not isinstance(value, list) or any(not isinstance(pmid, str) or not pmid.isdigit() for pmid in value):
-        raise ValueError("stored literature watch PMID snapshot is invalid")
-    return value
+    return validate_pmid_snapshot(value)
 
 
 def _specialist_meta(agent_id: str | None, token: str | None) -> dict[str, str] | None:
@@ -83,6 +175,96 @@ class ArtifactCollectionLimitError(RuntimeError):
     """Raised when bounded worker artifact retrieval cannot return a complete set."""
 
 
+def _record_control_plane_update_failure(
+    summary: dict[str, Any], task_id: str, task_error: BaseException, update_error: BaseException,
+) -> None:
+    """Report uncertain durable task state without copying untrusted error text."""
+    summary.setdefault("control_plane_update_failures", []).append({
+        "task_id": task_id,
+        "original_error_type": type(task_error).__name__,
+        "update_error_type": type(update_error).__name__,
+        "state": "unknown",
+    })
+
+
+def _source_identified_compound_artifacts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Accept compound identity receipts only from their registered chemistry stage."""
+    return [
+        item for item in items
+        if item.get("kind") == "compound_chemical_identity"
+        and item.get("task_id") == "compounds.analyze"
+        and item.get("source") == "PubChem PUG REST"
+    ]
+
+
+def _biomedical_domain_benchmark_inputs(items: list[dict[str, Any]], session_id: str) -> list[dict[str, Any]]:
+    """Select only researcher-designated domain benchmark artifacts from this session."""
+    return [
+        row for row in items
+        if isinstance(row, dict)
+        and row.get("session_id") == session_id
+        and row.get("task_id") == "benchmark.evaluate"
+        and row.get("kind") == DOMAIN_BENCHMARK_ARTIFACT_KIND
+        and row.get("source") == DOMAIN_BENCHMARK_ARTIFACT_SOURCE
+    ]
+
+
+def _evidence_quality_benchmark_inputs(items: list[dict[str, Any]], session_id: str) -> list[dict[str, Any]]:
+    """Select only researcher-designated double-reviewed ordinal quality benchmarks."""
+    return [
+        row for row in items
+        if isinstance(row, dict)
+        and row.get("session_id") == session_id
+        and row.get("task_id") == "benchmark.evaluate"
+        and row.get("kind") == EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_KIND
+        and row.get("source") == EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_SOURCE
+    ]
+
+
+def _exact_pubchem_identity(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Validate the exact requested CID and a single standard chemical identity match."""
+    payload = item.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    if not isinstance(payload, dict) or payload.get("source") != "PubChem PUG REST":
+        return None
+    source_id = item.get("source_id")
+    if not isinstance(source_id, str) or not source_id.isdecimal() or payload.get("query") != source_id:
+        return None
+    matches = payload.get("matches")
+    if (not isinstance(matches, list) or len(matches) != 1
+            or payload.get("ambiguous") is True or payload.get("too_many_matches") is True):
+        return None
+    match = matches[0]
+    if not isinstance(match, dict) or isinstance(match.get("cid"), bool) or match.get("cid") != int(source_id):
+        return None
+    inchikey = match.get("inchikey")
+    if not isinstance(inchikey, str) or not re.fullmatch(r"[A-Z]{14}-[A-Z]{10}-[A-Z]", inchikey):
+        return None
+    return payload, match
+
+
+def _pmc_extraction_receipts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Accept paper extraction inputs only from the PMC BioC extraction stage."""
+    return [
+        item for item in items
+        if item.get("kind") == "paper_extraction_receipt"
+        and item.get("task_id") == "literature.extract"
+        and item.get("source") == "PMC BioC"
+    ]
+
+
+def _session_research_budget(session: Any) -> int:
+    """Read a server-provided session budget without coercing malformed values."""
+    budget = session.get("budget") if isinstance(session, dict) else None
+    if isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= 100_000:
+        raise ValueError("research session returned an invalid integer credit budget")
+    return budget
+
+
 async def _retrieve_source_identified_compounds(
     call: Any,
     session_id: str,
@@ -97,6 +279,8 @@ async def _retrieve_source_identified_compounds(
     checkpoint: dict[str, Any],
 ) -> dict[str, Any]:
     """Resolve bounded BioC-provided PubChem CIDs and checkpoint retained identity artifacts."""
+    extraction_receipts = _pmc_extraction_receipts(extraction_receipts)
+    existing_artifacts = _source_identified_compound_artifacts(existing_artifacts)
     known_cids = {
         str(item.get("source_id"))
         for item in existing_artifacts
@@ -814,7 +998,7 @@ async def _collect_artifact_pages(
 
 
 class ResearchWorker:
-    def __init__(self, gateway_url: str, worker_id: str | None = None, lease_seconds: int = 900, agent_id: str | None = None, agent_api_token: str | None = None):
+    def __init__(self, gateway_url: str, worker_id: str | None = None, lease_seconds: int = 900, agent_id: str | None = None, agent_api_token: str | None = None, transport_headers: dict[str, str] | None = None):
         if not gateway_url.startswith(("http://", "https://")):
             raise ValueError("AgentMesh gateway URL must use http:// or https://")
         if not 30 <= lease_seconds <= 3600:
@@ -823,6 +1007,7 @@ class ResearchWorker:
             raise ValueError(f"unknown scientific agent ID: {agent_id}")
         specialist_meta = _specialist_meta(agent_id, agent_api_token)
         self.gateway_url = gateway_url
+        self.transport_headers = dict(transport_headers or {})
         self.agent_id = agent_id
         self.agent_api_token = agent_api_token if specialist_meta else None
         if agent_id:
@@ -844,8 +1029,8 @@ class ResearchWorker:
         from mcp import ClientSession
         from mcp.client.streamable_http import streamable_http_client
 
-        summary = {"session_id": session_id, "worker_id": self.worker_id, "claimed": 0, "succeeded": [], "needs_review": [], "failed": [], "skipped": [], "cancelled": [], "remaining_limit": max_tasks}
-        async with streamable_http_client(self.gateway_url) as (read_stream, write_stream):
+        summary = {"session_id": session_id, "worker_id": self.worker_id, "claimed": 0, "succeeded": [], "needs_review": [], "failed": [], "skipped": [], "cancelled": [], "control_plane_update_failures": [], "remaining_limit": max_tasks}
+        async with streamable_http_client(self.gateway_url, headers=self.transport_headers or None) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as client:
                 await client.initialize()
                 active_cancellation: asyncio.Event | None = None
@@ -870,7 +1055,7 @@ class ResearchWorker:
                 sessions = session_rows.get("items", []) if isinstance(session_rows, dict) else []
                 session = next((row for row in sessions if row.get("id") == session_id), None)
                 if session is None:
-                    raise ValueError(f"research session {session_id} was not found through AgentMesh")
+                    raise ValueError(f"research session {session_id} was not found through the configured MCP endpoint")
                 requested_paper_limit = paper_limit
                 research_depth = session.get("depth", "standard")
                 paper_limit = paper_limit_for_depth(research_depth, requested_paper_limit)
@@ -883,7 +1068,7 @@ class ResearchWorker:
                     session_id=session_id,
                     objective=objective,
                     depth=session.get("depth", "standard"),
-                    budget=int(session.get("budget", 100)),
+                    budget=_session_research_budget(session),
                     tasks=persisted_plan.get("tasks", []) if isinstance(persisted_plan, dict) else [],
                 )
                 assignments = {item["task_id"]: item for item in coordination["task_assignments"]}
@@ -1439,6 +1624,9 @@ class ResearchWorker:
                             alignment_artifact_id = None
                             semantic_alignment_artifact_ids: list[str] = []
                             semantic_alignment_warnings: list[dict[str, str]] = []
+                            semantic_links, semantic_alignment_omitted_count = _semantic_claim_screening_batch(
+                                alignment["links"], completed_source_ids,
+                            )
                             if alignment["links"]:
                                 stored_alignment = await call("medai_research_store_artifact", {
                                     "session_id": session_id,
@@ -1451,11 +1639,11 @@ class ResearchWorker:
                                 alignment_artifact_id = stored_alignment.get("id")
                                 if alignment_artifact_id:
                                     artifact_ids.append(alignment_artifact_id)
-                                for link in alignment["links"][:10]:
+                                for link in semantic_links:
                                     if cancellation.is_set():
                                         break
                                     left, right = link["sources"]
-                                    pair_marker = "semantic-claim-pair:" + hashlib.sha256((left["candidate_id"] + "\0" + right["candidate_id"]).encode()).hexdigest()
+                                    pair_marker = semantic_claim_pair_marker(left, right)
                                     if pair_marker in completed_source_ids:
                                         continue
                                     try:
@@ -1483,8 +1671,8 @@ class ResearchWorker:
                             evidence = evidence_data.get("items", []) if isinstance(evidence_data, dict) else []
                             claims = select_contradiction_claims(evidence, limit=min(10, paper_limit))
                             if not claims:
-                                status = "needs_review" if alignment_artifact_id or alignment["needs_review"] else "skipped"
-                                output = {"reason": "No source-linked supporting claim annotations are available for targeted PubMed contradiction searching.", "alignment_artifact_id": alignment_artifact_id, "alignment_candidate_count": len(alignment["links"]), "alignment_invalid_annotation_artifact_count": alignment["invalid_annotation_artifact_count"], "alignment_truncated": alignment["truncated"], "semantic_alignment_artifact_ids": semantic_alignment_artifact_ids, "semantic_alignment_warnings": semantic_alignment_warnings, "interpretation": "Directional article-pair leads are unreviewed and semantic model screenings require human review. Invalid or truncated source annotations require review. No claim-level PubMed search was possible; this is not evidence that contradictions are absent."}
+                                status = "needs_review" if alignment_artifact_id or alignment["needs_review"] or semantic_alignment_omitted_count else "skipped"
+                                output = {"reason": "No source-linked supporting claim annotations are available for targeted PubMed contradiction searching.", "alignment_artifact_id": alignment_artifact_id, "alignment_candidate_count": len(alignment["links"]), "alignment_invalid_annotation_artifact_count": alignment["invalid_annotation_artifact_count"], "alignment_truncated": alignment["truncated"], "semantic_alignment_omitted_count": semantic_alignment_omitted_count, "semantic_alignment_artifact_ids": semantic_alignment_artifact_ids, "semantic_alignment_warnings": semantic_alignment_warnings, "interpretation": "Directional article-pair leads are unreviewed and semantic model screenings require human review. Invalid or truncated source annotations require review. No claim-level PubMed search was possible; this is not evidence that contradictions are absent. At most ten semantic pairs are screened per task; omitted pairs remain pending review."}
                             else:
                                 searched = []
                                 warnings = []
@@ -1519,8 +1707,8 @@ class ResearchWorker:
                                         await call("medai_research_save_checkpoint", {"session_id": session_id, "task_id": task_id, "worker_id": self.worker_id, "checkpoint": checkpoint})
                                     except Exception as error:
                                         warnings.append({"target_evidence_id": evidence_id, "error": type(error).__name__})
-                                status = "needs_review" if alignment["needs_review"] or (warnings and not searched) or semantic_alignment_warnings else "succeeded"
-                                output = {"searched_claims": searched, "warnings": warnings, "alignment_artifact_id": alignment_artifact_id, "alignment_candidate_count": len(alignment["links"]), "alignment_invalid_annotation_artifact_count": alignment["invalid_annotation_artifact_count"], "alignment_truncated": alignment["truncated"], "semantic_alignment_artifact_ids": semantic_alignment_artifact_ids, "semantic_alignment_warnings": semantic_alignment_warnings, "artifact_ids": artifact_ids, "interpretation": "Retrieved papers are unassessed candidates for human contradiction review. Semantic pair outputs are local-model screening labels; neither retrieval nor model labeling confirms contradiction. Invalid or truncated source annotations require review."}
+                                status = "needs_review" if alignment["needs_review"] or semantic_alignment_omitted_count or (warnings and not searched) or semantic_alignment_warnings else "succeeded"
+                                output = {"searched_claims": searched, "warnings": warnings, "alignment_artifact_id": alignment_artifact_id, "alignment_candidate_count": len(alignment["links"]), "alignment_invalid_annotation_artifact_count": alignment["invalid_annotation_artifact_count"], "alignment_truncated": alignment["truncated"], "semantic_alignment_omitted_count": semantic_alignment_omitted_count, "semantic_alignment_artifact_ids": semantic_alignment_artifact_ids, "semantic_alignment_warnings": semantic_alignment_warnings, "artifact_ids": artifact_ids, "interpretation": "Retrieved papers are unassessed candidates for human contradiction review. At most ten semantic pairs are screened per task; omitted pairs remain pending review. Semantic pair outputs are local-model screening labels; neither retrieval nor model labeling confirms contradiction. Invalid or truncated source annotations require review."}
                         elif task_id == "graph.build":
                             graph = await call("medai_graph_snapshot", {"session_id": session_id})
                             if not graph.get("nodes") and not graph.get("edges"):
@@ -1534,8 +1722,8 @@ class ResearchWorker:
                         elif task_id == "hypotheses.propose":
                             proposal = await call("medai_hypotheses_propose", {"session_id": session_id, "task_id": task_id, "limit": min(50, max(1, paper_limit * 5))})
                             literature = await _search_hypothesis_literature(call, session_id, task_id, self.worker_id, proposal, paper_limit, cancellation, completed_source_ids, artifact_ids, checkpoint)
-                            output = {"candidate_count": proposal.get("candidate_count", 0), "returned_count": proposal.get("returned_count", 0), "artifact_id": proposal.get("artifact_id"), "literature_comparison_artifact_id": literature.get("artifact_id"), "literature_candidates_searched": literature.get("searched_candidate_count", 0), "literature_candidates_omitted": literature.get("omitted_candidate_count", 0), "literature_search_warnings": literature.get("warnings", []), "novelty_assessment": None, "interpretation": proposal.get("interpretation", "Candidate hypotheses require scientific review."), "literature_interpretation_limit": literature.get("interpretation_limit")}
-                            status = "succeeded" if proposal.get("artifact_id") and literature.get("artifact_id") else "needs_review"
+                            output = {"candidate_count": proposal.get("candidate_count", 0), "returned_count": proposal.get("returned_count", 0), "candidate_limit_omitted_count": proposal.get("candidate_limit_omitted_count", 0), "candidate_byte_omitted_count": proposal.get("candidate_byte_omitted_count", 0), "candidate_payload_bytes": proposal.get("candidate_payload_bytes", 0), "proposal_truncated": proposal.get("truncated") is not False, "traversal_truncated": proposal.get("traversal_truncated") is True, "traversed_path_count": proposal.get("traversed_path_count", 0), "artifact_id": proposal.get("artifact_id"), "literature_comparison_artifact_id": literature.get("artifact_id"), "literature_candidates_searched": literature.get("searched_candidate_count", 0), "literature_candidates_omitted": literature.get("omitted_candidate_count", 0), "literature_search_warnings": literature.get("warnings", []), "novelty_assessment": None, "interpretation": proposal.get("interpretation", "Candidate hypotheses require scientific review."), "literature_interpretation_limit": literature.get("interpretation_limit")}
+                            status = "needs_review" if _hypothesis_proposal_needs_review(proposal, literature) else "succeeded"
                         elif task_id == "hypotheses.criticize":
                             artifact_data = await _collect_artifact_pages(call, session_id, "hypothesis_candidates", cancellation=cancellation)
                             proposals = artifact_data.get("items", []) if isinstance(artifact_data, dict) else []
@@ -1548,42 +1736,55 @@ class ResearchWorker:
                                 contradiction_candidates = contradiction_data.get("items", []) if isinstance(contradiction_data, dict) else []
                                 contradiction_artifact_ids = [row["id"] for row in contradiction_candidates if isinstance(row, dict) and isinstance(row.get("id"), str)][:50]
                                 critique = await call("medai_hypotheses_criticize", {"session_id": session_id, "task_id": task_id, "proposal_artifact_id": proposal["id"], "contradiction_artifact_ids": contradiction_artifact_ids})
-                                output = {"proposal_artifact_id": proposal["id"], "review_count": len(critique.get("reviews", [])), "artifact_id": critique.get("artifact_id"), "contradiction_candidate_count": len(contradiction_candidates), "contradiction_candidates_supplied": len(contradiction_artifact_ids), "contradiction_candidates_truncated": len(contradiction_candidates) > len(contradiction_artifact_ids), "interpretation": critique.get("interpretation")}
-                                status = "succeeded" if critique.get("artifact_id") and len(contradiction_candidates) <= len(contradiction_artifact_ids) else "needs_review"
+                                alternative_route_truncated_count = sum(
+                                    review.get("alternative_graph_routes_truncated") is True
+                                    for review in critique.get("reviews", []) if isinstance(review, dict)
+                                )
+                                output = {"proposal_artifact_id": proposal["id"], "review_count": len(critique.get("reviews", [])), "artifact_id": critique.get("artifact_id"), "contradiction_candidate_count": len(contradiction_candidates), "contradiction_candidates_supplied": len(contradiction_artifact_ids), "contradiction_candidates_truncated": len(contradiction_candidates) > len(contradiction_artifact_ids), "alternative_graph_routes_truncated_count": alternative_route_truncated_count, "interpretation": critique.get("interpretation")}
+                                status = "needs_review" if _hypothesis_criticism_needs_review(critique, max(0, len(contradiction_candidates) - len(contradiction_artifact_ids))) or alternative_route_truncated_count > 0 else "succeeded"
+                        elif task_id == "compounds.analyze":
+                            source_data = await _collect_artifact_pages(call, session_id, cancellation=cancellation)
+                            available = source_data.get("items", []) if isinstance(source_data, dict) else []
+                            all_chemical_artifacts = _source_identified_compound_artifacts(available)
+                            compound_limit = min(20, paper_limit)
+                            extraction_receipts = _pmc_extraction_receipts(available)
+                            resolution = await _retrieve_source_identified_compounds(call, session_id, task_id, self.worker_id, extraction_receipts, all_chemical_artifacts[:compound_limit], compound_limit, cancellation, completed_source_ids, artifact_ids, checkpoint)
+                            unresolved = [
+                                item.get("id") for item in resolution["chemical_artifacts"]
+                                if _exact_pubchem_identity(item) is None
+                            ]
+                            status = "needs_review" if resolution["warnings"] or len(all_chemical_artifacts) > compound_limit or resolution["candidate_limit_reached"] or unresolved else "succeeded"
+                            if not extraction_receipts and not all_chemical_artifacts:
+                                status = "skipped"
+                            output = {"chemical_identity_artifact_ids": [item.get("id") for item in resolution["chemical_artifacts"]], "source_identified_compounds": resolution["discovered"], "compound_lookup_warnings": resolution["warnings"], "existing_identity_count": len(all_chemical_artifacts), "chemical_artifacts_processed": len(resolution["chemical_artifacts"]), "compound_limit": compound_limit, "candidate_limit_reached": resolution["candidate_limit_reached"], "unresolved_identity_artifact_ids": unresolved, "interpretation": "Only stable PubChem CIDs explicitly identified in paper extraction are resolved; chemical identities are not inferred from free text."}
                         elif task_id == "drugs.investigate":
                             source_data = await _collect_artifact_pages(call, session_id, cancellation=cancellation)
                             available = source_data.get("items", []) if isinstance(source_data, dict) else []
-                            all_chemical_artifacts = [item for item in available if item.get("kind") in {"compound_identity", "compound_chemical_identity"}]
+                            all_chemical_artifacts = _source_identified_compound_artifacts(available)
                             chemical_artifact_count = len(all_chemical_artifacts)
                             compound_limit = min(20, paper_limit)
-                            initial_chemical_artifacts = all_chemical_artifacts[:compound_limit]
-                            extraction_receipts = [item for item in available if item.get("kind") == "paper_extraction_receipt"]
-                            compound_resolution = await _retrieve_source_identified_compounds(call, session_id, task_id, self.worker_id, extraction_receipts, initial_chemical_artifacts, compound_limit, cancellation, completed_source_ids, artifact_ids, checkpoint)
-                            chemical_artifacts = compound_resolution["chemical_artifacts"]
-                            discovered_compounds = compound_resolution["discovered"]
-                            compound_lookup_warnings = compound_resolution["warnings"]
-                            candidate_limit_reached = compound_resolution["candidate_limit_reached"]
+                            chemical_artifacts = all_chemical_artifacts[:compound_limit]
+                            compound_lookup_warnings = []
+                            candidate_limit_reached = len(all_chemical_artifacts) > compound_limit
+                            discovered_compounds = []
                             resolved = []
                             rejected = []
                             pharmacology_graph_edges = 0
                             pharmacology_graph_warnings = []
                             for item in chemical_artifacts:
-                                payload = item.get("payload") or {}
-                                matches = payload.get("matches", []) if isinstance(payload, dict) else []
-                                if not isinstance(matches, list) or len(matches) != 1 or payload.get("ambiguous") or payload.get("too_many_matches"):
+                                exact_identity = _exact_pubchem_identity(item)
+                                if exact_identity is None:
                                     rejected.append(item.get("id"))
                                     continue
-                                inchikey = matches[0].get("inchikey") if isinstance(matches[0], dict) else None
-                                if not inchikey:
-                                    rejected.append(item.get("id"))
-                                    continue
+                                _payload, match = exact_identity
+                                inchikey = match["inchikey"]
                                 result = await call("medai_drug_profile_chembl", {"session_id": session_id, "task_id": task_id, "inchikey": inchikey})
                                 profile_artifact_id = result.get("artifact_id")
                                 graph_target_count = 0
                                 if isinstance(profile_artifact_id, str) and profile_artifact_id:
                                     try:
                                         compound_node = f"InChIKey:{inchikey}"
-                                        await call("medai_graph_add_entity", {"session_id": session_id, "task_id": task_id, "entity_id": compound_node, "entity_type": "Compound", "label": str(matches[0].get("title") or inchikey)[:512], "metadata": {"source": item.get("source"), "chemical_identity_artifact_id": item.get("id"), "inchikey": inchikey}})
+                                        await call("medai_graph_add_entity", {"session_id": session_id, "task_id": task_id, "entity_id": compound_node, "entity_type": "Compound", "label": str(match.get("title") or inchikey)[:512], "metadata": {"source": item.get("source"), "chemical_identity_artifact_id": item.get("id"), "inchikey": inchikey}})
                                         for mechanism in result.get("mechanisms", []) if isinstance(result.get("mechanisms"), list) else []:
                                             record = mechanism.get("record") if isinstance(mechanism, dict) else None
                                             target_id = record.get("target_chembl_id") if isinstance(record, dict) else None
@@ -1602,11 +1803,11 @@ class ResearchWorker:
                                     pharmacology_graph_warnings.append({"chemical_artifact_id": item.get("id"), "error": "pharmacology profile artifact was not retained"})
                                 resolved.append({"chemical_artifact_id": item.get("id"), "inchikey": inchikey, "pharmacology_artifact_id": profile_artifact_id, "parent_chembl_ids": result.get("parent_chembl_ids", []), "mechanism_count": len(result.get("mechanisms", [])), "indication_count": len(result.get("indications", [])), "warning_count": len(result.get("warnings", [])), "graph_target_links": graph_target_count, "interpretation": result.get("interpretation")})
                             if resolved:
-                                status = "needs_review" if compound_lookup_warnings or pharmacology_graph_warnings or chemical_artifact_count > compound_limit or candidate_limit_reached or rejected else "succeeded"
-                                output = {"profiles": resolved, "source_identified_compounds": discovered_compounds, "compound_lookup_warnings": compound_lookup_warnings, "pharmacology_graph_edges": pharmacology_graph_edges, "pharmacology_graph_warnings": pharmacology_graph_warnings, "chemical_artifact_count": chemical_artifact_count, "chemical_artifacts_processed": len(chemical_artifacts), "compound_limit": compound_limit, "candidate_limit_reached": candidate_limit_reached, "rejected_ambiguous_or_unresolved_artifact_ids": rejected, "research_only": True, "interpretation": "PubChem compound identities are followed only when BioC supplies a stable PubChem CID. ChEMBL target links report source-recorded mechanism annotations; they do not establish therapeutic effect, clinical efficacy, or drug-drug interaction."}
+                                status = "needs_review" if pharmacology_graph_warnings or chemical_artifact_count > compound_limit or candidate_limit_reached or rejected else "succeeded"
+                                output = {"profiles": resolved, "pharmacology_graph_edges": pharmacology_graph_edges, "pharmacology_graph_warnings": pharmacology_graph_warnings, "chemical_artifact_count": chemical_artifact_count, "chemical_artifacts_processed": len(chemical_artifacts), "compound_limit": compound_limit, "candidate_limit_reached": candidate_limit_reached, "rejected_ambiguous_or_unresolved_artifact_ids": rejected, "research_only": True, "interpretation": "ChEMBL target links report source-recorded mechanism annotations; they do not establish therapeutic effect, clinical efficacy, or drug-drug interaction."}
                             else:
-                                status = "needs_review" if chemical_artifacts or compound_lookup_warnings else "skipped"
-                                output = {"reason": "No unambiguous PubChem identity with an InChIKey was available." if chemical_artifacts else "No PMC extraction receipt contained a source-normalized PubChem CID.", "chemical_artifact_ids": [item.get("id") for item in chemical_artifacts], "source_identified_compounds": discovered_compounds, "compound_lookup_warnings": compound_lookup_warnings, "rejected_ambiguous_or_unresolved_artifact_ids": rejected, "interpretation": "MedAI does not infer chemical identities from free-text mentions or disease names."}
+                                status = "needs_review" if chemical_artifacts else "skipped"
+                                output = {"reason": "No unambiguous PubChem identity with an InChIKey was available." if chemical_artifacts else "No source-identified chemical identity artifact is available.", "chemical_artifact_ids": [item.get("id") for item in chemical_artifacts], "interpretation": "MedAI does not infer chemical identities from free-text mentions or disease names."}
                         elif task_id == "genomics.analyze":
                             source_data = await _collect_artifact_pages(call, session_id, cancellation=cancellation)
                             available = source_data.get("items", []) if isinstance(source_data, dict) else []
@@ -1647,11 +1848,41 @@ class ResearchWorker:
                         elif task_id == "skills.learn":
                             output = await call("medai_skills_learn_research_sequence", {"session_id": session_id, "task_id": task_id})
                             status = "succeeded"
+                        elif task_id == "benchmark.evaluate":
+                            artifact_data = await _collect_artifact_pages(call, session_id, cancellation=cancellation)
+                            artifact_rows = artifact_data.get("items", []) if isinstance(artifact_data, dict) else []
+                            domain_inputs = _biomedical_domain_benchmark_inputs(artifact_rows, session_id)
+                            quality_inputs = _evidence_quality_benchmark_inputs(artifact_rows, session_id)
+                            benchmark_inputs = domain_inputs + quality_inputs
+                            if not benchmark_inputs:
+                                status = "needs_review"
+                                output = {"reason": "Attach exactly one source-digest-bound, researcher-adjudicated biomedical domain or double-reviewed ordinal evidence-quality benchmark input before evaluation.", "input_artifacts_found": 0}
+                            elif len(benchmark_inputs) != 1:
+                                status = "needs_review"
+                                output = {"reason": "Multiple biomedical benchmark inputs are present; select one explicitly before evaluation.", "input_artifact_ids": [item.get("id") for item in benchmark_inputs]}
+                            else:
+                                benchmark_input = benchmark_inputs[0]
+                                artifact_id = benchmark_input.get("id")
+                                if not isinstance(artifact_id, str) or not artifact_id:
+                                    raise ValueError("biomedical benchmark input has no stable artifact ID")
+                                tool_name = (
+                                    "medai_biomedical_domain_benchmark_evaluate"
+                                    if benchmark_input.get("kind") == DOMAIN_BENCHMARK_ARTIFACT_KIND
+                                    else "medai_evidence_quality_benchmark_evaluate"
+                                )
+                                result = await call(tool_name, {"session_id": session_id, "task_id": task_id, "input_artifact_id": artifact_id})
+                                output = {
+                                    "input_artifact_id": artifact_id,
+                                    "input_artifact_sha256": benchmark_input.get("sha256"),
+                                    **result,
+                                }
+                                status = "succeeded" if result.get("artifact_id") and result.get("benchmark_sha256") else "needs_review"
                         elif task_id == "report.reproduce":
                             plan = await call("medai_research_get_plan", {"session_id": session_id})
                             artifacts_data = await _collect_artifact_pages(call, session_id, cancellation=cancellation)
                             evidence_data = await call("medai_evidence_list", {"session_id": session_id})
                             graph = await call("medai_graph_snapshot", {"session_id": session_id})
+                            citation_network = await call("medai_papers_citation_network", {"session_id": session_id})
                             artifact_rows = artifacts_data.get("items", []) if isinstance(artifacts_data, dict) else []
                             evidence_rows = evidence_data.get("items", []) if isinstance(evidence_data, dict) else []
                             workflow = build_research_workflow_proposal(session, plan)
@@ -1659,9 +1890,10 @@ class ResearchWorker:
                             if not isinstance(workflow_artifact, dict) or not isinstance(workflow_artifact.get("id"), str) or not isinstance(workflow_artifact.get("sha256"), str):
                                 raise ValueError("research workflow proposal was not retained with a content hash")
                             artifact_rows.append(workflow_artifact)
-                            bundle = build_reproducibility_bundle(session, plan, artifact_rows, graph, evidence_rows)
+                            citation_links = citation_network.get("items", []) if isinstance(citation_network, dict) else []
+                            bundle = build_reproducibility_bundle(session, plan, artifact_rows, graph, evidence_rows, citation_links)
                             stored = await call("medai_research_store_artifact", {"session_id": session_id, "task_id": task_id, "kind": "research_reproducibility_bundle", "source": "MedAI reproducibility engine", "source_id": session_id, "payload": bundle})
-                            output = {"artifact_id": stored.get("id"), "workflow_artifact_id": workflow_artifact["id"], "workflow_id": workflow["workflow_id"], "workflow_version": workflow["version"], "workflow_topology_sha256": workflow["topology_sha256"], "bundle_sha256": bundle["bundle_sha256"], "report_markdown": bundle["report_markdown"], "source_artifact_count": len(bundle["artifacts"]), "evidence_count": len(bundle["evidence_annotations"]), "graph_node_count": len(bundle["graph"]["nodes"]), "graph_edge_count": len(bundle["graph"]["edges"]), "interpretation": "Versioned workflow topology proposal, reproducibility bundle, and report; the workflow remains disabled pending review and provides no clinical advice or independent scientific validation."}
+                            output = {"artifact_id": stored.get("id"), "workflow_artifact_id": workflow_artifact["id"], "workflow_id": workflow["workflow_id"], "workflow_version": workflow["version"], "workflow_topology_sha256": workflow["topology_sha256"], "bundle_sha256": bundle["bundle_sha256"], "report_markdown": bundle["report_markdown"], "source_artifact_count": len(bundle["artifacts"]), "evidence_count": len(bundle["evidence_annotations"]), "graph_node_count": len(bundle["graph"]["nodes"]), "graph_edge_count": len(bundle["graph"]["edges"]), "citation_link_count": len(bundle["citation_graph"]["edges"]), "interpretation": "Versioned workflow topology proposal, reproducibility bundle, and report; the workflow remains disabled pending review and provides no clinical advice or independent scientific validation."}
                             status = "succeeded" if stored.get("id") else "needs_review"
                         else:
                             status = "needs_review"
@@ -1695,8 +1927,9 @@ class ResearchWorker:
                             if cancellation.is_set():
                                 await call("medai_research_update_task", {"session_id": session_id, "task_id": task_id, "status": "skipped", "output": json.dumps({"reason": "cancelled", "checkpoint_stage": checkpoint.get("stage")}), "worker_id": self.worker_id})
                                 summary["cancelled"].append(task_id)
-                            elif "specialist credit budget exhausted" in message.lower() and not lease_lost:
-                                await call("medai_research_update_task", {"session_id": session_id, "task_id": task_id, "status": "needs_review", "output": json.dumps({"reason": "The specialist reached its configured session credit ceiling.", "specialist_agent": assignment, "research_plan_sha256": coordination["plan_sha256"]}, ensure_ascii=False), "worker_id": self.worker_id})
+                            elif _is_budget_exhaustion_error(error) and not lease_lost:
+                                reason = "The specialist or research session reached its configured execution credit limit."
+                                await call("medai_research_update_task", {"session_id": session_id, "task_id": task_id, "status": "needs_review", "output": json.dumps({"reason": reason, "specialist_agent": assignment, "research_plan_sha256": coordination["plan_sha256"]}, ensure_ascii=False), "worker_id": self.worker_id})
                                 summary["needs_review"].append(task_id)
                             elif isinstance(error, ArtifactCollectionLimitError) and not lease_lost:
                                 await call("medai_research_update_task", {"session_id": session_id, "task_id": task_id, "status": "needs_review", "output": json.dumps({"reason": "The full session artifact set exceeds bounded worker retrieval limits; no incomplete artifact subset was analyzed.", "detail": message}, ensure_ascii=False), "worker_id": self.worker_id})
@@ -1705,8 +1938,11 @@ class ResearchWorker:
                                 await call("medai_research_update_task", {"session_id": session_id, "task_id": task_id, "status": "failed", "error": message, "worker_id": self.worker_id})
                                 if int(task.get("attempts", 1)) < 5:
                                     await call("medai_research_update_task", {"session_id": session_id, "task_id": task_id, "status": "ready"})
-                        except Exception:
-                            pass
+                        except Exception as update_error:
+                            # A failed task transition can leave a lease active or
+                            # its retry state uncertain. Surface that separately
+                            # without echoing provider/API error bodies into logs.
+                            _record_control_plane_update_failure(summary, task_id, error, update_error)
                         if not cancellation.is_set() and not isinstance(error, ArtifactCollectionLimitError):
                             summary["failed"].append({"task_id": task_id, "error": message})
                     finally:
@@ -1750,13 +1986,14 @@ class ResearchWorker:
 
 
 async def execute_session(session_id: str, max_tasks: int = 32, paper_limit: int | None = None, agent_id: str | None = None) -> dict:
-    url = os.getenv("MEDAI_AGENTMESH_URL", "http://127.0.0.1:8080/mcp")
+    url, transport_headers = _worker_mcp_connection()
     worker = ResearchWorker(
         url,
         worker_id=os.getenv("MEDAI_WORKER_ID"),
         lease_seconds=int(os.getenv("MEDAI_WORKER_LEASE_SECONDS", "900")),
         agent_id=agent_id,
         agent_api_token=os.getenv("MEDAI_SPECIALIST_API_TOKEN"),
+        transport_headers=transport_headers,
     )
     return await worker.execute(session_id, max_tasks=max_tasks, paper_limit=paper_limit)
 
@@ -1769,7 +2006,7 @@ async def run_worker(poll_seconds: int = 30, max_tasks: int = 32, paper_limit: i
     if agent_id is not None and agent_id not in AGENTS:
         raise ValueError(f"unknown scientific agent ID: {agent_id}")
     specialist_meta = _specialist_meta(agent_id, os.getenv("MEDAI_SPECIALIST_API_TOKEN"))
-    url = os.getenv("MEDAI_AGENTMESH_URL", "http://127.0.0.1:8080/mcp")
+    url, transport_headers = _worker_mcp_connection()
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
     trial_watch_worker_id = os.getenv("MEDAI_TRIAL_WATCH_WORKER_ID") or f"medai-watch-{uuid4().hex}"
@@ -1777,7 +2014,7 @@ async def run_worker(poll_seconds: int = 30, max_tasks: int = 32, paper_limit: i
 
     while True:
         available: list[str] = []
-        async with streamable_http_client(url) as (read_stream, write_stream):
+        async with streamable_http_client(url, headers=transport_headers or None) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as client:
                 await client.initialize()
                 sessions = _tool_value(await client.call_tool("medai_research_list_sessions", arguments={}, meta=specialist_meta))
@@ -1829,6 +2066,9 @@ async def run_worker(poll_seconds: int = 30, max_tasks: int = 32, paper_limit: i
                     for literature_watch in due_literature.get("items", []) if isinstance(due_literature, dict) else []:
                         try:
                             last_pmids = _literature_watch_pmids(literature_watch.get("last_pmids"))
+                            pending_metadata_pmids = _literature_watch_pmids(
+                                literature_watch.get("pending_metadata_pmids")
+                            )
                             outcome = _tool_value(await client.call_tool(
                                 "medai_literature_watch_refresh",
                                 arguments={
@@ -1838,9 +2078,10 @@ async def run_worker(poll_seconds: int = 30, max_tasks: int = 32, paper_limit: i
                                     "interval_seconds": literature_watch["interval_seconds"],
                                     "worker_id": literature_watch_worker_id,
                                     "last_pmids": last_pmids,
+                                    "pending_metadata_pmids": pending_metadata_pmids,
                                 },
                             ))
-                            print(json.dumps({"literature_watch": literature_watch["watch_id"], "session_id": literature_watch["session_id"], "new_pmids": outcome.get("new_pmids"), "retained_record_count": outcome.get("retained_record_count"), "incomplete": outcome.get("incomplete")}, ensure_ascii=False), flush=True)
+                            print(json.dumps({"literature_watch": literature_watch["watch_id"], "session_id": literature_watch["session_id"], "new_pmids": outcome.get("new_pmids"), "retained_record_count": outcome.get("retained_record_count"), "metadata_pending_count": outcome.get("metadata_pending_count"), "metadata_overflow_count": outcome.get("metadata_overflow_count"), "incomplete": outcome.get("incomplete")}, ensure_ascii=False), flush=True)
                         except Exception as error:
                             print(json.dumps({"literature_watch": literature_watch.get("watch_id"), "session_id": literature_watch.get("session_id"), "error": f"{type(error).__name__}: {error}"}), flush=True)
                 except LookupError:

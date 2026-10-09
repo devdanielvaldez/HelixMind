@@ -9,6 +9,7 @@ from urllib.parse import quote
 import httpx
 from medai_science.sources.bounded_http import read_bounded_response
 from medai_science.sources.safety import ensure_public_research_query
+from medai_science.json_input import strict_json_loads
 
 _MAX_ENTRY_BYTES = 8 * 1024 * 1024
 _ACCESSION = re.compile(r"^[A-Z0-9]{6,10}(?:-[1-9][0-9]*)?$", re.IGNORECASE)
@@ -63,9 +64,9 @@ class UniProtClient:
                     raise ValueError(f"UniProtKB accession not found: {accession}")
                 body = await read_bounded_response(response, _MAX_ENTRY_BYTES, "UniProtKB")
         try:
-            record = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise ValueError("UniProtKB returned invalid JSON") from error
+            record = strict_json_loads(body)
+        except ValueError as error:
+            raise ValueError(f"UniProtKB returned invalid strict JSON: {error}") from error
         if not isinstance(record, dict) or record.get("primaryAccession", "").upper() != accession.split("-")[0]:
             raise ValueError("UniProtKB response accession does not match the request")
 
@@ -99,9 +100,15 @@ class UniProtClient:
             ) as response:
                 raw = await read_bounded_response(response, _MAX_ENTRY_BYTES, "UniProtKB search")
         try:
-            payload = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError("UniProtKB returned invalid search JSON") from error
+            payload = strict_json_loads(raw)
+        except ValueError as error:
+            raise ValueError(f"UniProtKB returned invalid strict search JSON: {error}") from error
+        if not isinstance(payload, dict) or not isinstance(payload.get("results"), list) or len(payload["results"]) > limit:
+            raise ValueError("UniProtKB returned a malformed or over-limit search result collection")
+        records = payload["results"]
+        if any(not isinstance(record, dict) or not isinstance(record.get("primaryAccession"), str)
+               or not _ACCESSION.fullmatch(record["primaryAccession"]) for record in records):
+            raise ValueError("UniProtKB returned a malformed search record or missing accession")
 
         retrieved_at = datetime.now(timezone.utc).isoformat()
         return [
@@ -114,6 +121,5 @@ class UniProtClient:
                 "license": "CC BY 4.0",
                 "record": record,
             }
-            for record in payload.get("results", [])
-            if isinstance(record, dict) and record.get("primaryAccession")
+            for record in records
         ]

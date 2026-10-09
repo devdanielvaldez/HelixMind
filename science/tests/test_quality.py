@@ -102,6 +102,34 @@ class PubMedDesignMetadataTests(unittest.TestCase):
         self.assertEqual(inventory["records_with_malformed_design_metadata"], 0)
         self.assertEqual(inventory["records_with_malformed_related_publication_metadata"], 1)
 
+    def test_reports_source_metadata_coverage_without_turning_availability_into_quality(self):
+        inventory = summarize_pubmed_design_metadata([
+            {
+                "provenance": {"source": "PubMed", "source_id": "101", "title": "A study"},
+                "publication_date": "2025 Jan", "journal": "Journal", "authors": ["A. Author"],
+                "identifiers": {"doi": "10.1000/example", "pmc": "PMC123"},
+                "abstract_length": 250, "publication_types": ["Journal Article"],
+                "publication_type_ids": [], "mesh_headings": [{"descriptor": "Example"}],
+            },
+            {
+                "provenance": {"source": "PubMed", "source_id": "102", "title": ""},
+                "publication_date": None, "journal": None, "authors": [], "identifiers": {},
+                "abstract_length": 0, "publication_types": [], "publication_type_ids": [], "mesh_headings": [],
+            },
+            {"provenance": {"source": "PubMed", "source_id": "103", "title": "Malformed"}, "authors": [17], "abstract_length": True},
+            {"provenance": {"source": "Crossref", "source_id": "10.1000/other"}},
+        ])
+        coverage = inventory["source_metadata_coverage"]
+        self.assertEqual(coverage["methodology"], "pubmed-source-metadata-coverage-v1")
+        self.assertEqual(coverage["records"], 3)
+        self.assertEqual(coverage["fields"]["title"], {"nonempty": 2, "empty": 1, "not_captured": 0, "malformed": 0})
+        self.assertEqual(coverage["fields"]["abstract_length"], {"nonempty": 1, "empty": 1, "not_captured": 0, "malformed": 1})
+        self.assertEqual(coverage["fields"]["authors"]["malformed"], 1)
+        self.assertEqual(coverage["fields"]["doi"]["empty"], 1)
+        self.assertEqual(coverage["fields"]["doi"]["not_captured"], 1)
+        self.assertIn("not study quality", coverage["interpretation"])
+        self.assertIsNone(inventory["evidence_grade"])
+
 
 if __name__ == "__main__":
     unittest.main()

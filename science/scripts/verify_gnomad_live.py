@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import httpx
+
 from medai_science.sources.gnomad import GnomADClient
 
 
@@ -20,6 +22,7 @@ DOCUMENTED_GRCH38_EXAMPLES = ("1-55052746-GT-G", "1-55058620-TG-T")
 
 async def main() -> None:
     client = GnomADClient()
+    schema_contract = await client.verify_schema_contract()
     results = []
     for variant_id in DOCUMENTED_GRCH38_EXAMPLES:
         result = await client.lookup(variant_id, "GRCh38")
@@ -34,8 +37,15 @@ async def main() -> None:
             "exome_frequency": result["exome_frequency"],
             "source_record_sha256": result["source_record_sha256"],
         })
-    print(json.dumps({"provider": "gnomAD Browser GraphQL API", "validated_examples": results}, sort_keys=True, indent=2))
+    print(json.dumps({"provider": "gnomAD Browser GraphQL API", "schema_contract": schema_contract, "validated_examples": results}, sort_keys=True, indent=2))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except httpx.HTTPError as error:
+        raise SystemExit(
+            "Live gnomAD verification could not reach or read the provider; "
+            "check DNS/network access and retry. No live schema or variant "
+            f"results were verified ({type(error).__name__})."
+        ) from None

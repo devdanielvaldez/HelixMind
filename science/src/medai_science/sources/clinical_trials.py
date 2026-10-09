@@ -17,11 +17,59 @@ _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 def _mapping(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("ClinicalTrials.gov record contains a malformed object field")
+    return value
 
 
 def _rows(value: Any) -> list[dict[str, Any]]:
-    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError("ClinicalTrials.gov record contains a malformed object collection")
+    return value
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"ClinicalTrials.gov returned duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"ClinicalTrials.gov returned non-standard JSON numeric constant {value}")
+
+
+def _load_response_json(raw: bytes, response_kind: str) -> Any:
+    try:
+        return json.loads(raw, object_pairs_hook=_unique_json_object, parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"ClinicalTrials.gov returned invalid {response_kind} JSON") from error
+
+
+def _validated_snapshot(snapshot: Any, expected_nct_id: str | None = None) -> dict[str, Any]:
+    if not isinstance(snapshot, dict) or snapshot.get("source") != "ClinicalTrials.gov":
+        raise ValueError("trial snapshot has an invalid source")
+    nct_id = snapshot.get("nct_id")
+    record = snapshot.get("record")
+    provenance = snapshot.get("provenance")
+    if (not isinstance(nct_id, str) or not _NCT_ID.fullmatch(nct_id)
+            or expected_nct_id is not None and nct_id != expected_nct_id
+            or not isinstance(record, dict) or not isinstance(provenance, dict)):
+        raise ValueError("trial snapshot identity or retained source record is malformed")
+    retrieved_at = provenance.get("retrieved_at")
+    digest = _snapshot_hash(record)
+    if not isinstance(retrieved_at, str) or not retrieved_at or provenance.get("record_snapshot_sha256") != digest:
+        raise ValueError("trial snapshot source-record digest or retrieval time is inconsistent")
+    recomputed = normalize_study(record, retrieved_at)
+    if json.dumps(recomputed, ensure_ascii=False, sort_keys=True, separators=(",", ":")) != json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")):
+        raise ValueError("trial snapshot fields do not match its retained source record")
+    return snapshot
 
 
 def _pick(source: dict[str, Any], *keys: str) -> Any:
@@ -175,6 +223,8 @@ def normalize_study(study: dict[str, Any], retrieved_at: str | None = None) -> d
 
 def compare_study_snapshots(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     """Report changed source-field paths between two retained snapshots."""
+    previous = _validated_snapshot(previous)
+    current = _validated_snapshot(current)
     previous_id = previous.get("nct_id")
     current_id = current.get("nct_id")
     if not previous_id or previous_id != current_id:
@@ -223,13 +273,22 @@ def latest_retained_study_snapshot(artifacts: list[dict[str, Any]], nct_id: str)
         if artifact.get("source_id") != nct_id:
             continue
         payload = artifact.get("payload")
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-        if isinstance(payload, dict) and payload.get("nct_id") == nct_id and isinstance(payload.get("record"), dict):
-            matches.append((artifact.get("recorded_at", 0), artifact.get("id", ""), payload))
+        if (artifact.get("source") != "ClinicalTrials.gov" or not isinstance(payload, str)
+                or not isinstance(artifact.get("sha256"), str)
+                or hashlib.sha256(payload.encode("utf-8")).hexdigest() != artifact["sha256"]):
+            raise ValueError("retained ClinicalTrials.gov artifact payload digest or source is invalid")
+        try:
+            decoded = json.loads(payload, object_pairs_hook=_unique_json_object, parse_constant=_reject_json_constant)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("retained ClinicalTrials.gov artifact payload is invalid JSON") from error
+        if not isinstance(decoded, dict):
+            raise ValueError("retained ClinicalTrials.gov artifact payload must be an object")
+        _validated_snapshot(decoded, nct_id)
+        recorded_at = artifact.get("recorded_at")
+        artifact_id = artifact.get("id")
+        if isinstance(recorded_at, bool) or not isinstance(recorded_at, int) or recorded_at < 0 or not isinstance(artifact_id, str) or not artifact_id:
+            raise ValueError("retained ClinicalTrials.gov artifact ordering metadata is malformed")
+        matches.append((recorded_at, artifact_id, decoded))
     return max(matches, key=lambda item: (item[0], item[1]))[2] if matches else None
 
 
@@ -247,11 +306,8 @@ class ClinicalTrialsClient:
         async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout, follow_redirects=False) as client:
             async with client.stream("GET", self.endpoint, params={"query.term": query, "pageSize": limit, "format": "json"}) as response:
                 raw = await read_bounded_response(response, _MAX_RESPONSE_BYTES, "ClinicalTrials.gov")
-        try:
-            payload = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError("ClinicalTrials.gov returned invalid search JSON") from error
-        if not isinstance(payload, dict) or not isinstance(payload.get("studies", []), list):
+        payload = _load_response_json(raw, "search")
+        if not isinstance(payload, dict) or "studies" not in payload or not isinstance(payload.get("studies"), list):
             raise ValueError("ClinicalTrials.gov returned an unexpected studies response")
         retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         return [normalize_study(study, retrieved_at) for study in _rows(payload.get("studies"))]
@@ -263,11 +319,11 @@ class ClinicalTrialsClient:
         async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout, follow_redirects=False) as client:
             async with client.stream("GET", endpoint, params={"format": "json"}) as response:
                 raw = await read_bounded_response(response, _MAX_RESPONSE_BYTES, "ClinicalTrials.gov")
-        try:
-            study = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError("ClinicalTrials.gov returned invalid study JSON") from error
+        study = _load_response_json(raw, "study")
         if not isinstance(study, dict):
             raise ValueError("ClinicalTrials.gov returned an unexpected study record")
         retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        return normalize_study(study, retrieved_at)
+        normalized = normalize_study(study, retrieved_at)
+        if normalized["nct_id"] != nct_id:
+            raise ValueError("ClinicalTrials.gov response NCT identifier does not match the requested study")
+        return normalized

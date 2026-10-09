@@ -30,7 +30,7 @@ def make_history(index: int, status_override: dict[str, str] | None = None):
         "limitations": ["Fixture only"],
     }
     bundle["bundle_sha256"] = hashlib.sha256(json.dumps(bundle, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    live_tasks = [{"id": row["id"], "status": row["status"]} for row in task_rows]
+    live_tasks = [{"id": row["id"], "status": row["status"], "domain": task.domain, "depends_on": list(task.depends_on)} for row, task in zip(task_rows, DEFAULT_PLAN)]
     return {"session_id": session_id, "session_status": "completed", "created_at": index, "plan": {"session_id": session_id, "tasks": live_tasks}, "bundle": bundle}
 
 
@@ -69,6 +69,28 @@ class SkillLearningTests(unittest.TestCase):
         self.assertEqual(result["status"], "no_common_core_procedure")
         self.assertEqual(len(index["consumed_session_ids"]), 3)
         self.assertEqual(len(histories), 3)
+
+    def test_rejects_duplicate_or_plan_bundle_outcome_drift(self):
+        duplicate = make_history(1)
+        duplicate["plan"]["tasks"].append(dict(duplicate["plan"]["tasks"][0]))
+        with self.assertRaisesRegex(ValueError, "duplicate live task plan"):
+            learn_research_skill_batch([duplicate])
+
+        drifted = make_history(2)
+        drifted["bundle"]["tasks"][0]["status"] = "failed"
+        unsigned = {key: value for key, value in drifted["bundle"].items() if key != "bundle_sha256"}
+        drifted["bundle"]["bundle_sha256"] = hashlib.sha256(json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "outcomes differ"):
+            learn_research_skill_batch([drifted])
+
+    def test_learned_procedure_prunes_a_successful_stage_with_missing_prerequisite(self):
+        histories = [make_history(index, {"compounds.analyze": "skipped", "drugs.investigate": "succeeded"}) for index in range(1, 4)]
+        with patch.dict(os.environ, {"MEDAI_PROVENANCE_HMAC_KEY": "test-only-signing-key-with-at-least-32-bytes"}, clear=True):
+            candidate, _, result = learn_research_skill_batch(histories)
+        self.assertEqual(result["status"], "candidate_created")
+        procedure_ids = {step["task_id"] for step in candidate["procedure"]}
+        self.assertNotIn("drugs.investigate", procedure_ids)
+        self.assertNotIn("compounds.analyze", procedure_ids)
 
     def test_enforces_three_complete_reproducible_sessions_and_batches_history(self):
         candidate, index, result = learn_research_skill_batch([make_history(1), make_history(2)])

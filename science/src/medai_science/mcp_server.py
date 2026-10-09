@@ -9,12 +9,16 @@ import threading
 from typing import Any
 from urllib.parse import quote
 import httpx
+from medai_science.api_pagination import read_evidence_pages as _read_evidence_pages
 from mcp.server.fastmcp import FastMCP
 from medai_science.sources.pubmed import PubMedClient
+from medai_science.sources.pubmed_search import validate_pmid_snapshot
 from medai_science.sources.clinical_trials import ClinicalTrialsClient, compare_study_snapshots, latest_retained_study_snapshot
 from medai_science.sources.alphafold import AlphaFoldClient
+from medai_science.structure_analysis import summarize_pdb
 from medai_science.sources.mygene import MyGeneClient
 from medai_science.sources.clinvar import ClinVarClient
+from medai_science.sources.dbsnp import DbSNPClient
 from medai_science.sources.gnomad import GnomADClient
 from medai_science.sources.ensembl_vep import EnsemblVEPClient
 from medai_science.sources.panelapp import PanelAppClient
@@ -22,18 +26,18 @@ from medai_science.sources.gencc import GenCCClient
 from medai_science.sources.clingen_gene_validity import ClinGenGeneValidityClient
 from medai_science.sources.orphadata import OrphadataClient
 from medai_science.sources.uniprot import UniProtClient
-from medai_science.sources.intact import IntActClient
+from medai_science.sources.intact import IntActClient, build_retention_payload as build_intact_retention_payload
 from medai_science.sources.sifts import SIFTSClient
 from medai_science.sources.reactome import ReactomeClient
 from medai_science.sources.gene_disease import GeneDiseaseClient, reconcile_gene_disease_sources
 from medai_science.sources.pmc_bioc import PMCBioCClient
+from medai_science.paper_understanding import build_extraction_retention_receipt
 from medai_science.sources.pubchem import PubChemClient
 from medai_science.sources.chembl import ChEMBLClient
 from medai_science.sources.openfda_labels import OpenFDALabelClient
 from medai_science.sources.dailymed_labels import DailyMedLabelClient, compare_label_distributions
 from medai_science.sources.drug_interaction_literature import build_interaction_evidence_query, candidate_retention_receipt, characterize_interaction_candidate, retain_candidate_paper
-from medai_science.sources.pubmed import PubMedClient
-from medai_science.sources.crossref import CrossrefClient, build_retention_payload
+from medai_science.sources.crossref import CrossrefClient, build_retention_payload, build_unresolved_reference_query, select_retained_reference
 from medai_science.sources.preprint import PreprintClient
 from medai_science.sources.ontology import OntologyClient
 from medai_science.sources.ontology_mapping import OntologyMappingClient
@@ -49,7 +53,8 @@ from medai_science.capabilities import LocalSentenceTransformer, SemanticCapabil
 from medai_science.capabilities import runtime_capability_statuses
 from medai_science.capability_lifecycle import fetch_approved_lifecycle, fetch_capability_registry
 from medai_science.generated_execution import resolve_production_generated_package, require_exact_active_generated_route
-from medai_science.evaluation import load_pinned_capability_calibration
+from medai_science.evaluation import evaluate_biomedical_domain_benchmark, load_pinned_capability_calibration
+from medai_science.benchmark_artifacts import DOMAIN_BENCHMARK_ARTIFACT_KIND, DOMAIN_BENCHMARK_ARTIFACT_SOURCE, EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_KIND, EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_SOURCE, evaluate_evidence_quality_benchmark_bytes
 from medai_science.agentmesh_control import AgentMeshControlPlaneClient
 from medai_science.amcp_generation import build_generated_capability_amcp_package
 from medai_science.code_generation import generate_python_capability, generate_r_capability, validate_python_capability_request
@@ -65,7 +70,7 @@ from medai_science.research_criticism import generate_critic_leads
 from medai_science.structured_extraction import extract_local_result_annotations, extraction_batch_count, license_policy_allows_model_processing, provider_is_local
 from medai_science.claim_semantics import claim_context_receipt, compare_claim_pair
 from medai_science.claim_alignment import decode_verified_annotation_artifact, validate_semantic_claim_pair
-from medai_science.drug_interaction_review import sentence_candidates, rank_candidate_pairs
+from medai_science.drug_interaction_review import screen_sentence_candidates, screen_drug_label_candidates, rank_candidate_pairs
 from medai_science.drug_interaction_fulltext import build_interaction_fulltext_screen, rehydrate_interaction_fulltext_candidates, validate_interaction_fulltext_binding
 from medai_science.literature_reranking import rerank_pubmed_titles
 from medai_science.literature import omit_pubmed_abstract_text
@@ -73,7 +78,7 @@ from medai_science.sandbox import DockerPythonSandbox, SandboxError, capability_
 from medai_science.r_sandbox import DockerRSandbox, validate_r_source
 from medai_science.model_usage import ModelUsageBudgetError, ModelUsageError, meter_model_usage
 from medai_science.compute_usage import DEFAULT_CPU_SECONDS_PER_CREDIT, meter_cpu_time
-from medai_science.mcp_auth import API, SpecialistCredentialASGIMiddleware, api_headers as _api_headers
+from medai_science.mcp_auth import API, AuthenticatedMCPTransportASGIMiddleware, SpecialistCredentialASGIMiddleware, api_headers as _api_headers
 
 mcp = FastMCP("MedAI Biomedical Research")
 _semantic_index = None
@@ -129,6 +134,8 @@ async def _charge(session_id: str, task_id: str, credits: int, reason: str) -> N
         )
         if response.status_code == 429 and "specialist credit budget exhausted" in response.text.lower():
             raise RuntimeError("specialist credit budget exhausted; research task requires review")
+        if response.status_code == 402 and "research session execution budget exhausted" in response.text.lower():
+            raise RuntimeError("research session execution budget exhausted; research task requires review")
         response.raise_for_status()
 
 def _model_provider_for_task(task_id: str, session_id: str) -> JSONModelProvider | None:
@@ -1134,9 +1141,8 @@ async def record_evidence(session_id: str, claim: str, source: str, polarity: st
 async def list_evidence(session_id: str) -> dict:
     """List retained claims and their source provenance for one research session."""
     async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=15) as client:
-        response = await client.get("/v1/research/" + session_id + "/evidence")
-        response.raise_for_status()
-        return response.json()
+        items = await _read_evidence_pages(client, session_id)
+        return {"session_id": session_id, "items": items, "complete": True}
 
 @mcp.tool(name="medai_research_store_artifact")
 async def store_research_artifact(session_id: str, task_id: str, kind: str, source: str, source_id: str, payload: dict | list) -> dict:
@@ -1293,6 +1299,64 @@ async def resolve_crossref_paper(session_id: str, task_id: str, query: str, limi
         index_response.raise_for_status()
         indexed = index_response.json()
     return {"records": result, "artifact_id": artifact["id"], "citation_links_indexed": indexed["inserted"], "retention": retained["retention"]}
+
+
+@mcp.tool(name="medai_papers_resolve_crossref_reference")
+async def resolve_crossref_reference(session_id: str, task_id: str, source_artifact_id: str, citing_doi: str, reference_index: int, limit: int = 5) -> dict:
+    """Search Crossref for a DOI-less retained reference and keep results as unverified candidates."""
+    if task_id != "literature.discover":
+        raise ValueError("citation reference resolution is restricted to literature.discover")
+    if not 1 <= limit <= 5:
+        raise ValueError("Crossref candidate limit must be 1..5")
+    if isinstance(reference_index, bool) or not isinstance(reference_index, int) or not 0 <= reference_index < 200:
+        raise ValueError("reference_index must be an integer in 0..199")
+    if not isinstance(source_artifact_id, str) or not source_artifact_id or len(source_artifact_id) > 128:
+        raise ValueError("source_artifact_id must be a bounded artifact identifier")
+    client = CrossrefClient(mailto=os.getenv("CROSSREF_MAILTO"))
+    citing_doi = client.validate_doi(citing_doi)
+    async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=15) as client_http:
+        response = await client_http.get(
+            f"/v1/research/{quote(session_id, safe='')}/artifacts/{quote(source_artifact_id, safe='')}"
+        )
+        response.raise_for_status()
+        artifact = response.json()
+    selected = select_retained_reference(artifact, session_id=session_id, artifact_id=source_artifact_id, citing_doi=citing_doi, reference_index=reference_index)
+    reference = selected["reference"]
+    payload_digest = selected["source_artifact_sha256"]
+    reference_sha256 = selected["reference_sha256"]
+    existing_doi = selected["source_cited_doi"]
+    if existing_doi is not None:
+        return {"status": "source_doi_present", "citing_doi": citing_doi, "reference_index": reference_index, "cited_doi": client.validate_doi(existing_doi), "candidate_artifact_id": None, "interpretation": "Crossref supplied this DOI; MedAI did not independently validate the citation relationship."}
+    query_record = build_unresolved_reference_query(reference)
+    query = ensure_public_research_query(query_record["query"])
+    query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    await _charge(session_id, task_id, 1, "Crossref lookup for retained DOI-less citation candidate")
+    result = await _run_cancel_aware(session_id, client.search_bibliographic(query, limit))
+    retained = build_retention_payload(result, max_bytes=200_000)
+    candidate_payload = {
+        "schema_version": "1",
+        "source": "Crossref REST API",
+        "status": "unverified_candidates",
+        "citing_doi": citing_doi,
+        "reference_index": reference_index,
+        "source_artifact_id": source_artifact_id,
+        "source_artifact_sha256": payload_digest,
+        "reference_sha256": reference_sha256,
+        "query_sha256": query_sha256,
+        "candidate_records": retained["records"],
+        "candidate_records_sha256": retained["retained_records_sha256"],
+        "complete_result_sha256": retained["complete_result_sha256"],
+        "candidate_count": len(retained["records"]),
+        "interpretation": "Bibliographic search results are candidates only. No DOI was assigned to the cited reference and no citation edge was created; researcher adjudication is required.",
+    }
+    async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=20) as client_http:
+        save = await client_http.post(
+            f"/v1/research/{quote(session_id, safe='')}/artifacts",
+            json={"task_id": task_id, "kind": "crossref_reference_resolution_candidates", "source": "Crossref REST API", "source_id": "reference-" + reference_sha256, "payload": candidate_payload},
+        )
+        save.raise_for_status()
+        saved_artifact = save.json()
+    return {"status": "unverified_candidates", "candidate_artifact_id": saved_artifact["id"], "candidate_count": len(retained["records"]), "candidate_records": retained["records"], "citing_doi": citing_doi, "reference_index": reference_index, "source_artifact_id": source_artifact_id, "reference_sha256": reference_sha256, "query_sha256": query_sha256, "interpretation": candidate_payload["interpretation"]}
 
 
 @mcp.tool(name="medai_papers_citation_network")
@@ -1536,13 +1600,15 @@ async def claim_due_literature_watches(worker_id: str, limit: int = 10, lease_se
         return response.json()
 
 @mcp.tool(name="medai_literature_watch_refresh")
-async def refresh_literature_watch(session_id: str, watch_id: str, query: str, interval_seconds: int, worker_id: str, last_pmids: list[str] | None = None) -> dict:
+async def refresh_literature_watch(session_id: str, watch_id: str, query: str, interval_seconds: int, worker_id: str, last_pmids: list[str] | None = None, pending_metadata_pmids: list[str] | None = None) -> dict:
     """Search a bounded overlapping PubMed window, retain new papers, and record discovery without asserting evidence."""
     query = ensure_public_research_query(query)
     if not 86400 <= interval_seconds <= 31_536_000:
         raise ValueError("interval_seconds must be 86400..31536000")
     endpoint = f"/v1/research/{session_id}/literature-watches/{watch_id}"
     try:
+        last_pmids = validate_pmid_snapshot(last_pmids)
+        pending_metadata_pmids = validate_pmid_snapshot(pending_metadata_pmids, max_items=20)
         async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=20) as client:
             charged = await client.post(endpoint + "/budget/consume", json={"worker_id": worker_id, "credits": 1, "reason": "scheduled PubMed literature discovery"})
             charged.raise_for_status()
@@ -1550,20 +1616,20 @@ async def refresh_literature_watch(session_id: str, watch_id: str, query: str, i
         email = os.getenv("NCBI_EMAIL", "")
         api_key = os.getenv("NCBI_API_KEY")
         count, pmids = await _run_cancel_aware(session_id, PubMedClient(email, api_key).search_recent_ids(query, window_days, 200))
-        if last_pmids is not None and (not isinstance(last_pmids, list) or any(not isinstance(value, str) or not value.isdigit() for value in last_pmids)):
-            raise ValueError("stored literature watch PMID snapshot must be a list of numeric identifiers")
-        seen = set(last_pmids or [])
+        seen = set(last_pmids)
         new_pmids = [pmid for pmid in pmids if pmid not in seen]
+        metadata_candidates = list(dict.fromkeys(pending_metadata_pmids + new_pmids))[:20]
         papers = []
-        if new_pmids:
+        if metadata_candidates:
             async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=20) as client:
                 charged = await client.post(endpoint + "/budget/consume", json={"worker_id": worker_id, "credits": 1, "reason": "bounded PubMed bibliographic metadata retrieval"})
                 charged.raise_for_status()
-            papers = await _run_cancel_aware(session_id, PubMedClient(email, api_key).fetch_bibliographic(new_pmids[:20]))
+            papers = await _run_cancel_aware(session_id, PubMedClient(email, api_key).fetch_bibliographic(metadata_candidates))
         async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=20) as client:
             response = await client.post(endpoint + "/complete", json={"worker_id": worker_id, "pmids": pmids, "result_count": count, "papers": papers})
             response.raise_for_status()
-        return {"event": response.json(), "window_days": window_days, "returned_pmids": len(pmids), "new_pmids": len(new_pmids), "new_pmid_identifiers": new_pmids, "retained_record_count": len(papers), "incomplete": count > len(pmids), "research_only": True, "evidence_validated": False}
+        event = response.json()
+        return {"event": event, "window_days": window_days, "returned_pmids": len(pmids), "new_pmids": len(new_pmids), "new_pmid_identifiers": new_pmids, "metadata_candidates": len(metadata_candidates), "retained_record_count": len(papers), "metadata_pending_count": event.get("metadata_pending_count"), "metadata_overflow_count": event.get("metadata_overflow_count"), "incomplete": event.get("incomplete"), "research_only": True, "evidence_validated": False}
     except Exception as error:
         try:
             async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=15) as client:
@@ -1653,6 +1719,41 @@ async def get_alphafold_structure(session_id: str, task_id: str, uniprot_accessi
         artifact = response.json()
     return {"accession": uniprot_accession, "predictions": predictions, "artifact_id": artifact["id"], "research_only": True}
 
+@mcp.tool(name="medai_proteins_analyze_alphafold_coordinates")
+async def analyze_alphafold_coordinates(session_id: str, task_id: str, uniprot_accession: str, model_id: str) -> dict:
+    """Download and summarize one bounded AlphaFold PDB prediction; retain only a hash-linked summary."""
+    accession = AlphaFoldClient.validate_accession(uniprot_accession)
+    if not isinstance(model_id, str) or not model_id.startswith("AF-") or model_id.split("-")[1] != accession.split("-")[0]:
+        raise ValueError("model_id must be a prediction belonging to the requested UniProt accession")
+    await _charge(session_id, task_id, 4, "AlphaFold model lookup, PDB coordinate download, and bounded structural analysis")
+    predictions = await _run_cancel_aware(session_id, AlphaFoldClient().predictions(accession))
+    if not any(prediction["model_id"] == model_id for prediction in predictions):
+        raise ValueError("model_id is not present in the AlphaFold response for this accession")
+    downloaded = await _run_cancel_aware(session_id, AlphaFoldClient().coordinate_file(model_id, "pdb"))
+    summary = summarize_pdb(downloaded["content"], label=model_id)
+    receipt = {
+        "accession": accession,
+        "model_id": model_id,
+        "source": "AlphaFold Protein Structure Database",
+        "source_url": downloaded["url"],
+        "license": downloaded["license"],
+        "attribution": downloaded["attribution"],
+        "coordinate_sha256": downloaded["sha256"],
+        "coordinate_bytes": downloaded["byte_length"],
+        "retrieved_at": downloaded["retrieved_at"],
+        "summary": summary,
+        "experimental_structure": False,
+        "research_only": True,
+    }
+    async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=20) as client:
+        response = await client.post(
+            f"/v1/research/{session_id}/artifacts",
+            json={"task_id": task_id, "kind": "alphafold_coordinate_analysis", "source": receipt["source"], "source_id": model_id, "payload": receipt},
+        )
+        response.raise_for_status()
+        artifact = response.json()
+    return {**receipt, "artifact_id": artifact["id"]}
+
 @mcp.tool(name="medai_proteins_get_uniprot_record")
 async def get_uniprot_protein_record(session_id: str, task_id: str, uniprot_accession: str) -> dict:
     """Retrieve UniProt feature annotations and experimental-structure cross-reference metadata."""
@@ -1713,7 +1814,7 @@ async def search_intact_protein_interactions(session_id: str, task_id: str, unip
     async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=20) as client:
         response = await client.post(
             "/v1/research/" + session_id + "/artifacts",
-            json={"task_id": task_id, "kind": "protein_interaction_evidence", "source": "IntAct", "source_id": result["query_accession"], "payload": result},
+            json={"task_id": task_id, "kind": "protein_interaction_evidence", "source": "IntAct", "source_id": result["query_accession"], "payload": build_intact_retention_payload(result)},
         )
         response.raise_for_status()
         artifact = response.json()
@@ -1757,6 +1858,22 @@ async def search_variants_clinvar(session_id: str, task_id: str, query: str, lim
         response = await client.post(
             "/v1/research/" + session_id + "/artifacts",
             json={"task_id": task_id, "kind": "clinvar_variant_records", "source": "NCBI ClinVar E-utilities", "source_id": source_id, "payload": result},
+        )
+        response.raise_for_status()
+        artifact = response.json()
+    return {**result, "artifact_id": artifact["id"], "research_only": True}
+
+
+@mcp.tool(name="medai_variants_lookup_dbsnp")
+async def lookup_variant_dbsnp(session_id: str, task_id: str, rsid: str) -> dict:
+    """Retrieve one source-bound dbSNP RefSNP record; assembly reconciliation remains local and explicit."""
+    canonical_rsid = DbSNPClient.normalize_rsid(rsid)
+    await _charge(session_id, task_id, 1, "NCBI dbSNP RefSNP lookup")
+    result = await _run_cancel_aware(session_id, DbSNPClient().lookup(canonical_rsid))
+    async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=20) as client:
+        response = await client.post(
+            "/v1/research/" + session_id + "/artifacts",
+            json={"task_id": task_id, "kind": "dbsnp_refsnp_record", "source": result["source"], "source_id": canonical_rsid, "payload": result},
         )
         response.raise_for_status()
         artifact = response.json()
@@ -2146,6 +2263,7 @@ async def drug_interaction_review_sources(session_id: str, task_id: str, label_a
         pmc_ids = candidate_payload.get("identifiers", {})
         if candidate_payload.get("pmid") != paper_payload.get("pmid") or not isinstance(pmc_ids, dict) or pmc_ids.get("pmc") != paper_source_id:
             raise ValueError("PMC full-text screen does not match its linked PubMed record")
+        await _charge(session_id, task_id, 2, "PMC BioC source revalidation for selected drug-interaction claim screening")
         article = await _run_cancel_aware(session_id, PMCBioCClient().fetch(paper_source_id))
         paper_sentences = rehydrate_interaction_fulltext_candidates(paper_payload, article)
         paper_source_name, paper_field = "PMC BioC", "full_text"
@@ -2157,35 +2275,15 @@ async def drug_interaction_review_sources(session_id: str, task_id: str, label_a
         abstract = paper_payload.get("abstract")
         if not isinstance(abstract, str) or not abstract:
             raise ValueError("PubMed abstract text was not retained because reuse rights were not established; select an exact-license PMC full-text screen instead")
-        paper_sentences = sentence_candidates(abstract, "PMID")
+        paper_candidate_coverage = screen_sentence_candidates(abstract, "PMID")
+        paper_sentences = paper_candidate_coverage["candidates"]
         paper_context = {"title": str(paper_payload.get("title", ""))[:500], "journal": paper_payload.get("journal"), "publication_date": paper_payload.get("publication_date"), "publication_types": paper_payload.get("publication_types", [])[:10]}
 
     labels = label_payload.get("labels")
     if not isinstance(labels, dict):
         raise ValueError("selected label artifact has no label records")
-    label_sentences = []
-    for drug_name, rows in labels.items():
-        if not isinstance(rows, list):
-            continue
-        for row in rows:
-            if not isinstance(row, dict) or not isinstance(row.get("drug_interactions"), str):
-                continue
-            source_spans = sentence_candidates(row["drug_interactions"], "LABEL")
-            for span in source_spans:
-                label_sentences.append({
-                    **span,
-                    "drug_name": str(drug_name)[:128],
-                    "set_id": row.get("set_id"),
-                    "version": row.get("version") or row.get("spl_version"),
-                    "effective_time": row.get("effective_time") or row.get("published_date"),
-                    "product_name": (row.get("generic_name") or row.get("brand_name") or [None])[0] if isinstance(row.get("generic_name") or row.get("brand_name") or [], list) else None,
-                })
-                if len(label_sentences) >= 100:
-                    break
-            if len(label_sentences) >= 100:
-                break
-        if len(label_sentences) >= 100:
-            break
+    label_screen = screen_drug_label_candidates(labels)
+    label_sentences = label_screen["candidates"]
     if not paper_sentences or not label_sentences:
         raise ValueError("selected artifacts do not contain bounded label and source sentences to compare")
     pairs = rank_candidate_pairs(label_sentences, paper_sentences, max_pairs)
@@ -2222,6 +2320,18 @@ async def drug_interaction_review_sources(session_id: str, task_id: str, label_a
         "literature_artifact_id": literature_artifact_id,
         "reviews": reviews,
         "candidate_pair_count": len(reviews),
+        "candidate_coverage": {
+            "pubmed_or_pmc": paper_candidate_coverage if not is_pmc else {
+                "source_sentence_count": paper_payload.get("anchored_source_sentence_count", len(paper_sentences)),
+                "retained_candidate_count": len(paper_sentences),
+                "omitted_overlong_sentence_count": paper_payload.get("omitted_overlong_sentence_count", 0),
+                "reported_omitted_candidate_count": paper_payload.get("omitted_candidate_count", 0),
+                "source_scan_truncated": bool(paper_payload.get("candidate_scan_truncated")),
+                "truncated": bool(paper_payload.get("candidate_scan_truncated")) or paper_payload.get("omitted_candidate_count", 0) > 0 or paper_payload.get("omitted_overlong_sentence_count", 0) > 0,
+                "coverage_source": "bounded PMC BioC full-text screen receipt",
+            },
+            "label": label_screen["coverage"],
+        },
         "review_required": True,
         "interaction_verdict": None,
         "interpretation_limit": "Model screening compares source-anchored sentences and returns categorical review leads only. It does not establish contradiction, interaction, evidence quality, causality, pharmacokinetic/pharmacodynamic direction, or clinical relevance.",
@@ -2372,16 +2482,11 @@ async def gene_disease_orphadata(session_id: str, task_id: str, orphacode: str) 
 
 @mcp.tool(name="medai_papers_understand_pmc")
 async def understand_pmc_paper(session_id: str, task_id: str, identifier: str) -> dict:
-    """Parse PMC Open Access BioC full text; optionally classify results with a loopback model."""
+    """Parse PMC BioC transiently and return only hash-linked extraction metadata."""
     identifier = PMCBioCClient.validate_identifier(identifier)
     await _charge(session_id, task_id, 2, "PMC BioC full-text retrieval and structural parsing")
     result = await _run_cancel_aware(session_id, PMCBioCClient().fetch(identifier))
-    retained = {key: value for key, value in result.items() if key not in {"sections", "methods", "results", "limitations", "abstract", "result_sentence_candidates"}}
-    retained["sections"] = [{"passage_index": row["passage_index"], "sentence_index": row.get("sentence_index"), "section": row["section"], "source_section": row["source_section"], "offset": row["offset"], "text_sha256": hashlib.sha256(row["text"].encode()).hexdigest(), "text_length": len(row["text"])} for row in result["sections"]]
-    retained["result_sentence_candidates"] = [{"candidate_id": row["candidate_id"], "text_sha256": hashlib.sha256(row["text"].encode()).hexdigest(), "section": row["section"], "passage_index": row["passage_index"], "sentence_index": row["sentence_index"], "polarity": row["polarity"], "source_offset": row["source_offset"], "source_local_offset": row["source_local_offset"], "source_length": row["source_length"]} for row in result["result_sentence_candidates"]]
-    for entity in retained.get("normalized_entities", []):
-        for mention in entity.get("mentions", []):
-            mention.pop("text", None)
+    retained = build_extraction_retention_receipt(result)
     async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=20) as client:
         response = await client.post("/v1/research/" + session_id + "/artifacts", json={"task_id": task_id, "kind": "paper_extraction_metadata", "source": "PMC BioC", "source_id": identifier, "payload": retained})
         response.raise_for_status()
@@ -2415,7 +2520,7 @@ async def understand_pmc_paper(session_id: str, task_id: str, identifier: str) -
         raise
     except Exception as error:
         model_extraction = {"available": False, "reason": "local model annotation failed", "error": type(error).__name__}
-    return {"paper": result, "artifact_id": artifact["id"], "model_extraction": model_extraction, "retention": "Full-text content is returned to the caller but is not persisted by this operation; model labels store no article text. Verify the article-specific license before downstream retention or reuse."}
+    return {"paper": retained, "artifact_id": artifact["id"], "model_extraction": model_extraction, "retention": "Full-text content is neither returned through MCP nor persisted by this operation; any licensed text is used transiently only, and model processing requires an exact operator-reviewed license allowlist and a loopback endpoint."}
 
 @mcp.tool(name="medai_papers_align_pmc_claims")
 async def align_pmc_result_claims(
@@ -2537,47 +2642,77 @@ async def align_pmc_result_claims(
         artifact = response.json()
     return {"available": True, "artifact_id": artifact["id"], "assessment": completion.value, "usage": completion.usage, "usage_metering": usage_metering, "review_required": True}
 
+async def _read_graph_pages(client: httpx.AsyncClient, session_id: str, max_records: int = 50000) -> dict:
+    """Read a complete, bounded graph snapshot through the API keyset cursors."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    node_cursor: dict | None = None
+    edge_cursor: dict | None = None
+    nodes_done = False
+    edges_done = False
+    while True:
+        params: dict[str, Any] = {"limit": 500, "include_nodes": not nodes_done, "include_edges": not edges_done}
+        if node_cursor:
+            params["after_node_label"] = node_cursor["label"]
+            params["after_node_id"] = node_cursor["id"]
+        if edge_cursor:
+            params["after_edge_source"] = edge_cursor["source"]
+            params["after_edge_relation"] = edge_cursor["relation"]
+            params["after_edge_target"] = edge_cursor["target"]
+        response = await client.get(f"/v1/research/{quote(session_id, safe='')}/graph", params=params)
+        response.raise_for_status()
+        page = response.json()
+        if page.get("session_id") != session_id:
+            raise ValueError("graph page belongs to a different research session")
+        nodes.extend(page.get("nodes", []))
+        edges.extend(page.get("edges", []))
+        if len(nodes) > max_records or len(edges) > max_records:
+            raise ValueError(f"graph exceeds the bounded snapshot limit of {max_records} nodes or edges")
+        node_cursor = page.get("next_node_cursor")
+        edge_cursor = page.get("next_edge_cursor")
+        nodes_done = nodes_done or node_cursor is None
+        edges_done = edges_done or edge_cursor is None
+        if nodes_done and edges_done:
+            return {"session_id": session_id, "nodes": nodes, "edges": edges}
+
+
 @mcp.tool(name="medai_graph_search")
 async def search_knowledge_graph(session_id: str, query: str) -> dict:
     """Find existing graph nodes by case-insensitive ID, label, or entity type."""
     if not query.strip():
         raise ValueError("query cannot be empty")
     async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=15) as client:
-        response = await client.get("/v1/research/" + session_id + "/graph")
+        response = await client.get(
+            f"/v1/research/{quote(session_id, safe='')}/graph/search",
+            params={"q": query.strip(), "limit": 100},
+        )
         response.raise_for_status()
-        graph = response.json()
-    needle = query.casefold()
-    nodes = [node for node in graph["nodes"] if needle in node["id"].casefold() or needle in node["label"].casefold() or needle in node["kind"].casefold()]
-    matched = {node["id"] for node in nodes}
-    edges = [edge for edge in graph["edges"] if edge["source"] in matched or edge["target"] in matched]
-    return {"nodes": nodes, "edges": edges}
+        result = response.json()
+    if result.get("session_id") != session_id:
+        raise ValueError("graph search returned a different research session")
+    return result
 
 @mcp.tool(name="medai_graph_snapshot")
 async def get_knowledge_graph_snapshot(session_id: str) -> dict:
     """Read the complete session-scoped biomedical graph for auditing and reproduction."""
     async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=30) as client:
-        response = await client.get("/v1/research/" + session_id + "/graph")
-        response.raise_for_status()
-        result = response.json()
+        result = await _read_graph_pages(client, session_id)
     if any(node.get("session_id") != session_id for node in result.get("nodes", [])) or any(edge.get("session_id") != session_id for edge in result.get("edges", [])):
         raise ValueError("graph snapshot returned cross-session records")
     return result
 
 @mcp.tool(name="medai_hypotheses_propose")
 async def propose_research_hypotheses(session_id: str, task_id: str, limit: int = 50) -> dict:
-    """Enumerate evidence-backed two-edge paths from this session's graph."""
+    """Enumerate bounded evidence-backed simple paths of two to four edges."""
     if not 1 <= limit <= 200:
         raise ValueError("limit must be 1..200")
     await _charge(session_id, task_id, 1, "Evidence-linked hypothesis candidate generation")
     async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=30) as client:
-        graph_response, evidence_response = await asyncio.gather(
-            client.get("/v1/research/" + session_id + "/graph"),
-            client.get("/v1/research/" + session_id + "/evidence"),
+        graph_result, evidence = await asyncio.gather(
+            _read_graph_pages(client, session_id),
+            _read_evidence_pages(client, session_id),
         )
-        graph_response.raise_for_status()
-        evidence_response.raise_for_status()
-        graph = graph_response.json()
-        evidence = evidence_response.json().get("items", [])
+        graph = graph_result
         candidates = propose_candidates(graph["nodes"], graph["edges"], evidence, limit)
         response = await client.post(
             "/v1/research/" + session_id + "/artifacts",
@@ -2586,6 +2721,164 @@ async def propose_research_hypotheses(session_id: str, task_id: str, limit: int 
         response.raise_for_status()
         artifact = response.json()
     return {**candidates, "artifact_id": artifact["id"]}
+
+
+@mcp.tool(name="medai_biomedical_domain_benchmark_evaluate")
+async def evaluate_biomedical_domain_benchmark_in_session(
+    session_id: str,
+    task_id: str,
+    input_artifact_id: str,
+    bins: int = 10,
+) -> dict[str, Any]:
+    """Evaluate one exact retained benchmark input and keep only hash-bound metrics."""
+    if task_id != "benchmark.evaluate":
+        raise ValueError("biomedical benchmark evaluation requires the benchmark.evaluate task")
+    if not isinstance(input_artifact_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", input_artifact_id):
+        raise ValueError("input_artifact_id must be a bounded artifact identifier")
+    await _charge(session_id, task_id, 1, "four-domain biomedical benchmark evaluation")
+    async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=30) as client:
+        source_response = await client.get(
+            "/v1/research/" + quote(session_id, safe="") + "/artifacts/" + quote(input_artifact_id, safe="")
+        )
+        source_response.raise_for_status()
+        source_artifact = source_response.json()
+        if source_artifact.get("session_id") != session_id or source_artifact.get("id") != input_artifact_id:
+            raise ValueError("benchmark input artifact is outside the requested research session")
+        if (
+            source_artifact.get("kind") != DOMAIN_BENCHMARK_ARTIFACT_KIND
+            or source_artifact.get("task_id") != task_id
+            or source_artifact.get("source") != DOMAIN_BENCHMARK_ARTIFACT_SOURCE
+        ):
+            raise ValueError("artifact is not a biomedical domain benchmark input for this task")
+        raw_payload = source_artifact.get("payload")
+        if not isinstance(raw_payload, str) or len(raw_payload.encode("utf-8")) > 4 * 1024 * 1024:
+            raise ValueError("benchmark input payload is missing or exceeds 4 MiB")
+        source_digest = hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
+        if source_digest != source_artifact.get("sha256"):
+            raise ValueError("benchmark input artifact failed its retained payload hash check")
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("benchmark input contains duplicate JSON keys")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(value):
+        raise ValueError(f"benchmark input contains non-standard JSON number {value}")
+
+    try:
+        benchmark = json.loads(raw_payload, object_pairs_hook=reject_duplicate_keys, parse_constant=reject_nonfinite)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ValueError("benchmark input artifact does not contain strict JSON") from error
+    if not isinstance(benchmark, dict):
+        raise ValueError("benchmark input must be a JSON object")
+    canonical_input = json.dumps(benchmark, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    benchmark_digest = hashlib.sha256(canonical_input).hexdigest()
+    report = evaluate_biomedical_domain_benchmark(benchmark, bins=bins)
+    if report["benchmark_sha256"] != benchmark_digest:
+        raise ValueError("benchmark digest changed during evaluation")
+    report["input_artifact_id"] = input_artifact_id
+    report["input_artifact_sha256"] = source_digest
+    report_bytes = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(report_bytes) > 4 * 1024 * 1024:
+        raise ValueError("biomedical benchmark evaluation report exceeds 4 MiB")
+    async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=30) as client:
+        response = await client.post(
+            "/v1/research/" + quote(session_id, safe="") + "/artifacts",
+            json={
+                "task_id": task_id,
+                "kind": "biomedical_domain_benchmark",
+                "source": "MedAI source-bound biomedical benchmark evaluator",
+                "source_id": input_artifact_id,
+                "payload": report,
+            },
+        )
+        response.raise_for_status()
+        artifact = response.json()
+    return {
+        "benchmark_id": report["benchmark_id"],
+        "benchmark_sha256": benchmark_digest,
+        "total_cases": report["total_cases"],
+        "complete_domain_coverage": report["complete_domain_coverage"],
+        "missing_domains": report["missing_domains"],
+        "domains": {domain: {"status": result["status"], "cases": result.get("overall", {}).get("n", 0)} for domain, result in report["domains"].items()},
+        "adjudication_integrity": report["adjudication_integrity"],
+        "artifact_id": artifact["id"],
+        "interpretation_limit": report["interpretation_limit"],
+    }
+
+
+@mcp.tool(name="medai_evidence_quality_benchmark_evaluate")
+async def evaluate_evidence_quality_benchmark_in_session(
+    session_id: str,
+    task_id: str,
+    input_artifact_id: str,
+    bins: int = 10,
+) -> dict[str, Any]:
+    """Evaluate one retained, double-reviewed ordinal quality benchmark by domain."""
+    if task_id != "benchmark.evaluate":
+        raise ValueError("evidence-quality benchmark evaluation requires the benchmark.evaluate task")
+    if not isinstance(input_artifact_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", input_artifact_id):
+        raise ValueError("input_artifact_id must be a bounded artifact identifier")
+    await _charge(session_id, task_id, 1, "Double-reviewed evidence-quality benchmark evaluation")
+    async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=30) as client:
+        response = await client.get(
+            f"/v1/research/{quote(session_id, safe='')}/artifacts/{quote(input_artifact_id, safe='')}"
+        )
+        response.raise_for_status()
+        source_artifact = response.json()
+        if source_artifact.get("session_id") != session_id or source_artifact.get("id") != input_artifact_id:
+            raise ValueError("benchmark input artifact is outside the requested research session")
+        if (
+            source_artifact.get("kind") != EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_KIND
+            or source_artifact.get("task_id") != task_id
+            or source_artifact.get("source") != EVIDENCE_QUALITY_BENCHMARK_ARTIFACT_SOURCE
+        ):
+            raise ValueError("artifact is not a double-reviewed evidence-quality benchmark input for this task")
+        raw_payload = source_artifact.get("payload")
+        stored_digest = source_artifact.get("sha256")
+        if not isinstance(raw_payload, str):
+            raise ValueError("benchmark input payload is missing")
+        raw = raw_payload.encode("utf-8")
+        source_digest = hashlib.sha256(raw).hexdigest()
+        if source_digest != stored_digest:
+            raise ValueError("benchmark input artifact failed its retained payload hash check")
+        _, report, benchmark_digest = evaluate_evidence_quality_benchmark_bytes(raw, bins=bins)
+        if report.get("benchmark_sha256") != benchmark_digest:
+            raise ValueError("benchmark digest changed during evaluation")
+        report["input_artifact_id"] = input_artifact_id
+        report["input_artifact_sha256"] = source_digest
+        report_bytes = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if len(report_bytes) > 4 * 1024 * 1024:
+            raise ValueError("evidence-quality benchmark report exceeds 4 MiB")
+        saved_response = await client.post(
+            f"/v1/research/{quote(session_id, safe='')}/artifacts",
+            json={
+                "task_id": task_id,
+                "kind": "evidence_quality_benchmark_report",
+                "source": "MedAI double-reviewed evidence-quality benchmark evaluator",
+                "source_id": input_artifact_id,
+                "payload": report,
+            },
+        )
+        saved_response.raise_for_status()
+        saved_artifact = saved_response.json()
+    return {
+        "benchmark_id": report["benchmark_id"],
+        "benchmark_sha256": benchmark_digest,
+        "input_artifact_id": input_artifact_id,
+        "input_artifact_sha256": source_digest,
+        "cases": report["cases"],
+        "overall_by_domain": report["overall_by_domain"],
+        "by_evidence_type": report["by_evidence_type"],
+        "primary_review_agreement_by_domain": {
+            domain: metrics["primary_reviewer_agreement"]
+            for domain, metrics in report["overall_by_domain"].items()
+        },
+        "artifact_id": saved_artifact["id"],
+        "interpretation_limit": report["interpretation_limit"],
+    }
 
 @mcp.tool(name="medai_hypotheses_criticize")
 async def criticize_research_hypotheses(
@@ -2600,17 +2893,14 @@ async def criticize_research_hypotheses(
         raise ValueError("contradiction_artifact_ids must contain at most 50 unique artifact IDs")
     await _charge(session_id, task_id, 1, "Hypothesis criticism and contradictory evidence review")
     async with httpx.AsyncClient(base_url=API, headers=_api_headers(), timeout=30) as client:
-        artifacts_response, graph_response, evidence_response = await asyncio.gather(
+        artifacts_response, graph, evidence = await asyncio.gather(
             client.get(f"/v1/research/{session_id}/artifacts/{proposal_artifact_id}"),
-            client.get("/v1/research/" + session_id + "/graph"),
-            client.get("/v1/research/" + session_id + "/evidence"),
+            _read_graph_pages(client, session_id),
+            _read_evidence_pages(client, session_id),
         )
-        for response in (artifacts_response, graph_response, evidence_response):
-            response.raise_for_status()
+        artifacts_response.raise_for_status()
         proposal_artifact = artifacts_response.json()
         proposal = validate_hypothesis_proposal_artifact(proposal_artifact, session_id)
-        graph = graph_response.json()
-        evidence = evidence_response.json().get("items", [])
         candidate_responses = await asyncio.gather(*(
             client.get(f"/v1/research/{quote(session_id, safe='')}/artifacts/{quote(artifact_id, safe='')}")
             for artifact_id in contradiction_artifact_ids
@@ -2683,7 +2973,9 @@ def main() -> None:
     else:
         import uvicorn
 
-        app = SpecialistCredentialASGIMiddleware(mcp.streamable_http_app(stateless_http=True))
+        app = AuthenticatedMCPTransportASGIMiddleware(
+            SpecialistCredentialASGIMiddleware(mcp.streamable_http_app(stateless_http=True))
+        )
         uvicorn.run(app, host=os.getenv("MEDAI_MCP_HOST", "127.0.0.1"), port=int(os.getenv("MEDAI_MCP_PORT", "8091")))
 
 if __name__ == "__main__":

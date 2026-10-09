@@ -1,7 +1,7 @@
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderValue, Method, Request, StatusCode, header},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
@@ -9,7 +9,7 @@ use axum::{
 };
 use medai_core::{
     AgentMeshRouteApproval, ApiAuditActor, ApiCredentialRecord, Capability, Evidence, GraphEdge,
-    GraphNode, LiteratureWatchPaper, Store,
+    GraphNode, LiteratureWatchPaper, MAX_ARTIFACT_PAYLOAD_BYTES, Store,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -130,6 +130,10 @@ struct ApiPrincipal {
     scientific_agent_id: Option<String>,
 }
 
+fn is_general_service(principal: &ApiPrincipal) -> bool {
+    principal.role == "service" && principal.scientific_agent_id.is_none()
+}
+
 fn token_matches(provided: &[u8], expected_token: &[u8]) -> bool {
     let mut difference = expected_token.len() ^ provided.len();
     for index in 0..expected_token.len().max(provided.len()) {
@@ -204,6 +208,37 @@ fn authorize_specialist_task(
     Ok(())
 }
 
+fn validate_scientific_artifact_origin(
+    principal: &ApiPrincipal,
+    task_id: &str,
+    kind: &str,
+    source: &str,
+) -> Result<(), (StatusCode, String)> {
+    let expected = match kind {
+        "compound_chemical_identity" => Some(("compounds.analyze", "PubChem PUG REST")),
+        "paper_extraction_metadata" | "paper_extraction_receipt" => {
+            Some(("literature.extract", "PMC BioC"))
+        }
+        _ => None,
+    };
+    let Some((expected_task, expected_source)) = expected else {
+        return Ok(());
+    };
+    if principal.role != "service" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "source scientific artifacts can only be written by an authenticated service".into(),
+        ));
+    }
+    if task_id != expected_task || source != expected_source {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scientific artifact kind, source, and producing task do not match".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn authenticate_request(
     State(app): State<App>,
     mut request: Request<axum::body::Body>,
@@ -244,7 +279,8 @@ async fn authenticate_request(
             }
         }
         if path.starts_with("/v1/admin/")
-            && !(matches!(identity.role.as_str(), "platform_admin" | "service")
+            && !(identity.role == "platform_admin"
+                || is_general_service(identity)
                 || (path.starts_with("/v1/admin/credentials") && identity.role == "tenant_admin")
                 || (path.starts_with("/v1/admin/tenants/") && identity.role == "tenant_admin")
                 || (path == "/v1/admin/tenants" && identity.role == "tenant_admin")
@@ -259,7 +295,8 @@ async fn authenticate_request(
         } else if matches!(
             path.as_str(),
             "/v1/trial-watches/due/claim" | "/v1/literature-watches/due/claim"
-        ) && !matches!(identity.role.as_str(), "platform_admin" | "service")
+        ) && identity.role != "platform_admin"
+            && !is_general_service(identity)
         {
             rejection = Some((
                 StatusCode::FORBIDDEN,
@@ -273,6 +310,22 @@ async fn authenticate_request(
             "researcher" | "tenant_admin" | "platform_admin" | "service"
         ) {
             rejection = Some((StatusCode::FORBIDDEN, "write role required"));
+        } else if *request.method() == Method::POST
+            && path.starts_with("/v1/research/")
+            && path
+                == format!(
+                    "/v1/research/{}/control",
+                    path.split('/').nth(3).unwrap_or_default()
+                )
+            && identity
+                .scientific_agent_id
+                .as_deref()
+                .is_some_and(|agent_id| agent_id != "research_director")
+        {
+            rejection = Some((
+                StatusCode::FORBIDDEN,
+                "only a researcher or research director may cancel a session",
+            ));
         }
         if path.starts_with("/v1/research/") {
             let session_id = path.split('/').nth(3).unwrap_or_default();
@@ -324,7 +377,23 @@ async fn authenticate_request(
                     .flatten()
                     .is_some()
             });
-        (!is_budget_read && !is_status_read && !is_reservation_settlement)
+        // Cancellation is an owner-controlled stop signal and must remain
+        // available after research execution credits have been exhausted.
+        let is_session_cancellation = *request.method() == Method::POST
+            && path == format!("/v1/research/{session_id}/control");
+        // Task transitions meter themselves after decoding the bounded body so
+        // an already exhausted worker can still move its leased task to review.
+        let is_task_transition = *request.method() == Method::PATCH
+            && route_parts.len() == 6
+            && route_parts[1] == "v1"
+            && route_parts[2] == "research"
+            && route_parts[4] == "tasks"
+            && !route_parts[5].is_empty();
+        (!is_budget_read
+            && !is_status_read
+            && !is_reservation_settlement
+            && !is_session_cancellation
+            && !is_task_transition)
             .then_some(session_id.to_owned())
     } else {
         None
@@ -969,7 +1038,47 @@ async fn update_task(
     Json(input): Json<TaskTransition>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     authorize_specialist_task(&principal, &task_id)?;
-    if matches!(input.status.as_str(), "succeeded" | "failed") {
+    let request_credits = std::env::var("MEDAI_API_REQUEST_CREDITS")
+        .ok()
+        .map(|value| value.parse::<i64>())
+        .transpose()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MEDAI_API_REQUEST_CREDITS must be a positive integer".into(),
+            )
+        })?
+        .unwrap_or(1);
+    if request_credits <= 0 {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MEDAI_API_REQUEST_CREDITS must be a positive integer".into(),
+        ));
+    }
+    let charge_result = s
+        .store
+        .lock()
+        .map_err(internal)?
+        .consume_api_request_credits(
+            &id,
+            request_credits,
+            "PATCH",
+            &format!("/v1/research/{id}/tasks/{task_id}"),
+        );
+    match charge_result {
+        Ok(_) => {}
+        Err(error)
+            if input.status == "needs_review"
+                && error.to_string().contains("insufficient execution credits") => {}
+        Err(error) if error.to_string().contains("insufficient execution credits") => {
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                "research session execution budget exhausted".into(),
+            ));
+        }
+        Err(error) => return Err(internal(error)),
+    }
+    {
         let current = s
             .store
             .lock()
@@ -1026,10 +1135,11 @@ async fn review_task(
     let next = match input.decision.as_str() {
         "approve" => "succeeded",
         "reject" => "failed",
+        "resume" => "ready",
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "review decision must be approve or reject".into(),
+                "review decision must be approve, reject, or resume".into(),
             ));
         }
     };
@@ -1047,16 +1157,28 @@ async fn review_task(
         "rationale": input.rationale.trim(),
     });
     let output = serde_json::to_string(&review).map_err(internal)?;
-    store
-        .transition_task(
-            &id,
-            &task_id,
-            Some(&principal.subject),
-            next,
-            Some(&output),
-            None,
-        )
-        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    if input.decision == "resume" {
+        if task_id != "contradictions.search" {
+            return Err((
+                StatusCode::CONFLICT,
+                "only contradictions.search can be resumed through human review".into(),
+            ));
+        }
+        store
+            .resume_semantic_claim_task(&id, &principal.subject, &principal.role, &input.rationale)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    } else {
+        store
+            .transition_task(
+                &id,
+                &task_id,
+                Some(&principal.subject),
+                next,
+                Some(&output),
+                None,
+            )
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    }
     Ok(Json(serde_json::json!({
         "session_id": id,
         "task_id": task_id,
@@ -1210,14 +1332,58 @@ async fn recover_tasks(
 async fn evidence(
     State(s): State<App>,
     Path(id): Path<String>,
+    Query(filter): Query<EvidenceFilter>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let rows = s
+    let limit = filter.limit.unwrap_or(200);
+    if !(1..=500).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "evidence page limit must be 1..500".into(),
+        ));
+    }
+    if filter
+        .after_id
+        .as_ref()
+        .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 512)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "evidence cursor must be a bounded non-empty identifier".into(),
+        ));
+    }
+    if filter.after_id.is_some() != filter.snapshot_rowid.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "evidence cursor requires both after_id and snapshot_rowid".into(),
+        ));
+    }
+    if filter.snapshot_rowid.is_some_and(|rowid| rowid < 0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "evidence snapshot_rowid cannot be negative".into(),
+        ));
+    }
+    let (items, has_more, snapshot_rowid) = s
         .store
         .lock()
         .map_err(internal)?
-        .evidence(&id)
+        .evidence_page(
+            &id,
+            filter.after_id.as_deref(),
+            filter.snapshot_rowid,
+            limit,
+        )
         .map_err(internal)?;
-    Ok(Json(serde_json::json!({"items":rows})))
+    let next_cursor = has_more
+        .then(|| items.last().map(|row| row.id.as_str()))
+        .flatten();
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "items": items,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "snapshot_rowid": snapshot_rowid,
+    })))
 }
 #[derive(Deserialize)]
 struct NewEvidence {
@@ -1307,6 +1473,17 @@ struct OntologyCrossMappingReview {
     decision: String,
     rationale: String,
 }
+#[derive(Clone, Deserialize)]
+struct CrossrefReferenceReview {
+    candidate_artifact_id: String,
+    candidate_artifact_sha256: String,
+    reference_sha256: String,
+    citing_doi: String,
+    reference_index: i64,
+    decision: String,
+    selected_cited_doi: Option<String>,
+    rationale: String,
+}
 #[derive(Deserialize)]
 struct GraphNodeWrite {
     #[serde(flatten)]
@@ -1327,6 +1504,28 @@ struct ArtifactFilter {
     limit: Option<usize>,
     after_recorded_at: Option<i64>,
     after_id: Option<String>,
+}
+#[derive(Deserialize)]
+struct GraphFilter {
+    limit: Option<usize>,
+    include_nodes: Option<bool>,
+    include_edges: Option<bool>,
+    after_node_label: Option<String>,
+    after_node_id: Option<String>,
+    after_edge_source: Option<String>,
+    after_edge_relation: Option<String>,
+    after_edge_target: Option<String>,
+}
+#[derive(Deserialize)]
+struct EvidenceFilter {
+    limit: Option<usize>,
+    after_id: Option<String>,
+    snapshot_rowid: Option<i64>,
+}
+#[derive(Deserialize)]
+struct GraphSearchFilter {
+    q: String,
+    limit: Option<usize>,
 }
 #[derive(Deserialize)]
 struct CitationFilter {
@@ -1450,11 +1649,18 @@ async fn artifacts(
 async fn artifact_by_id(
     State(s): State<App>,
     Path((id, artifact_id)): Path<(String, String)>,
+    axum::Extension(principal): axum::Extension<ApiPrincipal>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let artifact = s
-        .store
-        .lock()
-        .map_err(internal)?
+    let store = s.store.lock().map_err(internal)?;
+    if store.session_tenant(&id).map_err(internal)?.as_deref() != Some(principal.tenant_id.as_str())
+        && principal.role != "platform_admin"
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "research artifact not found in this session".into(),
+        ));
+    }
+    let artifact = store
         .artifact(&id, &artifact_id)
         .map_err(internal)?
         .ok_or((
@@ -1867,6 +2073,7 @@ async fn add_artifact(
     Json(input): Json<NewArtifact>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     authorize_specialist_task(&principal, &input.task_id)?;
+    validate_scientific_artifact_origin(&principal, &input.task_id, &input.kind, &input.source)?;
     let payload = serde_json::to_string(&input.payload).map_err(internal)?;
     let item = s
         .store
@@ -3394,6 +3601,281 @@ async fn review_ontology_cross_mapping(
     ))
 }
 
+fn valid_citation_doi(value: &str) -> bool {
+    if value.len() > 255 || !value.is_ascii() {
+        return false;
+    }
+    let Some((registrant, suffix)) = value.split_once('/') else {
+        return false;
+    };
+    let Some(registrant) = registrant.strip_prefix("10.") else {
+        return false;
+    };
+    (4..=9).contains(&registrant.len())
+        && registrant.bytes().all(|byte| byte.is_ascii_digit())
+        && !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._;()/:".contains(&byte))
+}
+
+async fn review_crossref_reference(
+    State(s): State<App>,
+    Path(id): Path<String>,
+    axum::Extension(principal): axum::Extension<ApiPrincipal>,
+    Json(input): Json<CrossrefReferenceReview>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    if principal.scientific_agent_id.is_some()
+        || !matches!(principal.role.as_str(), "researcher" | "platform_admin")
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "citation reference review requires researcher or platform_admin role".into(),
+        ));
+    }
+    let rationale = input.rationale.trim();
+    if !matches!(
+        input.decision.as_str(),
+        "match" | "not_a_match" | "uncertain"
+    ) || rationale.is_empty()
+        || rationale.len() > 2000
+        || !valid_citation_doi(&input.citing_doi)
+        || !(0..200).contains(&input.reference_index)
+        || input.candidate_artifact_id.is_empty()
+        || input.candidate_artifact_id.len() > 128
+        || input.candidate_artifact_sha256.len() != 64
+        || !input
+            .candidate_artifact_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || input.reference_sha256.len() != 64
+        || !input
+            .reference_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err((StatusCode::BAD_REQUEST, "citation review decision, rationale, DOI, artifact identity, and reference index must be valid and bounded".into()));
+    }
+    let selected_cited_doi = input.selected_cited_doi.as_deref();
+    if (input.decision == "match") != selected_cited_doi.is_some()
+        || selected_cited_doi.is_some_and(|doi| !valid_citation_doi(doi))
+    {
+        return Err((StatusCode::BAD_REQUEST, "a match decision requires exactly one valid selected_cited_doi; other decisions must omit it".into()));
+    }
+    let store = s.store.lock().map_err(internal)?;
+    let tenant = store.session_tenant(&id).map_err(internal)?;
+    if tenant.as_deref() != Some(principal.tenant_id.as_str()) && principal.role != "platform_admin"
+    {
+        return Err((StatusCode::NOT_FOUND, "research session not found".into()));
+    }
+    let candidate = store
+        .artifact(&id, &input.candidate_artifact_id)
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "candidate_artifact_id was not found in this session".into(),
+        ))?;
+    if candidate.kind != "crossref_reference_resolution_candidates"
+        || candidate.source != "Crossref REST API"
+        || candidate.sha256 != input.candidate_artifact_sha256
+        || format!("{:x}", Sha256::digest(candidate.payload.as_bytes())) != candidate.sha256
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "candidate artifact identity or digest does not match this review".into(),
+        ));
+    }
+    let candidate_data: serde_json::Value =
+        serde_json::from_str(&candidate.payload).map_err(internal)?;
+    let candidate_reference_sha = candidate_data
+        .get("reference_sha256")
+        .and_then(serde_json::Value::as_str);
+    let source_artifact_id = candidate_data
+        .get("source_artifact_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "candidate artifact is missing its source Crossref artifact".into(),
+        ))?;
+    let source_artifact_sha = candidate_data
+        .get("source_artifact_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "candidate artifact is missing its source artifact digest".into(),
+        ))?;
+    if candidate_data
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("unverified_candidates")
+        || candidate_data
+            .get("citing_doi")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|doi| !doi.eq_ignore_ascii_case(&input.citing_doi))
+        || candidate_data
+            .get("reference_index")
+            .and_then(serde_json::Value::as_i64)
+            != Some(input.reference_index)
+        || candidate_reference_sha != Some(input.reference_sha256.as_str())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "candidate artifact is not bound to the exact cited reference".into(),
+        ));
+    }
+    let source = store
+        .artifact(&id, source_artifact_id)
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "source Crossref artifact was not found in this session".into(),
+        ))?;
+    if source.kind != "crossref_citation_metadata"
+        || source.source != "Crossref REST API"
+        || source.sha256 != source_artifact_sha
+        || format!("{:x}", Sha256::digest(source.payload.as_bytes())) != source.sha256
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "source Crossref artifact identity or digest failed verification".into(),
+        ));
+    }
+    let source_data: serde_json::Value = serde_json::from_str(&source.payload).map_err(internal)?;
+    let records = source_data
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "source Crossref artifact has no record array".into(),
+        ))?;
+    if format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(records).map_err(internal)?)
+    ) != source_data
+        .get("retained_records_sha256")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "source Crossref record digest failed verification".into(),
+        ));
+    }
+    let reference = records
+        .iter()
+        .find(|record| {
+            record
+                .get("doi")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|doi| doi.eq_ignore_ascii_case(&input.citing_doi))
+        })
+        .and_then(|record| {
+            record
+                .get("references")
+                .and_then(serde_json::Value::as_array)
+        })
+        .and_then(|references| {
+            references.iter().find(|reference| {
+                reference
+                    .get("reference_index")
+                    .and_then(serde_json::Value::as_i64)
+                    == Some(input.reference_index)
+            })
+        })
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "selected reference index is not present in the exact Crossref source record".into(),
+        ))?;
+    if reference
+        .get("doi_validated_by_pattern")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(reference).map_err(internal)?)
+        ) != input.reference_sha256
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "selected reference has a source DOI or its digest does not match the candidate".into(),
+        ));
+    }
+    let candidate_rows = candidate_data
+        .get("candidate_records")
+        .and_then(serde_json::Value::as_array)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "candidate artifact has no candidate record array".into(),
+        ))?;
+    if format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(candidate_rows).map_err(internal)?)
+    ) != candidate_data
+        .get("candidate_records_sha256")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "candidate record digest failed verification".into(),
+        ));
+    }
+    if let Some(doi) = selected_cited_doi
+        && !candidate_rows.iter().any(|row| {
+            row.get("doi")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|candidate_doi| candidate_doi.eq_ignore_ascii_case(doi))
+        })
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "selected DOI is not present among retained Crossref candidates".into(),
+        ));
+    }
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "review_type": "human_crossref_reference_resolution_adjudication",
+        "reviewer": {"subject": principal.subject, "role": principal.role},
+        "candidate_artifact_id": candidate.id,
+        "candidate_artifact_sha256": candidate.sha256,
+        "candidate_records_sha256": candidate_data.get("candidate_records_sha256"),
+        "source_artifact_id": source.id,
+        "source_artifact_sha256": source.sha256,
+        "reference_sha256": input.reference_sha256,
+        "citing_doi": input.citing_doi.to_ascii_lowercase(),
+        "reference_index": input.reference_index,
+        "decision": input.decision,
+        "selected_cited_doi": selected_cited_doi.map(str::to_ascii_lowercase),
+        "rationale": rationale,
+        "citation_edge_created": input.decision == "match",
+        "interpretation_limit": "Authenticated researcher adjudication of one exact DOI-less Crossref reference and a retained search candidate. This does not establish scientific support, contradiction, article quality, or evidence strength."
+    });
+    let serialized = serde_json::to_string(&payload).map_err(internal)?;
+    let review = store
+        .add_human_review_artifact(
+            &id,
+            &candidate.task_id,
+            "crossref_reference_resolution_adjudication",
+            "authenticated researcher citation resolution review",
+            &candidate.id,
+            &serialized,
+        )
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let citation_link_created = if input.decision == "match" {
+        store
+            .index_reviewed_crossref_reference(&id, &review.id)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?
+    } else {
+        false
+    };
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            serde_json::json!({"review_artifact_id":review.id,"review_artifact_sha256":review.sha256,"decision":input.decision,"citation_link_created":citation_link_created,"citation_link_source_artifact_id":if citation_link_created { Some(review.id) } else { None }}),
+        ),
+    ))
+}
+
 async fn add_evidence(
     State(s): State<App>,
     Path(id): Path<String>,
@@ -3432,16 +3914,85 @@ async fn add_evidence(
 async fn graph(
     State(s): State<App>,
     Path(id): Path<String>,
+    Query(filter): Query<GraphFilter>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (nodes, edges) = s
+    let limit = filter.limit.unwrap_or(200);
+    if !(1..=500).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "graph page limit must be 1..500".into(),
+        ));
+    }
+    if filter.after_node_label.is_some() != filter.after_node_id.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "node cursor requires both after_node_label and after_node_id".into(),
+        ));
+    }
+    let edge_cursor_parts = [
+        filter.after_edge_source.is_some(),
+        filter.after_edge_relation.is_some(),
+        filter.after_edge_target.is_some(),
+    ];
+    if edge_cursor_parts.iter().any(|value| *value) && !edge_cursor_parts.iter().all(|value| *value)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "edge cursor requires after_edge_source, after_edge_relation, and after_edge_target"
+                .into(),
+        ));
+    }
+    let store = s.store.lock().map_err(internal)?;
+    let (nodes, edges, has_more_nodes, has_more_edges) = store
+        .graph_page(
+            &id,
+            filter
+                .after_node_label
+                .as_deref()
+                .zip(filter.after_node_id.as_deref()),
+            filter
+                .after_edge_source
+                .as_deref()
+                .zip(filter.after_edge_relation.as_deref())
+                .zip(filter.after_edge_target.as_deref())
+                .map(|((source, relation), target)| (source, relation, target)),
+            filter.include_nodes.unwrap_or(true),
+            filter.include_edges.unwrap_or(true),
+            limit,
+        )
+        .map_err(internal)?;
+    let next_node_cursor = has_more_nodes
+        .then(|| {
+            nodes
+                .last()
+                .map(|node| serde_json::json!({"label":node.label,"id":node.id}))
+        })
+        .flatten();
+    let next_edge_cursor = has_more_edges.then(|| edges.last().map(|edge| serde_json::json!({"source":edge.source,"relation":edge.relation,"target":edge.target}))).flatten();
+    Ok(Json(
+        serde_json::json!({"session_id":id,"nodes":nodes,"edges":edges,"next_node_cursor":next_node_cursor,"next_edge_cursor":next_edge_cursor,"page_size":limit}),
+    ))
+}
+async fn graph_search(
+    State(s): State<App>,
+    Path(id): Path<String>,
+    Query(filter): Query<GraphSearchFilter>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = filter.limit.unwrap_or(50);
+    let (nodes, edges, has_more_nodes, has_more_edges) = s
         .store
         .lock()
         .map_err(internal)?
-        .graph(&id)
-        .map_err(internal)?;
-    Ok(Json(
-        serde_json::json!({"session_id":id,"nodes":nodes,"edges":edges}),
-    ))
+        .graph_search(&id, &filter.q, limit)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "nodes": nodes,
+        "edges": edges,
+        "truncated": {"nodes": has_more_nodes, "edges": has_more_edges},
+        "limits": {"nodes": limit, "edges": (limit * 5).min(500)},
+        "matching": "SQLite case-insensitive substring search over ID, label, and kind",
+    })))
 }
 async fn add_node(
     State(s): State<App>,
@@ -3858,10 +4409,9 @@ async fn audit_events(
     Query(filter): Query<AuditFilter>,
     axum::Extension(principal): axum::Extension<ApiPrincipal>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !matches!(
-        principal.role.as_str(),
-        "tenant_admin" | "platform_admin" | "service"
-    ) {
+    if !(matches!(principal.role.as_str(), "tenant_admin" | "platform_admin")
+        || is_general_service(&principal))
+    {
         return Err((
             StatusCode::FORBIDDEN,
             "audit administrator role required".into(),
@@ -3904,10 +4454,9 @@ async fn audit_export(
     Query(filter): Query<AuditFilter>,
     axum::Extension(principal): axum::Extension<ApiPrincipal>,
 ) -> Result<Response, (StatusCode, String)> {
-    if !matches!(
-        principal.role.as_str(),
-        "tenant_admin" | "platform_admin" | "service"
-    ) {
+    if !(matches!(principal.role.as_str(), "tenant_admin" | "platform_admin")
+        || is_general_service(&principal))
+    {
         return Err((
             StatusCode::FORBIDDEN,
             "audit administrator role required".into(),
@@ -4361,7 +4910,11 @@ async fn main() -> anyhow::Result<()> {
     store.configure_specialist_credit_policies(&agent_credit_policies)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     for credential in configured_credentials {
-        let digest = String::from_utf8(credential.token.to_vec())?;
+        let digest = credential
+            .token
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         store.register_api_credential(&ApiCredentialRecord {
             id: credential.id,
             token_sha256: digest,
@@ -4466,7 +5019,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/v1/research/{id}/artifacts",
-            get(artifacts).post(add_artifact),
+            get(artifacts)
+                .post(add_artifact)
+                .layer(DefaultBodyLimit::max(
+                    MAX_ARTIFACT_PAYLOAD_BYTES + 1024 * 1024,
+                )),
         )
         .route(
             "/v1/research/{id}/genomic-datasets",
@@ -4580,7 +5137,12 @@ async fn main() -> anyhow::Result<()> {
             "/v1/research/{id}/citation-links",
             get(citation_links).post(index_citations),
         )
+        .route(
+            "/v1/research/{id}/citation-reference-review",
+            axum::routing::post(review_crossref_reference),
+        )
         .route("/v1/research/{id}/graph", get(graph).post(add_node))
+        .route("/v1/research/{id}/graph/search", get(graph_search))
         .route(
             "/v1/research/{id}/graph/edges",
             axum::routing::post(add_edge),
@@ -4650,6 +5212,264 @@ async fn main() -> anyhow::Result<()> {
 mod authentication_tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn artifact_endpoint_accepts_payloads_above_the_default_json_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "medai-large-artifact-api-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).unwrap();
+        let session = store
+            .create_session_with_options("large artifact API", "standard", 20)
+            .unwrap();
+        let task = store
+            .claim_ready_tasks(&session.id, "api-test", 1, 60)
+            .unwrap()
+            .remove(0);
+        let state = App {
+            store: Arc::new(Mutex::new(store)),
+            api_credentials: credential_set(vec![test_credential(
+                b"large-artifact-api-token-123456789",
+                "api-test",
+                "local",
+                "service",
+            )]),
+        };
+        let router = Router::new()
+            .route(
+                "/v1/research/{id}/artifacts",
+                axum::routing::post(add_artifact).layer(DefaultBodyLimit::max(
+                    MAX_ARTIFACT_PAYLOAD_BYTES + 1024 * 1024,
+                )),
+            )
+            .layer(from_fn_with_state(state.clone(), authenticate_request))
+            .with_state(state.clone());
+        let payload = serde_json::json!({"records": "x".repeat(2_250_000)});
+        let body = serde_json::json!({
+            "task_id": task.id,
+            "kind": "biomedical_domain_benchmark_input",
+            "source": "researcher-supplied adjudicated biomedical benchmark",
+            "source_id": "benchmark-large",
+            "payload": payload,
+        })
+        .to_string();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/v1/research/{}/artifacts", session.id))
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer large-artifact-api-token-123456789",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let stored = state.store.lock().unwrap().artifacts(&session.id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].payload.len(), 2_250_014);
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn exhausted_session_can_only_use_unmetered_task_transition_to_review() {
+        let path = std::env::temp_dir().join(format!(
+            "medai-budget-task-review-api-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).unwrap();
+        let session = store
+            .create_session_with_options("budget exhaustion recovery", "standard", 2)
+            .unwrap();
+        let task = store
+            .claim_ready_tasks(&session.id, "budget-worker", 1, 60)
+            .unwrap()
+            .remove(0);
+        store
+            .consume_credits(&session.id, &task.id, 1, "exhaust test budget")
+            .unwrap();
+        let state = App {
+            store: Arc::new(Mutex::new(store)),
+            api_credentials: credential_set(vec![test_credential(
+                b"budget-task-review-token-123456789",
+                "budget-worker",
+                "local",
+                "service",
+            )]),
+        };
+        let router = Router::new()
+            .route(
+                "/v1/research/{id}/tasks/{task_id}",
+                axum::routing::patch(update_task),
+            )
+            .route(
+                "/v1/research/{id}/control",
+                axum::routing::post(cancel_research),
+            )
+            .layer(from_fn_with_state(state.clone(), authenticate_request))
+            .with_state(state.clone());
+        let transition = |status: &str| {
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/v1/research/{}/tasks/{}", session.id, task.id))
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer budget-task-review-token-123456789",
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "status": status,
+                        "output": "budget exhausted; awaiting researcher review",
+                        "worker_id": "budget-worker"
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let failed = router.clone().oneshot(transition("failed")).await.unwrap();
+        assert_eq!(failed.status(), StatusCode::PAYMENT_REQUIRED);
+        let review = router
+            .clone()
+            .oneshot(transition("needs_review"))
+            .await
+            .unwrap();
+        assert_eq!(review.status(), StatusCode::NO_CONTENT);
+        let tasks = state
+            .store
+            .lock()
+            .unwrap()
+            .research_tasks(&session.id)
+            .unwrap();
+        assert_eq!(
+            tasks.iter().find(|item| item.id == task.id).unwrap().status,
+            "needs_review"
+        );
+        let cancellable = state
+            .store
+            .lock()
+            .unwrap()
+            .create_session_with_options("cancel exhausted session", "standard", 2)
+            .unwrap();
+        let cancel_task = state
+            .store
+            .lock()
+            .unwrap()
+            .claim_ready_tasks(&cancellable.id, "budget-worker", 1, 60)
+            .unwrap()
+            .remove(0);
+        state
+            .store
+            .lock()
+            .unwrap()
+            .consume_credits(
+                &cancellable.id,
+                &cancel_task.id,
+                1,
+                "exhaust cancellation test",
+            )
+            .unwrap();
+        let cancelled = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/v1/research/{}/control", cancellable.id))
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer budget-task-review-token-123456789",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let cancelled_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(cancelled.into_body(), 100_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cancelled_json["cancellation_requested"], true);
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn specialist_cannot_cancel_session_but_researcher_can() {
+        let path = std::env::temp_dir().join(format!(
+            "medai-specialist-cancel-api-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).unwrap();
+        let session = store
+            .create_session_for_tenant("cancel authorization", "standard", 5, "tenant-a")
+            .unwrap();
+        let mut specialist = test_credential(
+            b"specialist-cancel-token-1234567890",
+            "agent-literature",
+            "tenant-a",
+            "service",
+        );
+        specialist.scientific_agent_id = Some("literature_librarian".into());
+        let state = App {
+            store: Arc::new(Mutex::new(store)),
+            api_credentials: credential_set(vec![
+                specialist,
+                test_credential(
+                    b"researcher-cancel-token-1234567890",
+                    "researcher",
+                    "tenant-a",
+                    "researcher",
+                ),
+            ]),
+        };
+        let router = Router::new()
+            .route(
+                "/v1/research/{id}/control",
+                axum::routing::post(cancel_research),
+            )
+            .layer(from_fn_with_state(state.clone(), authenticate_request))
+            .with_state(state);
+        let specialist_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/v1/research/{}/control", session.id))
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer specialist-cancel-token-1234567890",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(specialist_response.status(), StatusCode::FORBIDDEN);
+        let researcher_response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/v1/research/{}/control", session.id))
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer researcher-cancel-token-1234567890",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(researcher_response.status(), StatusCode::OK);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn agentmesh_route_approval_is_authenticated_scoped_and_bound_to_plan_hashes() {
@@ -6091,7 +6911,7 @@ mod authentication_tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(result["skipped_task_ids"].as_array().unwrap().len(), 7);
+        assert_eq!(result["skipped_task_ids"].as_array().unwrap().len(), 9);
         let remaining = state
             .store
             .lock()
@@ -6337,6 +7157,7 @@ mod authentication_tests {
             .unwrap();
         assert_eq!(wrong_tenant.status(), StatusCode::NOT_FOUND);
         let approved = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -6374,6 +7195,155 @@ mod authentication_tests {
                 .as_deref()
                 .unwrap()
                 .contains("human_scientific_review")
+        );
+
+        let resume_session = state
+            .store
+            .lock()
+            .unwrap()
+            .create_session_for_tenant("resume semantic comparisons", "standard", 100, "tenant-a")
+            .unwrap();
+        let mut resume_target_found = false;
+        for _ in 0..40 {
+            let store = state.store.lock().unwrap();
+            let claimed = store
+                .claim_ready_tasks(&resume_session.id, "resume-test-worker", 16, 60)
+                .unwrap();
+            if claimed.is_empty() {
+                break;
+            }
+            for claimed_task in claimed {
+                let (status, output) = if claimed_task.id == "contradictions.search" {
+                    resume_target_found = true;
+                    ("needs_review", r#"{"semantic_alignment_omitted_count":2}"#)
+                } else {
+                    ("succeeded", r#"{"test":"dependency setup"}"#)
+                };
+                store
+                    .transition_task(
+                        &resume_session.id,
+                        &claimed_task.id,
+                        Some("resume-test-worker"),
+                        status,
+                        Some(output),
+                        None,
+                    )
+                    .unwrap();
+            }
+            if resume_target_found {
+                break;
+            }
+        }
+        assert!(
+            resume_target_found,
+            "contradictions.search should become runnable in the research DAG"
+        );
+        let resume_url = format!(
+            "/v1/research/{}/tasks/contradictions.search/review",
+            resume_session.id
+        );
+        let direct_resume = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!(
+                        "/v1/research/{}/tasks/contradictions.search",
+                        resume_session.id
+                    ))
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer researcher-token-0123456789abcdef",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"status":"ready"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(direct_resume.status(), StatusCode::FORBIDDEN);
+        let resumed = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&resume_url)
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer researcher-token-0123456789abcdef",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "decision":"resume",
+                            "rationale":"Continue the remaining bounded semantic comparison batch."
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), StatusCode::OK);
+        let resumed_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resumed.into_body(), 100_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resumed_body["status"], "ready");
+        assert_eq!(resumed_body["review"]["decision"], "resume");
+        let repeated_resume = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&resume_url)
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer researcher-token-0123456789abcdef",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "decision":"resume",
+                            "rationale":"Do not resume after pending work was scheduled."
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated_resume.status(), StatusCode::CONFLICT);
+        let resumed_store = state.store.lock().unwrap();
+        let resumed_task = resumed_store
+            .research_tasks(&resume_session.id)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == "contradictions.search")
+            .unwrap();
+        assert_eq!(resumed_task.status, "ready");
+        let resumed_session = resumed_store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == resume_session.id)
+            .unwrap();
+        assert_eq!(resumed_session.status, "planned");
+        let review_event = resumed_store
+            .task_events(&resume_session.id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|event| event.task_id == "contradictions.search" && event.to_status == "ready")
+            .unwrap();
+        assert!(
+            review_event
+                .details
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Continue the remaining bounded semantic comparison batch.")
         );
         let _ = std::fs::remove_file(path);
     }
@@ -6633,6 +7603,65 @@ mod authentication_tests {
         assert!(
             bearer_authorized(None, None),
             "loopback development mode has no configured token"
+        );
+    }
+
+    #[test]
+    fn source_scientific_artifacts_require_the_registered_kind_source_and_task() {
+        let service = ApiPrincipal {
+            subject: "chemistry-worker".into(),
+            tenant_id: "lab-a".into(),
+            role: "service".into(),
+            scientific_agent_id: Some("chemistry_analyst".into()),
+        };
+        assert!(
+            validate_scientific_artifact_origin(
+                &service,
+                "compounds.analyze",
+                "compound_chemical_identity",
+                "PubChem PUG REST",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_scientific_artifact_origin(
+                &service,
+                "drugs.investigate",
+                "compound_chemical_identity",
+                "PubChem PUG REST",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scientific_artifact_origin(
+                &service,
+                "compounds.analyze",
+                "compound_chemical_identity",
+                "unverified source",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scientific_artifact_origin(
+                &service,
+                "literature.extract",
+                "paper_extraction_receipt",
+                "PMC BioC",
+            )
+            .is_ok()
+        );
+        let researcher = ApiPrincipal {
+            role: "researcher".into(),
+            ..service
+        };
+        assert!(
+            validate_scientific_artifact_origin(
+                &researcher,
+                "compounds.analyze",
+                "compound_chemical_identity",
+                "PubChem PUG REST",
+            )
+            .is_err()
         );
     }
 
@@ -7410,17 +8439,38 @@ mod authentication_tests {
             .unwrap();
         let state = App {
             store: Arc::new(Mutex::new(store)),
-            api_credentials: credential_set(vec![test_credential(
-                b"0123456789abcdef0123456789abcdef",
-                "admin-a",
-                "lab-a",
-                "tenant_admin",
-            )]),
+            api_credentials: credential_set(vec![
+                test_credential(
+                    b"0123456789abcdef0123456789abcdef",
+                    "admin-a",
+                    "lab-a",
+                    "tenant_admin",
+                ),
+                ApiCredential {
+                    scientific_agent_id: Some("literature_librarian".into()),
+                    ..test_credential(
+                        b"abcdef0123456789abcdef0123456789",
+                        "worker-literature",
+                        "lab-a",
+                        "service",
+                    )
+                },
+                test_credential(
+                    b"fedcba9876543210fedcba9876543210",
+                    "general-worker",
+                    "lab-a",
+                    "service",
+                ),
+            ]),
         };
         let router = Router::new()
             .route("/v1/admin/audit", get(audit_events))
             .route("/v1/admin/audit/export", get(audit_export))
             .route("/v1/admin/audit/verify", get(audit_verify))
+            .route(
+                "/v1/literature-watches/due/claim",
+                axum::routing::post(|| async { StatusCode::OK }),
+            )
             .route(
                 "/v1/admin/audit/archive",
                 axum::routing::post(audit_archive),
@@ -7496,6 +8546,68 @@ mod authentication_tests {
             .await
             .unwrap();
         assert_eq!(verify.status(), StatusCode::FORBIDDEN);
+        let specialist_global_audit = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/audit")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer abcdef0123456789abcdef0123456789",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(specialist_global_audit.status(), StatusCode::FORBIDDEN);
+        let specialist_global_queue = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/literature-watches/due/claim")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer abcdef0123456789abcdef0123456789",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(specialist_global_queue.status(), StatusCode::FORBIDDEN);
+        let general_service_audit = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/audit")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer fedcba9876543210fedcba9876543210",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(general_service_audit.status(), StatusCode::OK);
+        let general_service_global_queue = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/literature-watches/due/claim")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer fedcba9876543210fedcba9876543210",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(general_service_global_queue.status(), StatusCode::OK);
         let archive = router
             .oneshot(
                 Request::builder()
@@ -8009,12 +9121,40 @@ mod authentication_tests {
         let found = artifact_by_id(
             State(state.clone()),
             Path((first.id.clone(), artifact.id.clone())),
+            axum::Extension(ApiPrincipal {
+                subject: "test.admin".into(),
+                tenant_id: "local".into(),
+                role: "platform_admin".into(),
+                scientific_agent_id: None,
+            }),
         )
         .await
         .unwrap()
         .0;
         assert_eq!(found["id"], artifact.id);
-        let hidden = artifact_by_id(State(state), Path((second.id.clone(), artifact.id))).await;
+        let cross_tenant = artifact_by_id(
+            State(state.clone()),
+            Path((first.id.clone(), artifact.id.clone())),
+            axum::Extension(ApiPrincipal {
+                subject: "test.researcher".into(),
+                tenant_id: "other-tenant".into(),
+                role: "researcher".into(),
+                scientific_agent_id: None,
+            }),
+        )
+        .await;
+        assert!(cross_tenant.is_err());
+        let hidden = artifact_by_id(
+            State(state),
+            Path((second.id.clone(), artifact.id)),
+            axum::Extension(ApiPrincipal {
+                subject: "test.admin".into(),
+                tenant_id: "local".into(),
+                role: "platform_admin".into(),
+                scientific_agent_id: None,
+            }),
+        )
+        .await;
         assert!(hidden.is_err());
         let _ = std::fs::remove_file(path);
     }
@@ -8140,6 +9280,198 @@ mod authentication_tests {
         assert_eq!(listed["items"].as_array().unwrap().len(), 1);
         let _ = std::fs::remove_file(path);
     }
+
+    #[tokio::test]
+    async fn graph_search_route_is_authenticated_bounded_and_reports_truncation() {
+        use tower::ServiceExt;
+        let path = std::env::temp_dir().join(format!(
+            "medai-graph-search-api-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).unwrap();
+        let session = store.create_session("graph search API").unwrap();
+        for (id, label) in [("gene-a", "Alpha"), ("gene-b", "Alpha beta")] {
+            store
+                .put_node(&GraphNode {
+                    session_id: session.id.clone(),
+                    id: id.into(),
+                    kind: "Gene".into(),
+                    label: label.into(),
+                    metadata: "{}".into(),
+                })
+                .unwrap();
+        }
+        let state = App {
+            store: Arc::new(Mutex::new(store)),
+            api_credentials: credential_set(vec![test_credential(
+                b"graph-search-api-token-123456",
+                "graph-researcher",
+                "local",
+                "researcher",
+            )]),
+        };
+        let router = Router::new()
+            .route("/v1/research/{id}/graph/search", get(graph_search))
+            .layer(from_fn_with_state(state.clone(), authenticate_request))
+            .with_state(state);
+        let uri = format!("/v1/research/{}/graph/search?q=alpha&limit=1", session.id);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer graph-search-api-token-123456",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(result["truncated"]["nodes"], true);
+        assert_eq!(result["truncated"]["edges"], false);
+        let invalid = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/research/{}/graph/search?q=alpha&limit=101",
+                        session.id
+                    ))
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer graph-search-api-token-123456",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn evidence_route_returns_authenticated_keyset_pages() {
+        use tower::ServiceExt;
+        let path = std::env::temp_dir().join(format!(
+            "medai-evidence-page-api-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).unwrap();
+        let session = store.create_session("evidence page API").unwrap();
+        for id in ["EVD-002", "EVD-001"] {
+            store
+                .add_evidence(&Evidence {
+                    id: id.into(),
+                    session_id: session.id.clone(),
+                    claim: "pageable claim".into(),
+                    source: "test".into(),
+                    source_id: None,
+                    polarity: "supports".into(),
+                    quality: 0.5,
+                    provenance: "{}".into(),
+                })
+                .unwrap();
+        }
+        let shared_store = Arc::new(Mutex::new(store));
+        let state = App {
+            store: shared_store.clone(),
+            api_credentials: credential_set(vec![test_credential(
+                b"evidence-page-api-token-123456",
+                "evidence-reader",
+                "local",
+                "researcher",
+            )]),
+        };
+        let router = Router::new()
+            .route("/v1/research/{id}/evidence", get(evidence))
+            .layer(from_fn_with_state(state.clone(), authenticate_request))
+            .with_state(state);
+        let request = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer evidence-page-api-token-123456",
+                )
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let first = router
+            .clone()
+            .oneshot(request(format!(
+                "/v1/research/{}/evidence?limit=1",
+                session.id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"][0]["id"], "EVD-001");
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["next_cursor"], "EVD-001");
+        let snapshot_rowid = page["snapshot_rowid"].as_i64().unwrap();
+        shared_store
+            .lock()
+            .unwrap()
+            .add_evidence(&Evidence {
+                id: "EVD-0015".into(),
+                session_id: session.id.clone(),
+                claim: "inserted after snapshot capture".into(),
+                source: "test".into(),
+                source_id: None,
+                polarity: "supports".into(),
+                quality: 0.5,
+                provenance: "{}".into(),
+            })
+            .unwrap();
+
+        let last = router
+            .clone()
+            .oneshot(request(format!(
+                "/v1/research/{}/evidence?limit=1&after_id=EVD-001&snapshot_rowid={snapshot_rowid}",
+                session.id,
+            )))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(last.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"][0]["id"], "EVD-002");
+        assert_eq!(page["has_more"], false);
+        assert!(page["next_cursor"].is_null());
+        assert_eq!(page["snapshot_rowid"], snapshot_rowid);
+
+        let invalid = router
+            .clone()
+            .oneshot(request(format!(
+                "/v1/research/{}/evidence?limit=501",
+                session.id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let invalid = router
+            .oneshot(request(format!(
+                "/v1/research/{}/evidence?after_id=EVD-001",
+                session.id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]
@@ -8176,10 +9508,16 @@ mod citation_api_tests {
             store: Arc::new(Mutex::new(store)),
             api_credentials: credential_set(Vec::new()),
         };
+        let records = serde_json::json!([{"doi":"10.1234/citing","references":[{"DOI":"10.5678/cited","reference_index":0}]}]);
+        let retained_records_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&records).unwrap())
+        );
         let payload = serde_json::json!({
             "source": "Crossref REST API",
             "complete_result_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-            "records": [{"doi":"10.1234/citing","references":[{"DOI":"10.5678/cited","reference_index":0}]}]
+            "retained_records_sha256": retained_records_sha256,
+            "records": records
         });
         let (_, Json(artifact)) = add_artifact(
             State(app.clone()),
@@ -8229,6 +9567,157 @@ mod citation_api_tests {
                 .contains("not evidence polarity")
         );
         drop(app);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn citation_reference_edge_requires_exact_researcher_adjudication() {
+        let path = std::env::temp_dir().join(format!(
+            "medai-citation-review-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).unwrap();
+        let session = store.create_session("citation reference review").unwrap();
+        let task = store
+            .claim_ready_tasks(&session.id, "review-test", 1, 60)
+            .unwrap()
+            .remove(0);
+        let records = serde_json::json!([{
+            "doi": "10.1234/citing",
+            "references": [{"article-title":"An unresolved but identifiable citation title","author":"Researcher","year":"2020","reference_index":3}]
+        }]);
+        let records_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&records).unwrap())
+        );
+        let source_payload = serde_json::json!({
+            "source":"Crossref REST API", "complete_result_sha256":"a".repeat(64),
+            "retained_records_sha256":records_sha256, "records":records
+        });
+        let source = store
+            .add_artifact(
+                &session.id,
+                &task.id,
+                "crossref_citation_metadata",
+                "Crossref REST API",
+                "query-source",
+                &source_payload.to_string(),
+            )
+            .unwrap();
+        let reference_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&records[0]["references"][0]).unwrap())
+        );
+        let candidate_records = serde_json::json!([{"doi":"10.5678/candidate","title":["Matching candidate"],"published_date":"2020"}]);
+        let candidate_records_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&candidate_records).unwrap())
+        );
+        let candidate_payload = serde_json::json!({
+            "schema_version":"1", "source":"Crossref REST API", "status":"unverified_candidates",
+            "citing_doi":"10.1234/citing", "reference_index":3,
+            "source_artifact_id":source.id, "source_artifact_sha256":source.sha256,
+            "reference_sha256":reference_sha256, "query_sha256":"b".repeat(64),
+            "candidate_records":candidate_records, "candidate_records_sha256":candidate_records_sha256,
+            "complete_result_sha256":"c".repeat(64), "candidate_count":1,
+        });
+        let candidate = store
+            .add_artifact(
+                &session.id,
+                &task.id,
+                "crossref_reference_resolution_candidates",
+                "Crossref REST API",
+                "reference-review",
+                &candidate_payload.to_string(),
+            )
+            .unwrap();
+        let state = App {
+            store: Arc::new(Mutex::new(store)),
+            api_credentials: credential_set(Vec::new()),
+        };
+        let reviewer = ApiPrincipal {
+            subject: "scientist-1".into(),
+            tenant_id: "local".into(),
+            role: "researcher".into(),
+            scientific_agent_id: None,
+        };
+        let input = CrossrefReferenceReview {
+            candidate_artifact_id: candidate.id.clone(),
+            candidate_artifact_sha256: candidate.sha256.clone(),
+            reference_sha256,
+            citing_doi: "10.1234/citing".into(),
+            reference_index: 3,
+            decision: "match".into(),
+            selected_cited_doi: Some("10.5678/candidate".into()),
+            rationale:
+                "The retained title, author, and publication year match the citation record.".into(),
+        };
+        let mut uncertain = input.clone();
+        uncertain.decision = "uncertain".into();
+        uncertain.selected_cited_doi = None;
+        uncertain.rationale = "The available bibliographic fields are insufficient.".into();
+        let (uncertain_status, Json(uncertain_result)) = review_crossref_reference(
+            State(state.clone()),
+            Path(session.id.clone()),
+            axum::Extension(reviewer.clone()),
+            Json(uncertain),
+        )
+        .await
+        .unwrap();
+        assert_eq!(uncertain_status, StatusCode::CREATED);
+        assert_eq!(uncertain_result["citation_link_created"], false);
+        assert!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .citation_links(&session.id, None)
+                .unwrap()
+                .is_empty()
+        );
+        let (status, Json(first)) = review_crossref_reference(
+            State(state.clone()),
+            Path(session.id.clone()),
+            axum::Extension(reviewer.clone()),
+            Json(input.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(first["citation_link_created"], true);
+        assert_eq!(first["decision"], "match");
+        let rows = state
+            .store
+            .lock()
+            .unwrap()
+            .citation_links(&session.id, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].citing_doi, "10.1234/citing");
+        assert_eq!(rows[0].cited_doi, "10.5678/candidate");
+        assert_eq!(
+            rows[0].source_artifact_id,
+            first["review_artifact_id"].as_str().unwrap()
+        );
+        let (_, Json(second)) = review_crossref_reference(
+            State(state.clone()),
+            Path(session.id.clone()),
+            axum::Extension(reviewer),
+            Json(input),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["citation_link_created"], false);
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .citation_links(&session.id, None)
+                .unwrap()
+                .len(),
+            1
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -8463,6 +9952,10 @@ mod trial_watch_api_tests {
         .await
         .unwrap();
         assert_eq!(claimed["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            claimed["items"][0]["pending_metadata_pmids"],
+            serde_json::json!([])
+        );
         let _ = charge_literature_watch(
             State(app.clone()),
             Path((session.id.clone(), watch_id.clone())),
@@ -8501,6 +9994,8 @@ mod trial_watch_api_tests {
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(event["incomplete"], true);
         assert_eq!(event["retrieved_count"], 2);
+        assert_eq!(event["metadata_pending_count"], 1);
+        assert_eq!(event["metadata_overflow_count"], 0);
         let Json(watches) = list_literature_watches(State(app.clone()), Path(session.id.clone()))
             .await
             .unwrap();
@@ -8514,6 +10009,8 @@ mod trial_watch_api_tests {
         .unwrap();
         assert_eq!(events["items"].as_array().unwrap().len(), 1);
         assert_eq!(events["items"][0]["new_pmids"], "[\"12345\",\"67890\"]");
+        assert_eq!(events["items"][0]["metadata_pending_count"], 1);
+        assert_eq!(events["items"][0]["metadata_overflow_count"], 0);
         let Json(papers) = literature_watch_papers(
             State(app.clone()),
             Path(session.id.clone()),

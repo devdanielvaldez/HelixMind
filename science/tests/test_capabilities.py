@@ -116,6 +116,64 @@ class SemanticCapabilityTests(unittest.TestCase):
         self.assertFalse(result["compatible"])
         self.assertIn("output schema does not provide all required outputs", result["reasons"])
 
+    def test_contract_fit_rejects_unimplemented_json_schema_assertions(self):
+        manifest = package()
+        manifest["contract"]["inputs"]["properties"]["accession"]["oneOf"] = [
+            {"pattern": "^P"}, {"pattern": "^Q"},
+        ]
+        result = evaluate_contract_fit(requirement(), manifest)
+        self.assertFalse(result["compatible"])
+        self.assertIn("input schema does not accept all required inputs", result["reasons"])
+
+        manifest = package()
+        requirement_with_not = requirement()
+        requirement_with_not["outputs"]["properties"]["structure"]["not"] = {"type": "null"}
+        result = evaluate_contract_fit(requirement_with_not, manifest)
+        self.assertFalse(result["compatible"])
+        self.assertIn("output schema does not provide all required outputs", result["reasons"])
+
+    def test_contract_fit_fails_closed_on_malformed_supported_schema_keywords(self):
+        malformed_schemas = [
+            {"type": ["string", "string"]},
+            {"type": "not-a-json-type"},
+            {"pattern": "["},
+            {"minimum": float("nan")},
+            {"required": ["accession", "accession"]},
+            {"properties": {"accession": "string"}},
+            {"enum": "accession"},
+            {"enum": [float("nan")]},
+            {"const": {1: "non-string object key"}},
+            {"default": float("inf")},
+        ]
+        for malformed in malformed_schemas:
+            with self.subTest(schema=malformed):
+                manifest = package()
+                manifest["contract"]["inputs"]["properties"]["accession"] = malformed
+                result = evaluate_contract_fit(requirement(), manifest)
+                self.assertFalse(result["compatible"])
+                self.assertIn("input schema does not accept all required inputs", result["reasons"])
+
+    def test_contract_fit_respects_directional_type_subsets_and_format_constraints(self):
+        manifest = package()
+        broad_input = requirement()
+        broad_input["inputs"]["properties"]["accession"].pop("type")
+        result = evaluate_contract_fit(broad_input, manifest)
+        self.assertFalse(result["compatible"])
+
+        broad_output = requirement()
+        broad_output["outputs"]["properties"]["structure"].pop("type")
+        manifest["contract"]["outputs"]["properties"]["structure"] = {"type": "object"}
+        self.assertTrue(evaluate_contract_fit(broad_output, manifest)["compatible"])
+        broad_output["outputs"]["properties"]["structure"] = {"type": "string"}
+        manifest["contract"]["outputs"]["properties"]["structure"] = {}
+        self.assertFalse(evaluate_contract_fit(broad_output, manifest)["compatible"])
+
+        requested = requirement()
+        manifest = package()
+        requested["inputs"]["properties"]["accession"]["format"] = "uri"
+        manifest["contract"]["inputs"]["properties"]["accession"]["format"] = "email"
+        self.assertFalse(evaluate_contract_fit(requested, manifest)["compatible"])
+
     def test_authenticated_lifecycle_overrides_local_catalog_status_and_defaults_absent_to_experimental(self):
         promoted = package(status="production")
         absent = package(status="verified")
@@ -173,6 +231,80 @@ class SemanticCapabilityTests(unittest.TestCase):
             )
             self.assertEqual(result[0]["decision"], Decision.REUSE.value)
             self.assertTrue(result[0]["contract_fit"]["compatible"])
+            index.close()
+
+    def test_index_bounds_lazy_catalog_consumption_before_materializing_the_rest(self):
+        consumed = 0
+
+        def catalog():
+            nonlocal consumed
+            for item in range(10_000_000):
+                consumed += 1
+                descriptor = package()
+                descriptor["capability"]["id"] = f"biomedical.test.{item}"
+                yield descriptor
+
+        with tempfile.TemporaryDirectory() as folder:
+            index = SemanticCapabilityIndex(Path(folder) / "vectors.sqlite", FakeEmbedder())
+            with self.assertRaisesRegex(ValueError, "at most 1000 packages"):
+                index.index(catalog())
+            self.assertEqual(consumed, 1001)
+            self.assertEqual(index.db.execute("SELECT count(*) FROM capability_vectors").fetchone()[0], 0)
+            index.close()
+
+    def test_index_rejects_non_json_and_oversized_capability_manifests(self):
+        with tempfile.TemporaryDirectory() as folder:
+            index = SemanticCapabilityIndex(Path(folder) / "vectors.sqlite", FakeEmbedder())
+            non_json = package()
+            non_json["unexpected_numeric_annotation"] = float("nan")
+            with self.assertRaisesRegex(ValueError, "finite JSON values"):
+                index.index([non_json])
+            oversized = package()
+            oversized["capability"]["intent"] = "x" * 1_000_001
+            with self.assertRaisesRegex(ValueError, "exceeds 1 MiB"):
+                index.index([oversized])
+            self.assertEqual(index.db.execute("SELECT count(*) FROM capability_vectors").fetchone()[0], 0)
+            index.close()
+
+    def test_invalid_batch_rolls_back_valid_replacements_and_insertions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            index = SemanticCapabilityIndex(Path(folder) / "vectors.sqlite", FakeEmbedder())
+            original = package()
+            index.index([original])
+            original_row = index.db.execute(
+                "SELECT package_json,content_sha256,vector_json FROM capability_vectors WHERE capability_id=? AND version=?",
+                ("biomedical.protein.structure", "2.1.0"),
+            ).fetchone()
+            replacement = package()
+            replacement["capability"]["intent"] = "Different description for the same capability"
+            insertion = package()
+            insertion["capability"]["id"] = "biomedical.protein.new-structure"
+            malformed = package()
+            malformed["capability"]["id"] = "biomedical.protein.invalid"
+            malformed["unexpected"] = float("inf")
+
+            with self.assertRaisesRegex(ValueError, "finite JSON values"):
+                index.index([replacement, insertion, malformed])
+
+            rows = index.db.execute(
+                "SELECT capability_id,version,package_json,content_sha256,vector_json FROM capability_vectors ORDER BY capability_id"
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][:2], ("biomedical.protein.structure", "2.1.0"))
+            self.assertEqual(rows[0][2:], original_row)
+            index.close()
+
+    def test_search_rejects_nonstandard_json_corruption_in_stored_manifest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            index = SemanticCapabilityIndex(Path(folder) / "vectors.sqlite", FakeEmbedder())
+            index.index([package()])
+            index.db.execute(
+                "UPDATE capability_vectors SET package_json=? WHERE capability_id=? AND version=?",
+                ('{"capability":{"id":"biomedical.protein.structure","version":"2.1.0","status":NaN}}', "biomedical.protein.structure", "2.1.0"),
+            )
+            index.db.commit()
+            with self.assertRaisesRegex(ValueError, "contains invalid JSON"):
+                index.search("protein structure", requirement())
             index.close()
 
     def test_vector_search_rejects_manifest_bytes_that_do_not_match_the_index_digest(self):

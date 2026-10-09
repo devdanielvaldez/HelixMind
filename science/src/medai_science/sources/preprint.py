@@ -10,6 +10,7 @@ from urllib.parse import quote
 import httpx
 from medai_science.sources.bounded_http import read_bounded_response
 from medai_science.sources.safety import ensure_public_research_query
+from medai_science.json_input import strict_json_loads
 
 
 _DOI = re.compile(r"^10\.1101/[A-Za-z0-9._;()/:-]{1,200}$", re.IGNORECASE)
@@ -61,17 +62,17 @@ class PreprintClient:
             async with client.stream("GET", f"{self.endpoints[server]}/details/{server}/{path_doi}/na/json") as response:
                 raw = await read_bounded_response(response, _MAX_RESPONSE_BYTES, "preprint API")
         try:
-            payload = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError("preprint API returned invalid JSON") from error
+            payload = strict_json_loads(raw)
+        except ValueError as error:
+            raise ValueError(f"preprint API returned invalid strict JSON: {error}") from error
         collection = payload.get("collection") if isinstance(payload, dict) else None
-        if not isinstance(collection, list):
+        if not isinstance(collection, list) or len(collection) > 10:
             raise ValueError("preprint API returned an invalid collection")
+        if any(not isinstance(record, dict) or not isinstance(record.get("doi"), str) for record in collection):
+            raise ValueError("preprint API returned a malformed collection record")
         retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         matches = []
-        for record in collection[:10]:
-            if not isinstance(record, dict) or not isinstance(record.get("doi"), str):
-                continue
+        for record in collection:
             if record["doi"].casefold() != doi.casefold():
                 continue
             matches.append(self._retain_record(record, server, retrieved_at))
@@ -126,13 +127,15 @@ class PreprintClient:
                 async with client.stream("GET", f"{self.endpoints[server]}{path}", params={"category": category} if category else None) as response:
                     raw = await read_bounded_response(response, _MAX_RESPONSE_BYTES, "preprint API")
                 try:
-                    payload = json.loads(raw)
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise ValueError("preprint API returned invalid JSON") from error
+                    payload = strict_json_loads(raw)
+                except ValueError as error:
+                    raise ValueError(f"preprint API returned invalid strict JSON: {error}") from error
                 collection = payload.get("collection") if isinstance(payload, dict) else None
-                if not isinstance(collection, list):
+                if not isinstance(collection, list) or len(collection) > page_size:
                     raise ValueError("preprint API returned an invalid collection")
-                rows = [item for item in collection[:page_size] if isinstance(item, dict)]
+                if any(not isinstance(item, dict) or not isinstance(item.get("doi"), str) for item in collection):
+                    raise ValueError("preprint API returned a malformed collection record")
+                rows = collection
                 scanned.extend(rows)
                 pages += 1
                 if len(rows) < page_size:

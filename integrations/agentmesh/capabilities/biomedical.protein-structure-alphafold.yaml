@@ -2,7 +2,7 @@ schemaVersion: amcp/0.1
 capability:
   id: biomedical.protein-structure-alphafold
   version: 0.1.0
-  intent: Retrieve and retain AlphaFold DB predicted structure metadata and coordinate URLs for a UniProt protein accession.
+  intent: Retrieve AlphaFold DB predicted structure metadata and coordinate URLs for a UniProt protein accession.
 contract:
   inputs:
     type: object
